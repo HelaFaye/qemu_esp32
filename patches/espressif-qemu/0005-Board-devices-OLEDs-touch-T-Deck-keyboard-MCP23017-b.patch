@@ -1,0 +1,1723 @@
+From 2514bb12ce870c76188b851ff30ff9709ad50c75 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Tue, 10 Nov 2026 10:36:43 +0000
+Subject: [PATCH 5/5] Board devices: OLEDs, touch, T-Deck keyboard, MCP23017,
+ buttons
+
+ssd1306/sh1106: I2C OLEDs (128x64, 128x32) as screens: control
+bytes (Co, D/C#), addressing modes, windows, segment/COM remap, start
+line, offset, contrast, invert, display on/off.
+
+gt911, cst816, ft6336: capacitive touch controllers with their ID
+and point registers, GT911 configuration and status handshake,
+reports every 10 ms while touched with INT pulses (FT6336 polling: INT
+low while touched); touches from the pointer or qom-set x/y/pressed.
+
+tdeck-keyboard: LilyGO T-Deck's I2C keyboard (0x55): keys from the
+host keyboard or qom-set keys, backlight commands.
+
+mcp23017: 16 GPIO lines in and out, pull-ups, polarity, interrupt on
+change or compare, INTA/INTB with MIRROR/ODR/INTPOL, INTCAP.
+
+gpio-button: a button (or a rotary encoder's quadrature) on an S3 pin
+or any device's GPIO input, pressed with qom-set or a host key.
+---
+ hw/display/meson.build                 |   1 +
+ hw/display/ssd1306.c                   | 298 ++++++++++++++++++++++
+ hw/gpio/mcp23017.c                     | 240 ++++++++++++++++++
+ hw/gpio/meson.build                    |   1 +
+ hw/input/gpio_button.c                 | 218 ++++++++++++++++
+ hw/input/i2c_touch.c                   | 335 +++++++++++++++++++++++++
+ hw/input/meson.build                   |   2 +
+ hw/input/tdeck_keyboard.c              | 196 +++++++++++++++
+ hw/misc/Kconfig                        |   4 +
+ hw/xtensa/Kconfig                      |   4 +
+ tests/qtest/esp32s3-i2c-devices-test.c | 279 ++++++++++++++++++++
+ tests/qtest/meson.build                |   2 +-
+ 12 files changed, 1579 insertions(+), 1 deletion(-)
+ create mode 100644 hw/display/ssd1306.c
+ create mode 100644 hw/gpio/mcp23017.c
+ create mode 100644 hw/input/gpio_button.c
+ create mode 100644 hw/input/i2c_touch.c
+ create mode 100644 hw/input/tdeck_keyboard.c
+ create mode 100644 tests/qtest/esp32s3-i2c-devices-test.c
+
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index 8c2a1c6..af90feb 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -145,3 +145,4 @@ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
+ 
+ modules += { 'hw-display': hw_display_modules }
+ system_ss.add(when: 'CONFIG_MIPI_DBI_PANEL', if_true: files('mipi_dbi_panel.c'))
++system_ss.add(when: 'CONFIG_ESP_BOARD_PERIPHERALS', if_true: files('ssd1306.c'))
+diff --git a/hw/display/ssd1306.c b/hw/display/ssd1306.c
+new file mode 100644
+index 0000000..157048f
+--- /dev/null
++++ b/hw/display/ssd1306.c
+@@ -0,0 +1,298 @@
++/*
++ * SSD1306 and SH1106 monochrome OLED controllers on I2C (128x64 or 128x32)
++ *
++ * After the address, a control byte: Co (bit 7: one byte follows, then another control
++ * byte) and D/C# (bit 6: data, else commands). Commands: display on/off, contrast,
++ * entire display on, inverse, multiplex ratio, display offset, start line, segment remap,
++ * COM scan direction, memory addressing modes (horizontal, vertical, page; SH1106: page
++ * only), column/page windows, page and column start in page mode. GDDRAM is 8 pages of
++ * 128 (SH1106: 132) columns, one bit per pixel, LSB at the top.
++ *
++ *   -device ssd1306,bus=i2c0,address=0x3c[,height=32]     (also sh1106)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/i2c/i2c.h"
++#include "hw/qdev-properties.h"
++#include "ui/console.h"
++#include "qom/object.h"
++
++#define TYPE_SSD1306 "ssd1306"
++#define TYPE_SH1106 "sh1106"
++OBJECT_DECLARE_SIMPLE_TYPE(SSD1306State, SSD1306)
++
++#define COLS_MAX    132
++#define PAGES       8
++
++struct SSD1306State {
++    I2CSlave parent_obj;
++
++    QemuConsole *con;
++    uint32_t width, height;
++    uint32_t color;             /* Lit pixel color (RGB888) */
++    bool sh1106;
++
++    uint8_t ram[PAGES][COLS_MAX];
++    /* The I2C stream */
++    bool first;                 /* Next byte is a control byte */
++    bool single;                /* Co: one byte, then a control byte again */
++    bool data;
++    uint8_t cmd[8];
++    int ncmd, need;
++    /* State */
++    bool on, invert, entire_on, seg_remap, com_remap;
++    uint8_t contrast, mode, mux, offset, start_line;
++    uint8_t col, col_start, col_end, page, page_start, page_end;
++    bool dirty;
++};
++
++static int cmd_len(SSD1306State *s, uint8_t c)
++{
++    if (s->sh1106) {
++        switch (c) {
++        case 0x81: case 0xA8: case 0xD3: case 0xD5: case 0xD9: case 0xDA: case 0xDB:
++        case 0xAD:
++            return 2;
++        default:
++            return 1;
++        }
++    }
++    switch (c) {
++    case 0x81: case 0x20: case 0xA8: case 0xD3: case 0xD5: case 0xD9: case 0xDA:
++    case 0xDB: case 0x8D: case 0xA3:
++        return 2;
++    case 0x21: case 0x22:
++        return 3;
++    case 0x26: case 0x27:
++        return 7;
++    case 0x29: case 0x2A:
++        return 6;
++    default:
++        return 1;
++    }
++}
++
++static void run_cmd(SSD1306State *s)
++{
++    uint8_t c = s->cmd[0];
++
++    if (c <= 0x0F) {
++        s->col = (s->col & 0xF0) | c;
++    } else if (c <= 0x1F) {
++        s->col = (s->col & 0x0F) | ((c & 0x0F) << 4);
++    } else if (c >= 0x40 && c <= 0x7F) {
++        s->start_line = c & 0x3F;
++    } else if (c >= 0xB0 && c <= 0xB7) {
++        s->page = c & 7;
++    } else {
++        switch (c) {
++        case 0x20: s->mode = s->cmd[1] & 3; break;
++        case 0x21: s->col_start = s->col = s->cmd[1] & 0x7F; s->col_end = s->cmd[2] & 0x7F; break;
++        case 0x22: s->page_start = s->page = s->cmd[1] & 7; s->page_end = s->cmd[2] & 7; break;
++        case 0x81: s->contrast = s->cmd[1]; break;
++        case 0xA0: s->seg_remap = false; break;
++        case 0xA1: s->seg_remap = true; break;
++        case 0xA4: s->entire_on = false; break;
++        case 0xA5: s->entire_on = true; break;
++        case 0xA6: s->invert = false; break;
++        case 0xA7: s->invert = true; break;
++        case 0xA8: s->mux = s->cmd[1] & 0x3F; break;
++        case 0xAE: s->on = false; break;
++        case 0xAF: s->on = true; break;
++        case 0xC0: s->com_remap = false; break;
++        case 0xC8: s->com_remap = true; break;
++        case 0xD3: s->offset = s->cmd[1] & 0x3F; break;
++        default: break;     /* Clock, precharge, VCOMH, charge pump, scrolling */
++        }
++    }
++    s->dirty = true;
++}
++
++static void write_data(SSD1306State *s, uint8_t b)
++{
++    int cols = s->sh1106 ? COLS_MAX : 128;
++    if (s->col < cols && s->page < PAGES) {
++        s->ram[s->page][s->col] = b;
++        s->dirty = true;
++    }
++    if (s->sh1106 || s->mode == 2) {            /* Page mode: along the page, no wrap */
++        if (s->col < cols - 1) {
++            s->col++;
++        }
++    } else if (s->mode == 0) {                   /* Horizontal */
++        if (s->col >= s->col_end) {
++            s->col = s->col_start;
++            s->page = s->page >= s->page_end ? s->page_start : s->page + 1;
++        } else {
++            s->col++;
++        }
++    } else {                                     /* Vertical */
++        if (s->page >= s->page_end) {
++            s->page = s->page_start;
++            s->col = s->col >= s->col_end ? s->col_start : s->col + 1;
++        } else {
++            s->page++;
++        }
++    }
++}
++
++static int ssd1306_event(I2CSlave *i2c, enum i2c_event event)
++{
++    SSD1306State *s = SSD1306(i2c);
++    if (event == I2C_START_SEND || event == I2C_START_SEND_ASYNC) {
++        s->first = true;
++        s->ncmd = 0;
++    }
++    return 0;
++}
++
++static int ssd1306_send(I2CSlave *i2c, uint8_t b)
++{
++    SSD1306State *s = SSD1306(i2c);
++
++    if (s->first) {
++        s->single = b & 0x80;
++        s->data = b & 0x40;
++        s->first = false;
++        return 0;
++    }
++    if (s->data) {
++        write_data(s, b);
++    } else {
++        if (s->ncmd == 0) {
++            s->need = cmd_len(s, b);
++        }
++        s->cmd[s->ncmd++] = b;
++        if (s->ncmd >= s->need) {
++            run_cmd(s);
++            s->ncmd = 0;
++        }
++    }
++    if (s->single) {
++        s->first = true;
++    }
++    return 0;
++}
++
++static uint8_t ssd1306_recv(I2CSlave *i2c)
++{
++    SSD1306State *s = SSD1306(i2c);
++    return s->on ? 0x03 : 0x43;     /* Status: display off in bit 6 (and the SH1106's id) */
++}
++
++static void ssd1306_update(void *opaque)
++{
++    SSD1306State *s = SSD1306(opaque);
++    DisplaySurface *surface = qemu_console_surface(s->con);
++    if (!s->dirty || !surface) {
++        return;
++    }
++    s->dirty = false;
++
++    /* Contrast dims the lit color a little, as the OLED's current does */
++    uint32_t scale = 128 + s->contrast / 2;
++    uint32_t lit = ((((s->color >> 16) & 0xFF) * scale / 255) << 16) |
++                   ((((s->color >> 8) & 0xFF) * scale / 255) << 8) | ((s->color & 0xFF) * scale / 255);
++    int xoff = s->sh1106 ? 2 : 0;
++    uint8_t *dst = surface_data(surface);
++    int stride = surface_stride(surface);
++
++    for (uint32_t y = 0; y < s->height; y++) {
++        uint32_t *line = (uint32_t *)(dst + y * stride);
++        /* Row y shows COM y (or mirrored), which shows RAM row start_line + offset ... */
++        uint32_t com = s->com_remap ? s->height - 1 - y : y;
++        uint32_t row = (com + s->start_line + s->offset) % 64;
++        for (uint32_t x = 0; x < s->width; x++) {
++            uint32_t col = (s->seg_remap ? 127 - x : x) + xoff;
++            bool px = (s->ram[row / 8][col] >> (row % 8)) & 1;
++            if (s->entire_on) {
++                px = true;
++            }
++            if (s->invert) {
++                px = !px;
++            }
++            line[x] = (s->on && px) ? lit : 0;
++        }
++    }
++    dpy_gfx_update(s->con, 0, 0, s->width, s->height);
++}
++
++static void ssd1306_invalidate(void *opaque)
++{
++    SSD1306(opaque)->dirty = true;
++}
++
++static const GraphicHwOps ssd1306_ops = {
++    .invalidate = ssd1306_invalidate,
++    .gfx_update = ssd1306_update,
++};
++
++static void ssd1306_realize(DeviceState *dev, Error **errp)
++{
++    SSD1306State *s = SSD1306(dev);
++    if (s->height != 64 && s->height != 32) {
++        error_setg(errp, "height must be 64 or 32");
++        return;
++    }
++    s->width = 128;
++    s->sh1106 = !strcmp(object_get_typename(OBJECT(dev)), TYPE_SH1106);
++    s->con = graphic_console_init(dev, 0, &ssd1306_ops, s);
++    qemu_console_resize(s->con, s->width, s->height);
++}
++
++static void ssd1306_reset(DeviceState *dev)
++{
++    SSD1306State *s = SSD1306(dev);
++    memset(s->ram, 0, sizeof(s->ram));
++    s->first = true;
++    s->ncmd = 0;
++    s->on = s->invert = s->entire_on = s->seg_remap = s->com_remap = false;
++    s->contrast = 0x7F;
++    s->mode = 2;                /* Page addressing after reset */
++    s->mux = 63;
++    s->offset = s->start_line = 0;
++    s->col = s->col_start = 0;
++    s->col_end = 127;
++    s->page = s->page_start = 0;
++    s->page_end = 7;
++    s->dirty = true;
++}
++
++static Property ssd1306_properties[] = {
++    DEFINE_PROP_UINT32("height", SSD1306State, height, 64),
++    DEFINE_PROP_UINT32("color", SSD1306State, color, 0xFFFFFF),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void ssd1306_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    dc->realize = ssd1306_realize;
++    device_class_set_legacy_reset(dc, ssd1306_reset);
++    device_class_set_props(dc, ssd1306_properties);
++    k->event = ssd1306_event;
++    k->send = ssd1306_send;
++    k->recv = ssd1306_recv;
++    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
++}
++
++static const TypeInfo ssd1306_types[] = {
++    {
++        .name = TYPE_SSD1306,
++        .parent = TYPE_I2C_SLAVE,
++        .instance_size = sizeof(SSD1306State),
++        .class_init = ssd1306_class_init,
++    }, {
++        .name = TYPE_SH1106,
++        .parent = TYPE_SSD1306,
++    },
++};
++
++DEFINE_TYPES(ssd1306_types)
+diff --git a/hw/gpio/mcp23017.c b/hw/gpio/mcp23017.c
+new file mode 100644
+index 0000000..606c879
+--- /dev/null
++++ b/hw/gpio/mcp23017.c
+@@ -0,0 +1,240 @@
++/*
++ * MCP23017 16-bit I2C GPIO expander (IOCON.BANK = 0 register map)
++ *
++ * Pins GPA0-7 and GPB0-7 are lines 0-15: "in" (driven from outside: 0, 1, or anything
++ * else to release the pin to its pull-up) and "out" (the pin's level when it's an
++ * output). INTA/INTB ("inta", "intb") follow GPINTEN, INTCON, DEFVAL, IOCON.MIRROR,
++ * ODR and INTPOL; reading INTCAP or GPIO clears the interrupt. Sequential reads and
++ * writes go up the registers (IOCON.SEQOP = 0).
++ *
++ *   -device mcp23017,bus=i2c0,address=0x20,id=exp
++ *   -device gpio-button,dev=exp,line=in,n=0,id=btnA       (a button to ground on GPA0)
++ *   -device esp32s3.pin-link,pin=36,dev=exp,line=inta,dir=out,open-drain=on,pull=up
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/i2c/i2c.h"
++#include "hw/irq.h"
++#include "qom/object.h"
++
++#define TYPE_MCP23017 "mcp23017"
++OBJECT_DECLARE_SIMPLE_TYPE(MCP23017State, MCP23017)
++
++enum {
++    IODIR, IPOL, GPINTEN, DEFVAL, INTCON, IOCON, GPPU, INTF, INTCAP, GPIO, OLAT, NREGS
++};
++
++#define IOCON_MIRROR    0x40
++#define IOCON_SEQOP     0x20
++#define IOCON_ODR       0x04
++#define IOCON_INTPOL    0x02
++
++struct MCP23017State {
++    I2CSlave parent_obj;
++
++    qemu_irq out[16];
++    qemu_irq inta, intb;
++    uint16_t reg[NREGS];        /* A in the low byte, B in the high byte */
++    uint16_t ext_driven, ext_level;
++    uint16_t level;             /* Each pin's level */
++    uint8_t ptr;
++    bool addr_next;
++};
++
++static uint16_t pin_levels(MCP23017State *s)
++{
++    uint16_t v = 0;
++    for (int n = 0; n < 16; n++) {
++        bool output = !((s->reg[IODIR] >> n) & 1);
++        int l;
++        if (output) {
++            l = (s->reg[OLAT] >> n) & 1;
++        } else if ((s->ext_driven >> n) & 1) {
++            l = (s->ext_level >> n) & 1;
++        } else {
++            l = (s->reg[GPPU] >> n) & 1;        /* Pulled up, or floating (reads 0) */
++        }
++        v |= l << n;
++    }
++    return v;
++}
++
++static void update_int(MCP23017State *s)
++{
++    bool a = s->reg[INTF] & 0x00FF, b = s->reg[INTF] & 0xFF00;
++    if (s->reg[IOCON] & IOCON_MIRROR) {
++        a = b = a || b;
++    }
++    bool pol = s->reg[IOCON] & IOCON_INTPOL;
++    if (s->reg[IOCON] & IOCON_ODR) {
++        /* Open drain: pulls low when active, else released */
++        qemu_set_irq(s->inta, a ? 0 : 1);
++        qemu_set_irq(s->intb, b ? 0 : 1);
++    } else {
++        qemu_set_irq(s->inta, a ? pol : !pol);
++        qemu_set_irq(s->intb, b ? pol : !pol);
++    }
++}
++
++static void update(MCP23017State *s)
++{
++    uint16_t old = s->level, now = pin_levels(s);
++    s->level = now;
++    for (int n = 0; n < 16; n++) {
++        int bit = 1 << n;
++        if ((old ^ now) & bit) {
++            qemu_set_irq(s->out[n], !!(now & bit));
++        }
++        if (!(s->reg[GPINTEN] & bit) || (s->reg[IODIR] & bit) == 0 || (s->reg[INTF] & bit)) {
++            continue;
++        }
++        bool fire = (s->reg[INTCON] & bit) ? ((now ^ s->reg[DEFVAL]) & bit) : ((old ^ now) & bit);
++        if (fire) {
++            s->reg[INTF] |= bit;
++            s->reg[INTCAP] = now;
++        }
++    }
++    update_int(s);
++}
++
++static uint8_t read_byte(MCP23017State *s, uint8_t a)
++{
++    int r = a >> 1, hi = a & 1;
++    uint16_t v;
++    if (r >= NREGS) {
++        return 0;
++    }
++    switch (r) {
++    case GPIO:
++        v = s->level ^ (s->reg[IPOL] & s->reg[IODIR]);
++        s->reg[INTF] &= hi ? 0x00FF : 0xFF00;      /* Reading the port clears its interrupt */
++        update(s);
++        break;
++    case INTCAP:
++        v = s->reg[INTCAP];
++        s->reg[INTF] &= hi ? 0x00FF : 0xFF00;
++        update(s);
++        break;
++    case IOCON:
++        v = s->reg[IOCON] | s->reg[IOCON] << 8;     /* One register, both addresses */
++        break;
++    default:
++        v = s->reg[r];
++    }
++    return hi ? v >> 8 : v & 0xFF;
++}
++
++static void write_byte(MCP23017State *s, uint8_t a, uint8_t b)
++{
++    int r = a >> 1, hi = a & 1;
++    if (r >= NREGS || r == INTF || r == INTCAP) {
++        return;
++    }
++    if (r == GPIO) {
++        r = OLAT;
++    }
++    if (r == IOCON) {
++        s->reg[IOCON] = b & 0xFE;
++    } else if (hi) {
++        s->reg[r] = (s->reg[r] & 0x00FF) | b << 8;
++    } else {
++        s->reg[r] = (s->reg[r] & 0xFF00) | b;
++    }
++    update(s);
++}
++
++static int mcp_event(I2CSlave *i2c, enum i2c_event event)
++{
++    MCP23017State *s = MCP23017(i2c);
++    if (event == I2C_START_SEND || event == I2C_START_SEND_ASYNC) {
++        s->addr_next = true;
++    }
++    return 0;
++}
++
++static int mcp_send(I2CSlave *i2c, uint8_t b)
++{
++    MCP23017State *s = MCP23017(i2c);
++    if (s->addr_next) {
++        s->ptr = b % (NREGS * 2);
++        s->addr_next = false;
++        return 0;
++    }
++    write_byte(s, s->ptr, b);
++    if (!(s->reg[IOCON] & IOCON_SEQOP)) {
++        s->ptr = (s->ptr + 1) % (NREGS * 2);
++    }
++    return 0;
++}
++
++static uint8_t mcp_recv(I2CSlave *i2c)
++{
++    MCP23017State *s = MCP23017(i2c);
++    uint8_t v = read_byte(s, s->ptr);
++    if (!(s->reg[IOCON] & IOCON_SEQOP)) {
++        s->ptr = (s->ptr + 1) % (NREGS * 2);
++    }
++    return v;
++}
++
++static void mcp_pin_in(void *opaque, int n, int level)
++{
++    MCP23017State *s = MCP23017(opaque);
++    if (level == 0 || level == 1) {
++        s->ext_driven |= 1 << n;
++        s->ext_level = (s->ext_level & ~(1 << n)) | (level << n);
++    } else {
++        s->ext_driven &= ~(1 << n);
++    }
++    update(s);
++}
++
++static void mcp_reset(DeviceState *dev)
++{
++    MCP23017State *s = MCP23017(dev);
++    memset(s->reg, 0, sizeof(s->reg));
++    s->reg[IODIR] = 0xFFFF;
++    s->ptr = 0;
++    s->level = pin_levels(s);
++    update_int(s);
++}
++
++static void mcp_realize(DeviceState *dev, Error **errp)
++{
++    MCP23017State *s = MCP23017(dev);
++    qdev_init_gpio_in_named(dev, mcp_pin_in, "in", 16);
++    qdev_init_gpio_out_named(dev, s->out, "out", 16);
++    qdev_init_gpio_out_named(dev, &s->inta, "inta", 1);
++    qdev_init_gpio_out_named(dev, &s->intb, "intb", 1);
++}
++
++static void mcp_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    dc->realize = mcp_realize;
++    device_class_set_legacy_reset(dc, mcp_reset);
++    k->event = mcp_event;
++    k->send = mcp_send;
++    k->recv = mcp_recv;
++}
++
++static const TypeInfo mcp_info = {
++    .name = TYPE_MCP23017,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(MCP23017State),
++    .class_init = mcp_class_init,
++};
++
++static void mcp_register_types(void)
++{
++    type_register_static(&mcp_info);
++}
++
++type_init(mcp_register_types)
+diff --git a/hw/gpio/meson.build b/hw/gpio/meson.build
+index eca929e..18d6849 100644
+--- a/hw/gpio/meson.build
++++ b/hw/gpio/meson.build
+@@ -27,3 +27,4 @@ system_ss.add(when: 'CONFIG_RISCV_ESP32C6', if_true: files('esp32_gpio.c', 'esp3
+ system_ss.add(when: 'CONFIG_RISCV_ESP32H2', if_true: files('esp32_gpio.c', 'esp32c3_gpio.c', 'esp32h2_gpio.c'))
+ system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32_gpio.c', 'esp32s3_gpio.c', 'esp32s3_pin_link.c'))
+ system_ss.add(when: 'CONFIG_PCF8574', if_true: files('pcf8574.c'))
++system_ss.add(when: 'CONFIG_ESP_BOARD_PERIPHERALS', if_true: files('mcp23017.c'))
+diff --git a/hw/input/gpio_button.c b/hw/input/gpio_button.c
+new file mode 100644
+index 0000000..7864900
+--- /dev/null
++++ b/hw/input/gpio_button.c
+@@ -0,0 +1,218 @@
++/*
++ * A push button, switch or rotary encoder on GPIO lines
++ *
++ * A button drives its line while pressed (to 0, or 1 with active-high=on) and releases
++ * it otherwise (-1: the pull resistors decide). The line is an ESP32-S3 pin (pin=N) or
++ * a device's GPIO input (dev=ID, line=NAME, n=N), e.g. an I/O expander's.
++ * Pressed from tests with qom-set "pressed", or from the host keyboard with key=QCODE
++ * (e.g. key=a, key=ret).
++ *
++ * An encoder (encoder=on) has two lines, A at pin/n and B at pin-b/n+1; qom-set "turn"
++ * to N steps (negative: the other way) makes the quadrature edges, one step per 2 ms.
++ *
++ *   -device gpio-button,pin=0,id=boot,key=b
++ *   -device gpio-button,encoder=on,pin=4,pin-b=5,id=knob
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "qapi/qapi-types-ui.h"
++#include "qapi/util.h"
++#include "hw/irq.h"
++#include "hw/qdev-core.h"
++#include "hw/qdev-properties.h"
++#include "hw/gpio/esp32s3_gpio.h"
++#include "ui/input.h"
++#include "qom/object.h"
++
++#define TYPE_GPIO_BUTTON "gpio-button"
++OBJECT_DECLARE_SIMPLE_TYPE(GpioButtonState, GPIO_BUTTON)
++
++#define STEP_NS (500 * SCALE_US)
++
++struct GpioButtonState {
++    DeviceState parent_obj;
++
++    int32_t pin, pin_b;
++    char *dev, *line, *key;
++    int32_t n;
++    bool active_high, encoder;
++
++    qemu_irq a, b;
++    bool pressed;
++    int key_qcode;
++    /* Encoder */
++    int32_t pending;            /* Quarter steps still to make, signed */
++    int phase;                  /* Gray code position 0-3 */
++    QEMUTimer *timer;
++};
++
++static void drive(GpioButtonState *s, qemu_irq line, bool active)
++{
++    qemu_set_irq(line, active ? (s->active_high ? 1 : 0) : -1);
++}
++
++static void set_pressed(Object *obj, bool v, Error **errp)
++{
++    GpioButtonState *s = GPIO_BUTTON(obj);
++    s->pressed = v;
++    drive(s, s->a, v);
++}
++
++static bool get_pressed(Object *obj, Error **errp)
++{
++    return GPIO_BUTTON(obj)->pressed;
++}
++
++/* Quadrature: A leads B one way; 4 edges per detent */
++static void encoder_tick(void *opaque)
++{
++    GpioButtonState *s = GPIO_BUTTON(opaque);
++    if (!s->pending) {
++        return;
++    }
++    s->phase = (s->phase + (s->pending > 0 ? 1 : 3)) % 4;
++    s->pending += s->pending > 0 ? -1 : 1;
++    static const int gray_a[4] = { 0, 1, 1, 0 }, gray_b[4] = { 0, 0, 1, 1 };
++    /* Contacts to ground: a closed contact drives 0 */
++    qemu_set_irq(s->a, gray_a[s->phase] ? 0 : -1);
++    qemu_set_irq(s->b, gray_b[s->phase] ? 0 : -1);
++    if (s->pending) {
++        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + STEP_NS);
++    }
++}
++
++static void set_turn(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
++{
++    GpioButtonState *s = GPIO_BUTTON(obj);
++    int32_t steps;
++    if (!visit_type_int32(v, name, &steps, errp)) {
++        return;
++    }
++    s->pending += steps * 4;
++    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + STEP_NS);
++}
++
++static void button_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
++{
++    GpioButtonState *s = GPIO_BUTTON(dev);
++    if (evt->type == INPUT_EVENT_KIND_KEY) {
++        InputKeyEvent *key = evt->u.key.data;
++        if (qemu_input_key_value_to_qcode(key->key) == s->key_qcode) {
++            set_pressed(OBJECT(s), key->down, NULL);
++        }
++    }
++}
++
++static const QemuInputHandler button_handler = {
++    .name = "GPIO button",
++    .mask = INPUT_EVENT_MASK_KEY,
++    .event = button_input_event,
++};
++
++static qemu_irq resolve_line(GpioButtonState *s, int32_t pin, int idx, Error **errp)
++{
++    if (pin >= 0) {
++        Object *g = object_resolve_path("/machine/soc/gpio", NULL);
++        if (!object_dynamic_cast(g, TYPE_ESP32S3_GPIO) || pin >= ESP32S3_GPIO_PINS) {
++            error_setg(errp, "no ESP32-S3 pin %d", pin);
++            return NULL;
++        }
++        return qdev_get_gpio_in_named(DEVICE(g), ESP32S3_GPIO_PIN_IN, pin);
++    }
++    if (!s->dev) {
++        error_setg(errp, "a button needs pin= or dev=");
++        return NULL;
++    }
++    g_autofree char *path = s->dev[0] == '/' ? g_strdup(s->dev)
++                                             : g_strdup_printf("/machine/peripheral/%s", s->dev);
++    DeviceState *t = (DeviceState *)object_dynamic_cast(object_resolve_path(path, NULL), TYPE_DEVICE);
++    if (!t) {
++        error_setg(errp, "no device '%s' (it must come before the button)", s->dev);
++        return NULL;
++    }
++    const char *line = (s->line && *s->line) ? s->line : NULL;
++    NamedGPIOList *gl;
++    QLIST_FOREACH(gl, &t->gpios, node) {
++        if (g_strcmp0(gl->name, line) == 0 && idx < gl->num_in) {
++            return qdev_get_gpio_in_named(t, line, idx);
++        }
++    }
++    error_setg(errp, "'%s' has no input %s[%d]", s->dev, line ? line : "", idx);
++    return NULL;
++}
++
++static void button_realize(DeviceState *dev, Error **errp)
++{
++    GpioButtonState *s = GPIO_BUTTON(dev);
++
++    s->a = resolve_line(s, s->pin, s->n, errp);
++    if (!s->a) {
++        return;
++    }
++    if (s->encoder) {
++        s->b = resolve_line(s, s->pin >= 0 ? s->pin_b : -1, s->n + 1, errp);
++        if (!s->b) {
++            return;
++        }
++        s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, encoder_tick, s);
++        qemu_set_irq(s->b, -1);
++    }
++    qemu_set_irq(s->a, -1);
++    if (s->key) {
++        s->key_qcode = qapi_enum_parse(&QKeyCode_lookup, s->key, -1, errp);
++        if (s->key_qcode < 0) {
++            return;
++        }
++        qemu_input_handler_register(dev, &button_handler);
++    }
++}
++
++static Property button_properties[] = {
++    DEFINE_PROP_INT32("pin", GpioButtonState, pin, -1),
++    DEFINE_PROP_INT32("pin-b", GpioButtonState, pin_b, -1),
++    DEFINE_PROP_STRING("dev", GpioButtonState, dev),
++    DEFINE_PROP_STRING("line", GpioButtonState, line),
++    DEFINE_PROP_INT32("n", GpioButtonState, n, 0),
++    DEFINE_PROP_STRING("key", GpioButtonState, key),
++    DEFINE_PROP_BOOL("active-high", GpioButtonState, active_high, false),
++    DEFINE_PROP_BOOL("encoder", GpioButtonState, encoder, false),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void button_instance_init(Object *obj)
++{
++    object_property_add_bool(obj, "pressed", get_pressed, set_pressed);
++    object_property_add(obj, "turn", "int32", NULL, set_turn, NULL, NULL);
++}
++
++static void button_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    dc->realize = button_realize;
++    dc->user_creatable = true;
++    dc->desc = "A button, switch or rotary encoder on GPIO lines";
++    device_class_set_props(dc, button_properties);
++    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static const TypeInfo button_info = {
++    .name = TYPE_GPIO_BUTTON,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(GpioButtonState),
++    .instance_init = button_instance_init,
++    .class_init = button_class_init,
++};
++
++static void button_register_types(void)
++{
++    type_register_static(&button_info);
++}
++
++type_init(button_register_types)
+diff --git a/hw/input/i2c_touch.c b/hw/input/i2c_touch.c
+new file mode 100644
+index 0000000..2e026ad
+--- /dev/null
++++ b/hw/input/i2c_touch.c
+@@ -0,0 +1,335 @@
++/*
++ * Capacitive touch controllers on I2C: GT911 (Goodix), CST816S/T/D (Hynitron), FT6336U
++ * (FocalTech FT6x06 family)
++ *
++ * The touch comes from the absolute pointer (a window's mouse) or, for tests, the QOM
++ * properties "x", "y" (in the controller's coordinates) and "pressed". While touched
++ * the controller makes a new report every 10 ms, and once on release; each report pulses
++ * INT low for 100 us (the "int" GPIO out), except the FT6336 in its default polling mode,
++ * which holds INT low while touched. Wire INT with pin-link dir=out (open-drain=on for an
++ * open drain line).
++ *
++ * GT911: 16-bit register addresses; product ID "911" at 0x8140, resolution at 0x8146,
++ * status 0x814E (bit 7: a report is ready, bits 0-3: points; written 0 to take it),
++ * points from 0x814F, configuration 0x8047-0x8100 (its x/y maxima scale the
++ * coordinates). CST816 and FT6336: 8-bit registers; points at 0x02-0x06, chip IDs at
++ * 0xA7 (CST816) or 0xA3/0xA8 (FT6336).
++ *
++ *   -device gt911,bus=i2c0,address=0x5d,id=touch,width=320,height=240
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "hw/i2c/i2c.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "ui/input.h"
++#include "qom/object.h"
++
++#define TYPE_I2C_TOUCH "i2c-touch"
++OBJECT_DECLARE_SIMPLE_TYPE(I2CTouchState, I2C_TOUCH)
++
++enum { KIND_GT911, KIND_CST816, KIND_FT6336 };
++
++#define REPORT_NS   (10 * SCALE_MS)
++#define PULSE_NS    (100 * SCALE_US)
++
++struct I2CTouchState {
++    I2CSlave parent_obj;
++
++    int kind;
++    qemu_irq irq;
++    QEMUTimer *report_timer, *pulse_timer;
++    QemuInputHandlerState *input;
++
++    uint32_t width, height;     /* Coordinate range */
++    uint32_t chip_id;           /* CST816: 0xB4 S, 0xB5 T, 0xB6 D */
++    bool swap_xy, invert_x, invert_y;
++
++    uint32_t x, y;
++    bool pressed;
++    bool was_pressed;
++
++    /* Register access */
++    uint16_t reg;
++    int addr_bytes;             /* Address bytes still to come in this write */
++    bool writing_addr;
++    uint8_t gt_config[0x8100 - 0x8047 + 1];
++    uint8_t gt_status;
++    uint8_t gt_points[8];
++    uint8_t ft_mode;            /* FT6336 G_MODE: 0 polling, 1 trigger */
++    uint8_t gesture;
++};
++
++static void pulse_end(void *opaque)
++{
++    I2CTouchState *s = I2C_TOUCH(opaque);
++    if (!(s->kind == KIND_FT6336 && s->ft_mode == 0 && s->pressed)) {
++        qemu_set_irq(s->irq, 1);
++    }
++}
++
++static void report(I2CTouchState *s)
++{
++    if (s->kind == KIND_GT911) {
++        uint16_t x = s->x, y = s->y;
++        s->gt_status = 0x80 | (s->pressed ? 1 : 0);
++        uint8_t p[8] = { 0, x & 0xFF, x >> 8, y & 0xFF, y >> 8, 0x20, 0, 0 };
++        memcpy(s->gt_points, p, sizeof(p));
++    }
++    if (s->kind == KIND_FT6336 && s->ft_mode == 0) {
++        qemu_set_irq(s->irq, !s->pressed);      /* Polling mode: low while touched */
++        return;
++    }
++    qemu_set_irq(s->irq, 0);
++    timer_mod(s->pulse_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + PULSE_NS);
++}
++
++static void report_tick(void *opaque)
++{
++    I2CTouchState *s = I2C_TOUCH(opaque);
++    if (s->pressed || s->was_pressed) {
++        report(s);
++    }
++    s->was_pressed = s->pressed;
++    if (s->pressed) {
++        timer_mod(s->report_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + REPORT_NS);
++    }
++}
++
++static void touch_changed(I2CTouchState *s)
++{
++    report_tick(s);
++}
++
++static uint8_t read_reg(I2CTouchState *s, uint16_t r)
++{
++    uint16_t x = s->x, y = s->y;
++    switch (s->kind) {
++    case KIND_GT911:
++        if (r >= 0x8047 && r <= 0x8100) {
++            return s->gt_config[r - 0x8047];
++        }
++        switch (r) {
++        case 0x8140: return '9';
++        case 0x8141: return '1';
++        case 0x8142: return '1';
++        case 0x8143: return 0;
++        case 0x8144: return 0x60;           /* Firmware 0x1060 */
++        case 0x8145: return 0x10;
++        case 0x8146: return s->width & 0xFF;
++        case 0x8147: return s->width >> 8;
++        case 0x8148: return s->height & 0xFF;
++        case 0x8149: return s->height >> 8;
++        case 0x814A: return 0;              /* Vendor */
++        case 0x814E: return s->gt_status;
++        default:
++            if (r >= 0x814F && r < 0x814F + 8) {
++                return s->gt_points[r - 0x814F];
++            }
++            return 0;
++        }
++    case KIND_CST816:
++        switch (r) {
++        case 0x00: return 0;
++        case 0x01: return s->gesture;
++        case 0x02: return s->pressed ? 1 : 0;
++        case 0x03: return (s->pressed ? 0x80 : 0x40) | ((x >> 8) & 0x0F);
++        case 0x04: return x & 0xFF;
++        case 0x05: return (y >> 8) & 0x0F;
++        case 0x06: return y & 0xFF;
++        case 0xA7: return s->chip_id;
++        case 0xA8: return 0x00;
++        case 0xA9: return 0x02;
++        default:   return 0;
++        }
++    default: /* FT6336 */
++        switch (r) {
++        case 0x00: return 0;
++        case 0x01: return s->gesture;
++        case 0x02: return s->pressed ? 1 : 0;
++        case 0x03: return (s->pressed ? 0x80 : 0x40) | ((x >> 8) & 0x0F);
++        case 0x04: return x & 0xFF;
++        case 0x05: return (y >> 8) & 0x0F;
++        case 0x06: return y & 0xFF;
++        case 0x07: return 0x20;
++        case 0x08: return 0x10;
++        case 0x80: return 0x16;
++        case 0xA3: return 0x64;             /* FT6336U */
++        case 0xA4: return s->ft_mode;
++        case 0xA6: return 0x10;
++        case 0xA8: return 0x11;             /* FocalTech */
++        default:   return 0;
++        }
++    }
++}
++
++static void write_reg(I2CTouchState *s, uint16_t r, uint8_t v)
++{
++    if (s->kind == KIND_GT911) {
++        if (r >= 0x8047 && r <= 0x8100) {
++            s->gt_config[r - 0x8047] = v;
++            if (r == 0x804B) {          /* x/y output maxima: the coordinate range */
++                s->width = s->gt_config[1] | s->gt_config[2] << 8;
++                s->height = s->gt_config[3] | s->gt_config[4] << 8;
++            }
++        } else if (r == 0x814E) {
++            s->gt_status = v;
++        }
++    } else if (s->kind == KIND_FT6336 && r == 0xA4) {
++        s->ft_mode = v & 1;
++    }
++}
++
++static int touch_event(I2CSlave *i2c, enum i2c_event event)
++{
++    I2CTouchState *s = I2C_TOUCH(i2c);
++    if (event == I2C_START_SEND || event == I2C_START_SEND_ASYNC) {
++        s->addr_bytes = s->kind == KIND_GT911 ? 2 : 1;
++        s->writing_addr = true;
++    }
++    return 0;
++}
++
++static int touch_send(I2CSlave *i2c, uint8_t b)
++{
++    I2CTouchState *s = I2C_TOUCH(i2c);
++    if (s->writing_addr) {
++        s->reg = s->addr_bytes == 2 ? (uint16_t)b << 8 : (s->kind == KIND_GT911 ? (s->reg | b) : b);
++        if (--s->addr_bytes == 0) {
++            s->writing_addr = false;
++        }
++        return 0;
++    }
++    write_reg(s, s->reg++, b);
++    return 0;
++}
++
++static uint8_t touch_recv(I2CSlave *i2c)
++{
++    I2CTouchState *s = I2C_TOUCH(i2c);
++    return read_reg(s, s->reg++);
++}
++
++static void touch_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
++{
++    I2CTouchState *s = I2C_TOUCH(dev);
++    if (evt->type == INPUT_EVENT_KIND_ABS) {
++        InputMoveEvent *move = evt->u.abs.data;
++        bool is_x = (move->axis == INPUT_AXIS_X) != s->swap_xy;
++        uint32_t range = is_x ? s->width : s->height;
++        uint32_t v = (uint64_t)move->value * (range - 1) / INPUT_EVENT_ABS_MAX;
++        if (is_x) {
++            s->x = s->invert_x ? range - 1 - v : v;
++        } else {
++            s->y = s->invert_y ? range - 1 - v : v;
++        }
++    } else if (evt->type == INPUT_EVENT_KIND_BTN) {
++        InputBtnEvent *btn = evt->u.btn.data;
++        if (btn->button == INPUT_BUTTON_LEFT && btn->down != s->pressed) {
++            s->pressed = btn->down;
++            touch_changed(s);
++        }
++    }
++}
++
++static const QemuInputHandler touch_handler = {
++    .name = "capacitive touch screen",
++    .mask = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
++    .event = touch_input_event,
++};
++
++static bool get_pressed(Object *obj, Error **errp)
++{
++    return I2C_TOUCH(obj)->pressed;
++}
++
++static void set_pressed(Object *obj, bool v, Error **errp)
++{
++    I2CTouchState *s = I2C_TOUCH(obj);
++    if (v != s->pressed) {
++        s->pressed = v;
++        touch_changed(s);
++    }
++}
++
++static void touch_instance_init(Object *obj)
++{
++    I2CTouchState *s = I2C_TOUCH(obj);
++    const char *t = object_get_typename(obj);
++    s->kind = !strcmp(t, "gt911") ? KIND_GT911 : !strcmp(t, "cst816") ? KIND_CST816 : KIND_FT6336;
++    object_property_add_uint32_ptr(obj, "x", &s->x, OBJ_PROP_FLAG_READWRITE);
++    object_property_add_uint32_ptr(obj, "y", &s->y, OBJ_PROP_FLAG_READWRITE);
++    object_property_add_bool(obj, "pressed", get_pressed, set_pressed);
++}
++
++static void touch_realize(DeviceState *dev, Error **errp)
++{
++    I2CTouchState *s = I2C_TOUCH(dev);
++    qdev_init_gpio_out_named(dev, &s->irq, "int", 1);
++    s->report_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, report_tick, s);
++    s->pulse_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pulse_end, s);
++    s->input = qemu_input_handler_register(dev, &touch_handler);
++    if (s->kind == KIND_GT911) {
++        s->gt_config[0] = 0x41;                 /* Config version */
++        s->gt_config[1] = s->width & 0xFF;
++        s->gt_config[2] = s->width >> 8;
++        s->gt_config[3] = s->height & 0xFF;
++        s->gt_config[4] = s->height >> 8;
++        s->gt_config[5] = 5;                    /* Touch points */
++        s->gt_config[6] = 0x0D;                 /* INT falling edge, X2Y off */
++    }
++}
++
++static void touch_reset(DeviceState *dev)
++{
++    I2CTouchState *s = I2C_TOUCH(dev);
++    s->gt_status = 0;
++    s->ft_mode = 0;
++    qemu_set_irq(s->irq, 1);
++}
++
++static Property touch_properties[] = {
++    DEFINE_PROP_UINT32("width", I2CTouchState, width, 240),
++    DEFINE_PROP_UINT32("height", I2CTouchState, height, 320),
++    DEFINE_PROP_UINT32("chip-id", I2CTouchState, chip_id, 0xB5),
++    DEFINE_PROP_BOOL("swap-xy", I2CTouchState, swap_xy, false),
++    DEFINE_PROP_BOOL("invert-x", I2CTouchState, invert_x, false),
++    DEFINE_PROP_BOOL("invert-y", I2CTouchState, invert_y, false),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void touch_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    dc->realize = touch_realize;
++    device_class_set_legacy_reset(dc, touch_reset);
++    device_class_set_props(dc, touch_properties);
++    k->event = touch_event;
++    k->send = touch_send;
++    k->recv = touch_recv;
++    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static const TypeInfo touch_types[] = {
++    {
++        .name = TYPE_I2C_TOUCH,
++        .parent = TYPE_I2C_SLAVE,
++        .instance_size = sizeof(I2CTouchState),
++        .instance_init = touch_instance_init,
++        .class_init = touch_class_init,
++        .abstract = true,
++    },
++    { .name = "gt911", .parent = TYPE_I2C_TOUCH },
++    { .name = "cst816", .parent = TYPE_I2C_TOUCH },
++    { .name = "ft6336", .parent = TYPE_I2C_TOUCH },
++};
++
++DEFINE_TYPES(touch_types)
+diff --git a/hw/input/meson.build b/hw/input/meson.build
+index 1e7e0f2..243c88a 100644
+--- a/hw/input/meson.build
++++ b/hw/input/meson.build
+@@ -11,3 +11,5 @@ system_ss.add(when: 'CONFIG_VIRTIO_INPUT_HOST', if_true: files('virtio-input-hos
+ 
+ system_ss.add(when: 'CONFIG_LASIPS2', if_true: files('lasips2.c'))
+ system_ss.add(when: 'CONFIG_XPT2046', if_true: files('xpt2046.c'))
++system_ss.add(when: 'CONFIG_ESP_BOARD_PERIPHERALS', if_true: files('i2c_touch.c', 'tdeck_keyboard.c'))
++system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('gpio_button.c'))
+diff --git a/hw/input/tdeck_keyboard.c b/hw/input/tdeck_keyboard.c
+new file mode 100644
+index 0000000..5530d8d
+--- /dev/null
++++ b/hw/input/tdeck_keyboard.c
+@@ -0,0 +1,196 @@
++/*
++ * LilyGO T-Deck keyboard: an ESP32-C3 running LilyGO's Keyboard_ESP32C3 firmware as an
++ * I2C slave (0x55). A 1-byte read returns the next key's character, 0 when none;
++ * writes 0x01 <duty> and 0x02 <duty> set the backlight now and its Alt+B level.
++ *
++ * Keys come from the host keyboard (a window's) or, for tests, the QOM property "keys":
++ * a string whose characters are queued as keys ("\n" is Enter, 0x08 Backspace). "int"
++ * pulses low for each key queued; the T-Deck doesn't wire it, other boards may.
++ *
++ *   -device tdeck-keyboard,bus=i2c0,address=0x55,id=kbd
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "hw/i2c/i2c.h"
++#include "hw/irq.h"
++#include "ui/input.h"
++#include "qom/object.h"
++
++#define TYPE_TDECK_KEYBOARD "tdeck-keyboard"
++OBJECT_DECLARE_SIMPLE_TYPE(TDeckKeyboardState, TDECK_KEYBOARD)
++
++#define QUEUE_LEN 64
++
++struct TDeckKeyboardState {
++    I2CSlave parent_obj;
++
++    qemu_irq irq;
++    QEMUTimer *pulse;
++    uint8_t queue[QUEUE_LEN];
++    int head, count;
++    bool shift;
++    uint8_t cmd;
++    int nbytes;
++    uint8_t brightness, default_brightness;
++};
++
++static void push(TDeckKeyboardState *s, uint8_t c)
++{
++    if (s->count < QUEUE_LEN) {
++        s->queue[(s->head + s->count++) % QUEUE_LEN] = c;
++        qemu_set_irq(s->irq, 0);
++        timer_mod(s->pulse, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100 * SCALE_US);
++    }
++}
++
++static void pulse_end(void *opaque)
++{
++    qemu_set_irq(TDECK_KEYBOARD(opaque)->irq, 1);
++}
++
++static int kb_event(I2CSlave *i2c, enum i2c_event event)
++{
++    TDeckKeyboardState *s = TDECK_KEYBOARD(i2c);
++    if (event == I2C_START_SEND || event == I2C_START_SEND_ASYNC) {
++        s->nbytes = 0;
++    }
++    return 0;
++}
++
++static int kb_send(I2CSlave *i2c, uint8_t b)
++{
++    TDeckKeyboardState *s = TDECK_KEYBOARD(i2c);
++    if (s->nbytes++ == 0) {
++        s->cmd = b;
++    } else if (s->cmd == 0x01) {
++        s->brightness = b;
++    } else if (s->cmd == 0x02) {
++        s->default_brightness = b;
++    }
++    return 0;
++}
++
++static uint8_t kb_recv(I2CSlave *i2c)
++{
++    TDeckKeyboardState *s = TDECK_KEYBOARD(i2c);
++    if (!s->count) {
++        return 0;
++    }
++    uint8_t c = s->queue[s->head];
++    s->head = (s->head + 1) % QUEUE_LEN;
++    s->count--;
++    return c;
++}
++
++/* The host's keys to the characters the keyboard sends */
++static int qcode_char(int q, bool shift)
++{
++    static const char *letters = "abcdefghijklmnopqrstuvwxyz";
++    if (q >= Q_KEY_CODE_A && q <= Q_KEY_CODE_Z) {
++        /* QKeyCode letters are in alphabetical order */
++        int c = letters[q - Q_KEY_CODE_A];
++        return shift ? c - 32 : c;
++    }
++    if (q >= Q_KEY_CODE_1 && q <= Q_KEY_CODE_9) {
++        return shift ? "!@#$%^&*("[q - Q_KEY_CODE_1] : '1' + (q - Q_KEY_CODE_1);
++    }
++    switch (q) {
++    case Q_KEY_CODE_0:          return shift ? ')' : '0';
++    case Q_KEY_CODE_SPC:        return ' ';
++    case Q_KEY_CODE_RET:        return '\r';
++    case Q_KEY_CODE_BACKSPACE:  return 0x08;
++    case Q_KEY_CODE_DOT:        return shift ? '>' : '.';
++    case Q_KEY_CODE_COMMA:      return shift ? '<' : ',';
++    case Q_KEY_CODE_MINUS:      return shift ? '_' : '-';
++    case Q_KEY_CODE_EQUAL:      return shift ? '+' : '=';
++    case Q_KEY_CODE_SLASH:      return shift ? '?' : '/';
++    case Q_KEY_CODE_SEMICOLON:  return shift ? ':' : ';';
++    case Q_KEY_CODE_APOSTROPHE: return shift ? '"' : '\'';
++    case Q_KEY_CODE_ESC:        return 0x1B;
++    default:                    return -1;
++    }
++}
++
++static void kb_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
++{
++    TDeckKeyboardState *s = TDECK_KEYBOARD(dev);
++    if (evt->type != INPUT_EVENT_KIND_KEY) {
++        return;
++    }
++    InputKeyEvent *key = evt->u.key.data;
++    int q = qemu_input_key_value_to_qcode(key->key);
++    if (q == Q_KEY_CODE_SHIFT || q == Q_KEY_CODE_SHIFT_R) {
++        s->shift = key->down;
++        return;
++    }
++    if (key->down) {
++        int c = qcode_char(q, s->shift);
++        if (c >= 0) {
++            push(s, c);
++        }
++    }
++}
++
++static const QemuInputHandler kb_handler = {
++    .name = "T-Deck keyboard",
++    .mask = INPUT_EVENT_MASK_KEY,
++    .event = kb_input_event,
++};
++
++static void set_type(Object *obj, const char *str, Error **errp)
++{
++    TDeckKeyboardState *s = TDECK_KEYBOARD(obj);
++    for (const char *p = str; *p; p++) {
++        push(s, *p == '\n' ? '\r' : (uint8_t)*p);
++    }
++}
++
++static void kb_instance_init(Object *obj)
++{
++    object_property_add_str(obj, "keys", NULL, set_type);
++    object_property_add_uint8_ptr(obj, "brightness", &TDECK_KEYBOARD(obj)->brightness,
++                                  OBJ_PROP_FLAG_READ);
++}
++
++static void kb_realize(DeviceState *dev, Error **errp)
++{
++    TDeckKeyboardState *s = TDECK_KEYBOARD(dev);
++    qdev_init_gpio_out_named(dev, &s->irq, "int", 1);
++    s->pulse = timer_new_ns(QEMU_CLOCK_VIRTUAL, pulse_end, s);
++    qemu_input_handler_register(dev, &kb_handler);
++    s->brightness = 127;
++    s->default_brightness = 127;
++}
++
++static void kb_class_init(ObjectClass *klass, void *data)
++{
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = kb_realize;
++    k->event = kb_event;
++    k->send = kb_send;
++    k->recv = kb_recv;
++    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static const TypeInfo kb_info = {
++    .name = TYPE_TDECK_KEYBOARD,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(TDeckKeyboardState),
++    .instance_init = kb_instance_init,
++    .class_init = kb_class_init,
++};
++
++static void kb_register_types(void)
++{
++    type_register_static(&kb_info);
++}
++
++type_init(kb_register_types)
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index 1f1baa5..84eb364 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -216,3 +216,7 @@ config XLNX_VERSAL_TRNG
+     bool
+ 
+ source macio/Kconfig
++
++config ESP_BOARD_PERIPHERALS
++    bool
++    depends on I2C
+diff --git a/hw/xtensa/Kconfig b/hw/xtensa/Kconfig
+index 84228a5..ac9fb0a 100644
+--- a/hw/xtensa/Kconfig
++++ b/hw/xtensa/Kconfig
+@@ -36,6 +36,9 @@ config XTENSA_ESP32
+     select XPT2046
+     select SSI_SD
+     select AT24C
++    select ESP_BOARD_PERIPHERALS
++    select AT24C
++    select ESP_BOARD_PERIPHERALS
+ 
+ config XTENSA_ESP32S3
+     bool
+@@ -52,5 +55,6 @@ config XTENSA_ESP32S3
+     select XPT2046
+     select SSI_SD
+     select AT24C
++    select ESP_BOARD_PERIPHERALS
+ 
+ 
+diff --git a/tests/qtest/esp32s3-i2c-devices-test.c b/tests/qtest/esp32s3-i2c-devices-test.c
+new file mode 100644
+index 0000000..45c1981
+--- /dev/null
++++ b/tests/qtest/esp32s3-i2c-devices-test.c
+@@ -0,0 +1,279 @@
++/*
++ * QTest for board devices on the ESP32-S3's I2C0: an SSD1306 OLED (Heltec boards), GT911
++ * and CST816 touch (T-Deck, T-Display-S3 Touch), the T-Deck keyboard, an MCP23017 with a
++ * button (gbagate), and buttons and a rotary encoder on chip pins.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "qapi/qmp/qdict.h"
++#include "qapi/qmp/qjson.h"
++#include "qapi/error.h"
++#include "libqtest.h"
++
++#define I2C0            0x60013000
++#define I2C_SCL_LOW     (I2C0 + 0x00)
++#define I2C_CTR         (I2C0 + 0x04)
++#define I2C_FIFO_CONF   (I2C0 + 0x18)
++#define I2C_DATA        (I2C0 + 0x1C)
++#define I2C_INT_RAW     (I2C0 + 0x20)
++#define I2C_INT_CLR     (I2C0 + 0x24)
++#define I2C_SCL_HIGH    (I2C0 + 0x38)
++#define I2C_CLK_CONF    (I2C0 + 0x54)
++#define I2C_COMD(n)     (I2C0 + 0x58 + 4 * (n))
++
++#define CMD(op, n, ack_check, ack_val) ((op) << 11 | (ack_val) << 10 | (ack_check) << 8 | (n))
++#define INT_TRANS_COMPLETE  BIT(7)
++#define INT_NACK            BIT(10)
++
++#define GPIO            0x60004000
++#define IN              (GPIO + 0x3C)
++#define IN1             (GPIO + 0x40)
++#define STATUS          (GPIO + 0x44)
++#define STATUS_W1TC     (GPIO + 0x4C)
++#define PIN(n)          (GPIO + 0x74 + 4 * (n))
++#define IOMUX(n)        (0x60009004 + 4 * (n))
++#define FUN_IE          BIT(9)
++#define FUN_PU          BIT(8)
++
++static QTestState *board(const char *devices)
++{
++    g_autofree char *args = g_strdup_printf("-machine esp32s3 %s", devices);
++    QTestState *qts = qtest_init(args);
++    qtest_writel(qts, I2C_CLK_CONF, BIT(21));
++    qtest_writel(qts, I2C_SCL_LOW, 49);         /* 400 kHz */
++    qtest_writel(qts, I2C_SCL_HIGH, 49);
++    qtest_writel(qts, I2C_CTR, BIT(4) | BIT(11));
++    return qts;
++}
++
++/* A write of wn bytes, then (repeated start) a read of rn: as i2c_master_transmit_receive */
++static bool i2c_xfer(QTestState *qts, uint8_t addr, const uint8_t *w, int wn, uint8_t *r, int rn)
++{
++    int c = 0;
++    qtest_writel(qts, I2C_FIFO_CONF, BIT(12) | BIT(13));
++    qtest_writel(qts, I2C_FIFO_CONF, 0);
++    qtest_writel(qts, I2C_COMD(c++), CMD(6, 0, 0, 0));
++    qtest_writel(qts, I2C_DATA, addr << 1);
++    for (int i = 0; i < wn; i++) {
++        qtest_writel(qts, I2C_DATA, w[i]);
++    }
++    qtest_writel(qts, I2C_COMD(c++), CMD(1, 1 + wn, 1, 0));
++    if (rn) {
++        qtest_writel(qts, I2C_COMD(c++), CMD(6, 0, 0, 0));
++        qtest_writel(qts, I2C_DATA, addr << 1 | 1);
++        qtest_writel(qts, I2C_COMD(c++), CMD(1, 1, 1, 0));
++        if (rn > 1) {
++            qtest_writel(qts, I2C_COMD(c++), CMD(3, rn - 1, 0, 0));
++        }
++        qtest_writel(qts, I2C_COMD(c++), CMD(3, 1, 0, 1));
++    }
++    qtest_writel(qts, I2C_COMD(c++), CMD(2, 0, 0, 0));
++    qtest_writel(qts, I2C_INT_CLR, 0x3FFFF);
++    qtest_writel(qts, I2C_CTR, BIT(4) | BIT(5));
++    qtest_clock_step(qts, 1000 * 1000);        /* Plenty at 400 kHz for these few bytes */
++    uint32_t raw = qtest_readl(qts, I2C_INT_RAW);
++    for (int i = 0; i < rn; i++) {
++        r[i] = qtest_readl(qts, I2C_DATA);
++    }
++    return (raw & INT_TRANS_COMPLETE) && !(raw & INT_NACK);
++}
++
++static void qom_set(QTestState *qts, const char *path, const char *prop, const char *json)
++{
++    QDict *r = qtest_qmp(qts, "{'execute': 'qom-set', 'arguments': {'path': %s, 'property': %s, "
++                              "'value': %p}}", path, prop, qobject_from_json(json, &error_abort));
++    g_assert(qdict_haskey(r, "return"));
++    qobject_unref(r);
++}
++
++static uint8_t *screendump(QTestState *qts, const char *dev, int *w, int *h)
++{
++    g_autofree char *path = g_strdup_printf("%s/qtest-%s-%d.ppm", g_get_tmp_dir(), dev, getpid());
++    QDict *r = qtest_qmp(qts, "{'execute': 'screendump', 'arguments': {'filename': %s, 'device': %s}}",
++                         path, dev);
++    g_assert(qdict_haskey(r, "return"));
++    qobject_unref(r);
++    gchar *data;
++    gsize len;
++    g_assert(g_file_get_contents(path, &data, &len, NULL));
++    unlink(path);
++    int maxval, off;
++    g_assert_cmpint(sscanf(data, "P6 %d %d %d%n", w, h, &maxval, &off), ==, 3);
++    uint8_t *px = g_memdup2(data + off + 1, (size_t)*w * *h * 3);
++    g_free(data);
++    return px;
++}
++
++static void test_ssd1306(void)
++{
++    QTestState *qts = board("-device ssd1306,bus=i2c0,address=0x3c,id=oled");
++    /* Adafruit_SSD1306's start (abridged), horizontal addressing over the whole screen */
++    const uint8_t init[] = { 0x00, 0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40, 0x8D, 0x14,
++                             0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x12, 0x81, 0xCF, 0xA6, 0xAF,
++                             0x21, 0x00, 0x7F, 0x22, 0x00, 0x07 };
++    g_assert_true(i2c_xfer(qts, 0x3C, init, sizeof(init), NULL, 0));
++    /* Data: column 0 all lit, column 1 the top pixel, then a dark column */
++    const uint8_t data[] = { 0x40, 0xFF, 0x01, 0x00 };
++    g_assert_true(i2c_xfer(qts, 0x3C, data, sizeof(data), NULL, 0));
++
++    int w, h;
++    uint8_t *px = screendump(qts, "oled", &w, &h);
++    g_assert_cmpint(w, ==, 128);
++    g_assert_cmpint(h, ==, 64);
++    /* Segment remap (A1) and COM scan C8: RAM column 0 is the glass's right, page 0 its
++     * bottom; that's how the Heltec module is mounted so the image is upright */
++#define LIT(x, y) (px[((y) * w + (x)) * 3] > 0x40)
++    for (int y = 56; y < 64; y++) {
++        g_assert_true(LIT(127, y));
++    }
++    g_assert_true(LIT(126, 63));
++    g_assert_false(LIT(126, 62));
++    g_assert_false(LIT(125, 63));
++    g_free(px);
++    qtest_quit(qts);
++}
++
++static void test_touch(void)
++{
++    QTestState *qts = board("-device gt911,bus=i2c0,address=0x5d,id=gt,width=320,height=240 "
++                            "-device esp32s3.pin-link,pin=16,dev=gt,line=int,dir=out "
++                            "-device cst816,bus=i2c0,address=0x15,id=cst,width=170,height=320");
++    uint8_t r[8];
++
++    /* GT911: product ID, resolution */
++    g_assert_true(i2c_xfer(qts, 0x5D, (uint8_t[]){ 0x81, 0x40 }, 2, r, 3));
++    g_assert_cmpmem(r, 3, "911", 3);
++    g_assert_true(i2c_xfer(qts, 0x5D, (uint8_t[]){ 0x81, 0x46 }, 2, r, 4));
++    g_assert_cmpint(r[0] | r[1] << 8, ==, 320);
++    g_assert_cmpint(r[2] | r[3] << 8, ==, 240);
++
++    /* A touch at (100, 200): INT falls, the status says one point, the point is there */
++    qtest_writel(qts, PIN(16), 2 << 7);                     /* Falling edge */
++    qtest_writel(qts, STATUS_W1TC, ~0u);
++    qom_set(qts, "/machine/peripheral/gt", "x", "100");
++    qom_set(qts, "/machine/peripheral/gt", "y", "200");
++    qom_set(qts, "/machine/peripheral/gt", "pressed", "true");
++    qtest_clock_step(qts, 1000 * 1000);
++    g_assert_cmphex(qtest_readl(qts, STATUS) & BIT(16), ==, BIT(16));
++    g_assert_true(i2c_xfer(qts, 0x5D, (uint8_t[]){ 0x81, 0x4E }, 2, r, 6));
++    g_assert_cmphex(r[0], ==, 0x81);
++    g_assert_cmpint(r[2] | r[3] << 8, ==, 100);
++    g_assert_cmpint(r[4] | r[5] << 8, ==, 200);
++    /* Taken: status written 0 */
++    g_assert_true(i2c_xfer(qts, 0x5D, (uint8_t[]){ 0x81, 0x4E, 0x00 }, 3, NULL, 0));
++    g_assert_true(i2c_xfer(qts, 0x5D, (uint8_t[]){ 0x81, 0x4E }, 2, r, 1));
++    g_assert_cmphex(r[0], ==, 0x00);
++    /* Still touched: the next report 10 ms later */
++    qtest_clock_step(qts, 11 * 1000 * 1000);
++    g_assert_true(i2c_xfer(qts, 0x5D, (uint8_t[]){ 0x81, 0x4E }, 2, r, 1));
++    g_assert_cmphex(r[0], ==, 0x81);
++
++    /* CST816: chip ID, then a touch */
++    g_assert_true(i2c_xfer(qts, 0x15, (uint8_t[]){ 0xA7 }, 1, r, 1));
++    g_assert_cmphex(r[0], ==, 0xB5);
++    g_assert_true(i2c_xfer(qts, 0x15, (uint8_t[]){ 0x02 }, 1, r, 5));
++    g_assert_cmphex(r[0], ==, 0);
++    qom_set(qts, "/machine/peripheral/cst", "x", "150");
++    qom_set(qts, "/machine/peripheral/cst", "y", "300");
++    qom_set(qts, "/machine/peripheral/cst", "pressed", "true");
++    g_assert_true(i2c_xfer(qts, 0x15, (uint8_t[]){ 0x02 }, 1, r, 5));
++    g_assert_cmphex(r[0], ==, 1);
++    g_assert_cmpint((r[1] & 0x0F) << 8 | r[2], ==, 150);
++    g_assert_cmpint((r[3] & 0x0F) << 8 | r[4], ==, 300);
++    qtest_quit(qts);
++}
++
++static void test_keyboard(void)
++{
++    QTestState *qts = board("-device tdeck-keyboard,bus=i2c0,address=0x55,id=kbd");
++    uint8_t r[1];
++    g_assert_true(i2c_xfer(qts, 0x55, NULL, 0, r, 1));
++    g_assert_cmphex(r[0], ==, 0);
++    qom_set(qts, "/machine/peripheral/kbd", "keys", "\"hi\\n\"");
++    const char want[] = { 'h', 'i', '\r', 0 };
++    for (int i = 0; i < 4; i++) {
++        g_assert_true(i2c_xfer(qts, 0x55, NULL, 0, r, 1));
++        g_assert_cmphex(r[0], ==, (uint8_t)want[i]);
++    }
++    /* Backlight */
++    g_assert_true(i2c_xfer(qts, 0x55, (uint8_t[]){ 0x01, 200 }, 2, NULL, 0));
++    QDict *resp = qtest_qmp(qts, "{'execute': 'qom-get', 'arguments': {'path': '/machine/peripheral/kbd', "
++                                 "'property': 'brightness'}}");
++    g_assert_cmpint(qdict_get_int(resp, "return"), ==, 200);
++    qobject_unref(resp);
++    qtest_quit(qts);
++}
++
++static void test_expander(void)
++{
++    QTestState *qts = board("-device mcp23017,bus=i2c0,address=0x20,id=exp "
++                            "-device gpio-button,dev=exp,line=in,n=0,id=btnA "
++                            "-device esp32s3.pin-link,pin=36,dev=exp,line=inta,dir=out,open-drain=on,pull=up");
++    uint8_t r[2];
++    /* gbagate's set up: GPA all inputs with pull-ups, interrupt on change, open drain INT */
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x0A, 0x44 }, 2, NULL, 0));     /* IOCON MIRROR|ODR */
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x0C, 0xFF, 0xFF }, 3, NULL, 0)); /* GPPU */
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x04, 0xFF, 0x00 }, 3, NULL, 0)); /* GPINTEN A */
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x12 }, 1, r, 2));
++    g_assert_cmphex(r[0], ==, 0xFF);
++    g_assert_cmphex(qtest_readl(qts, IN1) & BIT(36 - 32), ==, BIT(36 - 32));
++
++    qom_set(qts, "/machine/peripheral/btnA", "pressed", "true");
++    g_assert_cmphex(qtest_readl(qts, IN1) & BIT(36 - 32), ==, 0);              /* INT low */
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x0E }, 1, r, 1));           /* INTF */
++    g_assert_cmphex(r[0], ==, 0x01);
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x12 }, 1, r, 1));           /* GPIOA */
++    g_assert_cmphex(r[0], ==, 0xFE);
++    g_assert_cmphex(qtest_readl(qts, IN1) & BIT(36 - 32), ==, BIT(36 - 32));   /* Cleared */
++
++    /* Outputs: GPB0 as an output follows OLATB */
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x01, 0xFE }, 2, NULL, 0));     /* IODIRB */
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x15, 0x01 }, 2, NULL, 0));     /* OLATB */
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x13 }, 1, r, 1));
++    g_assert_cmphex(r[0] & 1, ==, 1);
++    qtest_quit(qts);
++}
++
++static void test_buttons_and_encoder(void)
++{
++    QTestState *qts = board("-device gpio-button,pin=0,id=boot "
++                            "-device gpio-button,encoder=on,pin=4,pin-b=5,id=knob");
++    qtest_writel(qts, IOMUX(0), FUN_IE | FUN_PU);
++    qtest_writel(qts, IOMUX(4), FUN_IE | FUN_PU);
++    qtest_writel(qts, IOMUX(5), FUN_IE | FUN_PU);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(0), ==, BIT(0));
++    qom_set(qts, "/machine/peripheral/boot", "pressed", "true");
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(0), ==, 0);
++    qom_set(qts, "/machine/peripheral/boot", "pressed", "false");
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(0), ==, BIT(0));
++
++    /* One detent clockwise: A falls before B; any-edge interrupts count 2 edges each */
++    qtest_writel(qts, PIN(4), 3 << 7);
++    qtest_writel(qts, PIN(5), 3 << 7);
++    qtest_writel(qts, STATUS_W1TC, ~0u);
++    qom_set(qts, "/machine/peripheral/knob", "turn", "1");
++    qtest_clock_step(qts, 600 * 1000);                      /* The first quarter step */
++    g_assert_cmphex(qtest_readl(qts, IN) & (BIT(4) | BIT(5)), ==, BIT(5));     /* A low, B high */
++    qtest_clock_step(qts, 500 * 1000);
++    g_assert_cmphex(qtest_readl(qts, IN) & (BIT(4) | BIT(5)), ==, 0);          /* Both low */
++    qtest_clock_step(qts, 2 * 1000 * 1000);
++    g_assert_cmphex(qtest_readl(qts, IN) & (BIT(4) | BIT(5)), ==, BIT(4) | BIT(5));  /* Detent */
++    g_assert_cmphex(qtest_readl(qts, STATUS) & (BIT(4) | BIT(5)), ==, BIT(4) | BIT(5));
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/i2c-devices/ssd1306", test_ssd1306);
++    qtest_add_func("/esp32s3/i2c-devices/touch", test_touch);
++    qtest_add_func("/esp32s3/i2c-devices/keyboard", test_keyboard);
++    qtest_add_func("/esp32s3/i2c-devices/expander", test_expander);
++    qtest_add_func("/esp32s3/i2c-devices/buttons_and_encoder", test_buttons_and_encoder);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 9df41a0..b6a0713 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+

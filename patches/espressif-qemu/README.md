@@ -10,6 +10,8 @@ in `BASE`; `build.sh [dir]` fetches it, applies them and builds `qemu-system-xte
 | 0001 | GPIO pins as wires: levels from GPIO_OUT or peripheral signals (GPIO matrix), external drives, IO_MUX pulls; IN reads them; edge and level interrupts to the CPU |
 | 0002 | GP-SPI2/3 masters (W buffer and GDMA, all phases, chip selects, timing at the configured clock); `esp32s3.pin-link` to wire boards from the command line |
 | 0003 | SPI displays `ili9341` `ili9488` `st7735` `st7789` `st7796` `gc9a01` (MIPI DCS; each a screen `screendump` can capture), `xpt2046` touch, `ssi-sd` SD cards with `drive=` |
+| 0004 | I2C0/I2C1 masters (`i2c0`, `i2c1` buses): command lists, FIFOs, ACK checks, interrupts, SCL timing |
+| 0005 | I2C board devices: `ssd1306`/`sh1106` OLEDs (screens), `gt911` `cst816` `ft6336` touch, `tdeck-keyboard`, `mcp23017`; `gpio-button` (buttons and rotary encoders on pins or expander lines) |
 
 ## Wiring a board
 
@@ -50,7 +52,19 @@ decided by the pins. Touch from a test: `qom-set /machine/peripheral/touch x 123
 differs between modules: `width`/`height`/`x-offset`/`y-offset` (e.g. a 135x240 ST7789 at
 52,40), `panel-mirror-x`/`-y`, `panel-bgr`, `panel-inverted`.
 
+I2C devices go on `i2c0`/`i2c1` with their address; inputs are driven with `qom-set`:
+
+```
+  -device gt911,bus=i2c0,address=0x5d,id=touch,width=320,height=240 \
+  -device esp32s3.pin-link,pin=16,dev=touch,line=int,dir=out \
+  -device tdeck-keyboard,bus=i2c0,address=0x55,id=kbd \
+  -device gpio-button,pin=0,id=boot,key=b
+# qom-set /machine/peripheral/kbd keys "hello\n"
+# qom-set /machine/peripheral/boot pressed true
+# qom-set /machine/peripheral/knob turn 3          (an encoder: 3 detents)
+```
+
 ## Tests
 
-`tests/qtest/esp32s3-gpio-test.c`, `esp32s3-gpspi-test.c` and `esp32s3-spi-devices-test.c`; CI runs them with
+`tests/qtest/esp32s3-gpio-test.c`, `esp32s3-gpspi-test.c`, `esp32s3-spi-devices-test.c`, `esp32s3-i2c-test.c` and `esp32s3-i2c-devices-test.c`; CI runs them with
 Espressif's own ESP qtests (`.github/workflows/espressif-qemu.yml`).

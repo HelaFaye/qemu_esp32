@@ -1,0 +1,774 @@
+From 1211f00cd95d2ce1c71cc0150749425a97dc7e77 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Tue, 10 Nov 2026 10:30:35 +0000
+Subject: [PATCH 4/5] esp32s3: I2C0/I2C1 masters
+
+The S3 had no I2C controller. Both now run ESP-IDF's command lists
+(COMD0-7: RSTART, WRITE with the address after a start, READ with the
+final ACK level, STOP, END to pause and refill) over a QEMU I2C bus,
+i2c0 or i2c1, with the 32-byte FIFOs, ACK checking (NACK ends the
+transfer), SR counts and RESP_REC, the interrupts drivers wait for and
+their timing at the configured SCL. The same block is in the C3/C6.
+
+The S3 machine also selects AT24C EEPROMs.
+---
+ hw/i2c/esp32s3_i2c.c           | 439 +++++++++++++++++++++++++++++++++
+ hw/i2c/meson.build             |   2 +-
+ hw/xtensa/Kconfig              |   2 +
+ hw/xtensa/esp32s3.c            |  17 ++
+ include/hw/i2c/esp32s3_i2c.h   |  39 +++
+ tests/qtest/esp32s3-i2c-test.c | 155 ++++++++++++
+ tests/qtest/meson.build        |   2 +-
+ 7 files changed, 654 insertions(+), 2 deletions(-)
+ create mode 100644 hw/i2c/esp32s3_i2c.c
+ create mode 100644 include/hw/i2c/esp32s3_i2c.h
+ create mode 100644 tests/qtest/esp32s3-i2c-test.c
+
+diff --git a/hw/i2c/esp32s3_i2c.c b/hw/i2c/esp32s3_i2c.c
+new file mode 100644
+index 0000000..dd7a948
+--- /dev/null
++++ b/hw/i2c/esp32s3_i2c.c
+@@ -0,0 +1,439 @@
++/*
++ * ESP32-S3 I2C controllers, master mode (the same block is in the C3, C6 and other
++ * later chips)
++ *
++ * TRANS_START runs the command list (COMD0-7) on the bus: RSTART, WRITE n (from the TX
++ * FIFO; after a start the first byte is the address, read/write in bit 0), READ n (into
++ * the RX FIFO, ACK or NACK after the last byte per ACK_VALUE), STOP, END (pause with the
++ * bus held: END_DETECT; the next TRANS_START goes on from COMD0). A missing ACK where
++ * ACK_CHECK is on raises NACK and ends the transfer. Interrupts come when the bytes would
++ * have taken on the wire at the configured SCL timing.
++ * Register layout: ESP-IDF's soc/esp32s3/register/soc/i2c_struct.h and hal/i2c_ll.h.
++ *
++ *   -device tmp105,bus=i2c0,address=0x48
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/sysbus.h"
++#include "hw/i2c/i2c.h"
++#include "hw/i2c/esp32s3_i2c.h"
++
++#define A_SCL_LOW       0x00
++#define A_CTR           0x04
++#define A_SR            0x08
++#define A_TO            0x0C
++#define A_SLAVE_ADDR    0x10
++#define A_FIFO_ST       0x14
++#define A_FIFO_CONF     0x18
++#define A_DATA          0x1C
++#define A_INT_RAW       0x20
++#define A_INT_CLR       0x24
++#define A_INT_ENA       0x28
++#define A_INT_ST        0x2C
++#define A_SCL_HIGH      0x38
++#define A_CLK_CONF      0x54
++#define A_COMD0         0x58
++#define A_COMD7         0x74
++#define A_DATE          0xF8
++#define A_TXFIFO_MEM    0x100
++#define A_RXFIFO_MEM    0x180
++
++#define CTR_MS_MODE         BIT(4)
++#define CTR_TRANS_START     BIT(5)
++#define CTR_TX_LSB_FIRST    BIT(6)
++#define CTR_RX_LSB_FIRST    BIT(7)
++#define CTR_FSM_RST         BIT(10)
++#define CTR_CONF_UPGATE     BIT(11)
++
++#define FIFO_CONF_RX_RST    BIT(12)
++#define FIFO_CONF_TX_RST    BIT(13)
++#define RX_WM(v)            ((v) & 0x1F)
++#define TX_WM(v)            (((v) >> 5) & 0x1F)
++
++#define INT_RXFIFO_WM       BIT(0)
++#define INT_TXFIFO_WM       BIT(1)
++#define INT_RXFIFO_OVF      BIT(2)
++#define INT_END_DETECT      BIT(3)
++#define INT_BYTE_DONE       BIT(4)
++#define INT_ARB_LOST        BIT(5)
++#define INT_TXFIFO_UDF      BIT(6)
++#define INT_TRANS_COMPLETE  BIT(7)
++#define INT_TIME_OUT        BIT(8)
++#define INT_TRANS_START     BIT(9)
++#define INT_NACK            BIT(10)
++#define INT_TXFIFO_OVF      BIT(11)
++#define INT_MASK            0x3FFFF
++
++#define CMD_BYTES(c)        ((c) & 0xFF)
++#define CMD_ACK_CHECK(c)    (((c) >> 8) & 1)
++#define CMD_ACK_EXP(c)      (((c) >> 9) & 1)
++#define CMD_ACK_VAL(c)      (((c) >> 10) & 1)
++#define CMD_OP(c)           (((c) >> 11) & 7)
++#define CMD_DONE            BIT(31)
++
++enum { OP_WRITE = 1, OP_STOP = 2, OP_READ = 3, OP_END = 4, OP_RSTART = 6 };
++
++#define DATE_VALUE          0x20070201
++#define XTAL_HZ             40000000ULL
++
++static uint8_t bitrev8(uint8_t b)
++{
++    b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
++    b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
++    return (b & 0xAA) >> 1 | (b & 0x55) << 1;
++}
++
++static void update_irq(ESP32S3I2CState *s)
++{
++    /* The FIFO watermarks are levels */
++    s->int_raw &= ~(INT_RXFIFO_WM | INT_TXFIFO_WM);
++    if (s->rx_count >= MAX(RX_WM(s->fifo_conf), 1u)) {
++        s->int_raw |= INT_RXFIFO_WM;
++    }
++    if (s->tx_count <= TX_WM(s->fifo_conf)) {
++        s->int_raw |= INT_TXFIFO_WM;
++    }
++    qemu_set_irq(s->irq, (s->int_raw & s->int_ena) != 0);
++}
++
++static void tx_push(ESP32S3I2CState *s, uint8_t b)
++{
++    if (s->tx_count >= ESP32S3_I2C_FIFO_LEN) {
++        s->int_raw |= INT_TXFIFO_OVF;
++        return;
++    }
++    s->tx_fifo[(s->tx_head + s->tx_count++) % ESP32S3_I2C_FIFO_LEN] = b;
++}
++
++static bool tx_pop(ESP32S3I2CState *s, uint8_t *b)
++{
++    if (!s->tx_count) {
++        return false;
++    }
++    *b = s->tx_fifo[s->tx_head];
++    s->tx_head = (s->tx_head + 1) % ESP32S3_I2C_FIFO_LEN;
++    s->tx_count--;
++    return true;
++}
++
++static void rx_push(ESP32S3I2CState *s, uint8_t b)
++{
++    if (s->rx_count >= ESP32S3_I2C_FIFO_LEN) {
++        s->int_raw |= INT_RXFIFO_OVF;
++        return;
++    }
++    s->rx_fifo[(s->rx_head + s->rx_count++) % ESP32S3_I2C_FIFO_LEN] = b;
++}
++
++static uint8_t rx_pop(ESP32S3I2CState *s)
++{
++    if (!s->rx_count) {
++        s->int_raw |= BIT(12);                      /* RXFIFO_UDF */
++        return 0;
++    }
++    uint8_t b = s->rx_fifo[s->rx_head];
++    s->rx_head = (s->rx_head + 1) % ESP32S3_I2C_FIFO_LEN;
++    s->rx_count--;
++    return b;
++}
++
++/* One SCL period: the clock source / (div + 1), low + high (+ wait) cycles */
++static uint64_t scl_period_ns(ESP32S3I2CState *s)
++{
++    uint64_t div = (s->clk_conf & 0xFF) + 1;
++    uint64_t cycles = (s->scl_low & 0x1FF) + 1 + (s->scl_high & 0x1FF) + 1 + ((s->scl_high >> 9) & 0x7F);
++    uint64_t ns = muldiv64(cycles * div, NANOSECONDS_PER_SECOND, XTAL_HZ);
++    return MAX(ns, 1000);       /* No faster than 1 MHz */
++}
++
++static void finish(void *opaque)
++{
++    ESP32S3I2CState *s = ESP32S3_I2C(opaque);
++    s->int_raw |= s->pending_int;
++    s->pending_int = 0;
++    s->running = false;
++    update_irq(s);
++}
++
++static void run_commands(ESP32S3I2CState *s)
++{
++    uint64_t bits = 0;
++    uint32_t ints = INT_TRANS_START;
++
++    for (; s->next_cmd < ESP32S3_I2C_CMDS; s->next_cmd++) {
++        uint32_t c = s->comd[s->next_cmd];
++        int n = CMD_BYTES(c);
++
++        switch (CMD_OP(c)) {
++        case OP_RSTART:
++            s->want_address = true;
++            bits += 2;
++            break;
++        case OP_WRITE:
++            for (int i = 0; i < n; i++) {
++                uint8_t b;
++                if (!tx_pop(s, &b)) {
++                    ints |= INT_TXFIFO_UDF;
++                    goto stop;
++                }
++                if (s->ctr & CTR_TX_LSB_FIRST) {
++                    b = bitrev8(b);
++                }
++                int nack;
++                if (s->want_address) {
++                    s->want_address = false;
++                    s->reading = b & 1;
++                    nack = i2c_start_transfer(s->bus, b >> 1, s->reading) != 0;
++                    s->in_transfer = !nack;
++                } else if (s->in_transfer) {
++                    nack = i2c_send(s->bus, b) != 0;
++                } else {
++                    nack = 1;           /* Nobody is listening */
++                }
++                bits += 9;
++                ints |= INT_BYTE_DONE;
++                s->last_ack = nack;
++                if (CMD_ACK_CHECK(c) && nack != CMD_ACK_EXP(c)) {
++                    ints |= INT_NACK;
++                    goto stop;
++                }
++            }
++            break;
++        case OP_READ:
++            for (int i = 0; i < n; i++) {
++                uint8_t b = s->in_transfer && s->reading ? i2c_recv(s->bus) : 0xFF;
++                if (s->ctr & CTR_RX_LSB_FIRST) {
++                    b = bitrev8(b);
++                }
++                rx_push(s, b);
++                bits += 9;
++                ints |= INT_BYTE_DONE;
++            }
++            if (CMD_ACK_VAL(c) && s->in_transfer) {
++                i2c_nack(s->bus);       /* The master's NACK: the last byte */
++            }
++            break;
++        case OP_STOP:
++            if (s->in_transfer) {
++                i2c_end_transfer(s->bus);
++                s->in_transfer = false;
++            }
++            s->comd[s->next_cmd] |= CMD_DONE;
++            s->next_cmd = 0;
++            bits += 2;
++            ints |= INT_TRANS_COMPLETE;
++            goto done;
++        case OP_END:
++            s->comd[s->next_cmd] |= CMD_DONE;
++            s->next_cmd = 0;            /* Resumes at COMD0, the bus held */
++            ints |= INT_END_DETECT;
++            goto done;
++        default:
++            qemu_log_mask(LOG_GUEST_ERROR, "esp32s3.i2c: unknown command 0x%x\n", c);
++            break;
++        }
++        s->comd[s->next_cmd] |= CMD_DONE;
++    }
++    s->next_cmd = 0;
++    goto done;
++
++stop:
++    /* On a NACK or an empty FIFO, the master stops the transfer */
++    if (s->in_transfer) {
++        i2c_end_transfer(s->bus);
++        s->in_transfer = false;
++    }
++    s->comd[s->next_cmd] |= CMD_DONE;
++    s->next_cmd = 0;
++    ints |= INT_TRANS_COMPLETE;
++
++done:
++    s->pending_int = ints;
++    s->running = true;
++    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MAX(bits, 1) * scl_period_ns(s));
++}
++
++static uint64_t esp32s3_i2c_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    ESP32S3I2CState *s = ESP32S3_I2C(opaque);
++
++    if (addr >= A_COMD0 && addr <= A_COMD7) {
++        return s->comd[(addr - A_COMD0) / 4];
++    }
++    if (addr >= A_TXFIFO_MEM && addr < A_TXFIFO_MEM + 0x80) {
++        return s->tx_fifo[((addr - A_TXFIFO_MEM) / 4) % ESP32S3_I2C_FIFO_LEN];
++    }
++    if (addr >= A_RXFIFO_MEM && addr < A_RXFIFO_MEM + 0x80) {
++        return s->rx_fifo[((addr - A_RXFIFO_MEM) / 4) % ESP32S3_I2C_FIFO_LEN];
++    }
++    switch (addr) {
++    case A_SCL_LOW:     return s->scl_low;
++    case A_CTR:         return s->ctr;
++    case A_SR:
++        return (s->last_ack ? 1 : 0) | (s->in_transfer || s->running ? BIT(4) : 0) |
++               (s->rx_count << 8) | (s->tx_count << 18);
++    case A_TO:          return s->to;
++    case A_SLAVE_ADDR:  return s->slave_addr;
++    case A_FIFO_ST:
++        return (s->rx_head & 0x1F) | (((s->rx_head + s->rx_count) & 0x1F) << 5) |
++               ((s->tx_head & 0x1F) << 10) | (((s->tx_head + s->tx_count) & 0x1F) << 15);
++    case A_FIFO_CONF:   return s->fifo_conf;
++    case A_DATA: {
++        uint8_t b = rx_pop(s);
++        update_irq(s);
++        return b;
++    }
++    case A_INT_RAW:     return s->int_raw;
++    case A_INT_ENA:     return s->int_ena;
++    case A_INT_ST:      return s->int_raw & s->int_ena;
++    case A_SCL_HIGH:    return s->scl_high;
++    case A_CLK_CONF:    return s->clk_conf;
++    case A_DATE:        return DATE_VALUE;
++    default:
++        return (addr < 0x100) ? s->regs[addr / 4] : 0;
++    }
++}
++
++static void esp32s3_i2c_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
++{
++    ESP32S3I2CState *s = ESP32S3_I2C(opaque);
++
++    if (addr >= A_COMD0 && addr <= A_COMD7) {
++        s->comd[(addr - A_COMD0) / 4] = value;
++        return;
++    }
++    switch (addr) {
++    case A_SCL_LOW:     s->scl_low = value; break;
++    case A_CTR:
++        s->ctr = value & ~(CTR_TRANS_START | CTR_CONF_UPGATE | CTR_FSM_RST);
++        if (value & CTR_FSM_RST) {
++            timer_del(s->timer);
++            if (s->in_transfer) {
++                i2c_end_transfer(s->bus);
++            }
++            s->in_transfer = s->running = false;
++            s->next_cmd = 0;
++        }
++        if ((value & CTR_TRANS_START) && (value & CTR_MS_MODE)) {
++            run_commands(s);
++        }
++        break;
++    case A_TO:          s->to = value; break;
++    case A_SLAVE_ADDR:  s->slave_addr = value; break;
++    case A_FIFO_CONF:
++        s->fifo_conf = value;
++        if (value & FIFO_CONF_RX_RST) {
++            s->rx_head = s->rx_count = 0;
++        }
++        if (value & FIFO_CONF_TX_RST) {
++            s->tx_head = s->tx_count = 0;
++        }
++        update_irq(s);
++        break;
++    case A_DATA:
++        tx_push(s, value);
++        update_irq(s);
++        break;
++    case A_INT_CLR:     s->int_raw &= ~value; update_irq(s); break;
++    case A_INT_ENA:     s->int_ena = value & INT_MASK; update_irq(s); break;
++    case A_SCL_HIGH:    s->scl_high = value; break;
++    case A_CLK_CONF:    s->clk_conf = value; break;
++    default:
++        if (addr >= A_TXFIFO_MEM && addr < A_TXFIFO_MEM + 0x80) {
++            s->tx_fifo[((addr - A_TXFIFO_MEM) / 4) % ESP32S3_I2C_FIFO_LEN] = value;
++        } else if (addr < 0x100) {
++            s->regs[addr / 4] = value;  /* Timing and filter registers: kept, not used */
++        }
++        break;
++    }
++}
++
++static const MemoryRegionOps esp32s3_i2c_ops = {
++    .read = esp32s3_i2c_read,
++    .write = esp32s3_i2c_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void esp32s3_i2c_reset_hold(Object *obj, ResetType type)
++{
++    ESP32S3I2CState *s = ESP32S3_I2C(obj);
++
++    timer_del(s->timer);
++    if (s->in_transfer) {
++        i2c_end_transfer(s->bus);
++    }
++    memset(s->regs, 0, sizeof(s->regs));
++    memset(s->comd, 0, sizeof(s->comd));
++    s->scl_low = 0;
++    s->ctr = 0x20B;             /* Reset value: SDA/SCL force out, sample level, clk_en */
++    s->to = 0x10;
++    s->slave_addr = 0;
++    s->fifo_conf = 0x408B;
++    s->int_raw = s->int_ena = s->pending_int = 0;
++    s->scl_high = 0;
++    s->clk_conf = 0x200000;
++    s->rx_head = s->rx_count = s->tx_head = s->tx_count = 0;
++    s->next_cmd = 0;
++    s->in_transfer = s->running = s->want_address = false;
++    s->last_ack = 0;
++    update_irq(s);
++}
++
++static void esp32s3_i2c_realize(DeviceState *dev, Error **errp)
++{
++    ESP32S3I2CState *s = ESP32S3_I2C(dev);
++    g_autofree char *name = g_strdup_printf("i2c%u", s->port);
++    s->bus = i2c_init_bus(dev, name);
++}
++
++static void esp32s3_i2c_init(Object *obj)
++{
++    ESP32S3I2CState *s = ESP32S3_I2C(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &esp32s3_i2c_ops, s, TYPE_ESP32S3_I2C, ESP32S3_I2C_REGS);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, finish, s);
++}
++
++static Property esp32s3_i2c_properties[] = {
++    DEFINE_PROP_UINT32("port", ESP32S3I2CState, port, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void esp32s3_i2c_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    dc->realize = esp32s3_i2c_realize;
++    rc->phases.hold = esp32s3_i2c_reset_hold;
++    device_class_set_props(dc, esp32s3_i2c_properties);
++}
++
++static const TypeInfo esp32s3_i2c_info = {
++    .name = TYPE_ESP32S3_I2C,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(ESP32S3I2CState),
++    .instance_init = esp32s3_i2c_init,
++    .class_init = esp32s3_i2c_class_init,
++};
++
++static void esp32s3_i2c_register_types(void)
++{
++    type_register_static(&esp32s3_i2c_info);
++}
++
++type_init(esp32s3_i2c_register_types)
+diff --git a/hw/i2c/meson.build b/hw/i2c/meson.build
+index e72dca0..b77c766 100644
+--- a/hw/i2c/meson.build
++++ b/hw/i2c/meson.build
+@@ -16,7 +16,7 @@ i2c_ss.add(when: 'CONFIG_ARM_SBCON_I2C', if_true: files('arm_sbcon_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_PPC4XX', if_true: files('ppc4xx_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32_i2c.c'))
+-i2c_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32_i2c.c'))
++i2c_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32_i2c.c', 'esp32s3_i2c.c'))
+ i2c_ss.add(when: 'CONFIG_PCA954X', if_true: files('i2c_mux_pca954x.c'))
+ i2c_ss.add(when: 'CONFIG_PMBUS', if_true: files('pmbus_device.c'))
+ i2c_ss.add(when: 'CONFIG_BCM2835_I2C', if_true: files('bcm2835_i2c.c'))
+diff --git a/hw/xtensa/Kconfig b/hw/xtensa/Kconfig
+index b95c644..84228a5 100644
+--- a/hw/xtensa/Kconfig
++++ b/hw/xtensa/Kconfig
+@@ -35,6 +35,7 @@ config XTENSA_ESP32
+     select MIPI_DBI_PANEL
+     select XPT2046
+     select SSI_SD
++    select AT24C
+ 
+ config XTENSA_ESP32S3
+     bool
+@@ -50,5 +51,6 @@ config XTENSA_ESP32S3
+     select MIPI_DBI_PANEL
+     select XPT2046
+     select SSI_SD
++    select AT24C
+ 
+ 
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index 038d796..275bb8a 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -62,6 +62,7 @@
+ #include "hw/timer/esp32s3_systimer.h"
+ #include "hw/gpio/esp32s3_gpio.h"
+ #include "hw/ssi/esp32s3_gpspi.h"
++#include "hw/i2c/esp32s3_i2c.h"
+ #include "hw/misc/esp32s3_xts_aes.h"
+ #include "hw/misc/esp32s3_pms.h"
+ #include "hw/net/can/esp32s3_twai.h"
+@@ -125,6 +126,7 @@ typedef struct Esp32s3SocState {
+     ESP32S3UARTState uart[ESP32S3_UART_COUNT];
+     ESP32S3GPIOState gpio;
+     ESP32S3GPSPIState gpspi[2];         /* GP-SPI2 and GP-SPI3 */
++    ESP32S3I2CState i2c[2];
+     Esp32s3RngState rng;
+     Esp32S3TWAIState twai;
+ 
+@@ -760,6 +762,8 @@ static void esp32s3_machine_init(MachineState *machine)
+     object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ESP32S3_GPIO);
+     object_initialize_child(OBJECT(ss), "spi2", &ss->gpspi[0], TYPE_ESP32S3_GPSPI);
+     object_initialize_child(OBJECT(ss), "spi3", &ss->gpspi[1], TYPE_ESP32S3_GPSPI);
++    object_initialize_child(OBJECT(ss), "i2c0", &ss->i2c[0], TYPE_ESP32S3_I2C);
++    object_initialize_child(OBJECT(ss), "i2c1", &ss->i2c[1], TYPE_ESP32S3_I2C);
+     object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
+ 
+     object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
+@@ -959,6 +963,19 @@ static void esp32s3_machine_init(MachineState *machine)
+         }
+     }
+ 
++    /* I2C0 and I2C1 */
++    {
++        static const hwaddr base[2] = { DR_REG_I2C_EXT_BASE, DR_REG_I2C1_EXT_BASE };
++        for (int i = 0; i < 2; i++) {
++            qdev_prop_set_uint32(DEVICE(&ss->i2c[i]), "port", i);
++            sysbus_realize(SYS_BUS_DEVICE(&ss->i2c[i]), &error_fatal);
++            memory_region_add_subregion_overlap(sys_mem, base[i],
++                                                sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->i2c[i]), 0), 0);
++            sysbus_connect_irq(SYS_BUS_DEVICE(&ss->i2c[i]), 0,
++                               qdev_get_gpio_in(intmatrix_dev, ETS_I2C_EXT0_INTR_SOURCE + i));
++        }
++    }
++
+     /* SHA realization */
+     {
+         ss->sha.parent.gdma = ESP_GDMA(&ss->gdma);
+diff --git a/include/hw/i2c/esp32s3_i2c.h b/include/hw/i2c/esp32s3_i2c.h
+new file mode 100644
+index 0000000..b070e05
+--- /dev/null
++++ b/include/hw/i2c/esp32s3_i2c.h
+@@ -0,0 +1,39 @@
++/*
++ * ESP32-S3 I2C controllers (I2C0 at 0x60013000, I2C1 at 0x60027000), master mode.
++ * Each has an I2C bus, "i2c0" or "i2c1": -device <model>,bus=i2c0,address=0x..
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++#pragma once
++
++#include "hw/sysbus.h"
++#include "hw/i2c/i2c.h"
++
++#define TYPE_ESP32S3_I2C "esp32s3.i2c"
++OBJECT_DECLARE_SIMPLE_TYPE(ESP32S3I2CState, ESP32S3_I2C)
++
++#define ESP32S3_I2C_REGS        0x200
++#define ESP32S3_I2C_FIFO_LEN    32
++#define ESP32S3_I2C_CMDS        8
++
++struct ESP32S3I2CState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    I2CBus *bus;
++    qemu_irq irq;
++    QEMUTimer *timer;
++    uint32_t port;
++
++    uint32_t regs[0x100 / 4];   /* Timing registers, kept as written */
++    uint32_t scl_low, ctr, to, slave_addr, fifo_conf, scl_high, clk_conf;
++    uint32_t int_raw, int_ena, pending_int;
++    uint32_t comd[ESP32S3_I2C_CMDS];
++    uint8_t tx_fifo[ESP32S3_I2C_FIFO_LEN], rx_fifo[ESP32S3_I2C_FIFO_LEN];
++    uint32_t tx_head, tx_count, rx_head, rx_count;
++    uint32_t next_cmd;
++    bool in_transfer, reading, running, want_address;
++    int last_ack;               /* SR.RESP_REC: the last ACK level seen */
++};
+diff --git a/tests/qtest/esp32s3-i2c-test.c b/tests/qtest/esp32s3-i2c-test.c
+new file mode 100644
+index 0000000..1e301c4
+--- /dev/null
++++ b/tests/qtest/esp32s3-i2c-test.c
+@@ -0,0 +1,155 @@
++/*
++ * QTest for the ESP32-S3 I2C controller: a TMP105 and an AT24C EEPROM on i2c0, driven as
++ * ESP-IDF's i2c_master driver does (command list, FIFO, interrupts).
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "qapi/qmp/qdict.h"
++#include "libqtest.h"
++
++#define I2C0            0x60013000
++#define I2C_SCL_LOW     (I2C0 + 0x00)
++#define I2C_CTR         (I2C0 + 0x04)
++#define I2C_SR          (I2C0 + 0x08)
++#define I2C_FIFO_CONF   (I2C0 + 0x18)
++#define I2C_DATA        (I2C0 + 0x1C)
++#define I2C_INT_RAW     (I2C0 + 0x20)
++#define I2C_INT_CLR     (I2C0 + 0x24)
++#define I2C_INT_ENA     (I2C0 + 0x28)
++#define I2C_SCL_HIGH    (I2C0 + 0x38)
++#define I2C_CLK_CONF    (I2C0 + 0x54)
++#define I2C_COMD(n)     (I2C0 + 0x58 + 4 * (n))
++
++#define CTR_MS_MODE     BIT(4)
++#define CTR_TRANS_START BIT(5)
++#define CTR_CONF_UPGATE BIT(11)
++
++#define INT_END_DETECT      BIT(3)
++#define INT_TRANS_COMPLETE  BIT(7)
++#define INT_NACK            BIT(10)
++
++#define INTMATRIX_STATUS1   0x600C2190      /* Sources 32-63 */
++#define I2C0_SOURCE         42
++
++#define CMD(op, n, ack_check, ack_val) ((op) << 11 | (ack_val) << 10 | (ack_check) << 8 | (n))
++#define RSTART          CMD(6, 0, 0, 0)
++#define WRITE(n)        CMD(1, n, 1, 0)
++#define READ(n, last)   CMD(3, n, 0, last)
++#define STOP            CMD(2, 0, 0, 0)
++#define END             CMD(4, 0, 0, 0)
++
++#define TMP105          0x48
++#define EEPROM          0x50
++
++static QTestState *start(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3 "
++                                 "-device tmp105,bus=i2c0,address=0x48,id=temp "
++                                 "-device at24c-eeprom,bus=i2c0,address=0x50,rom-size=256");
++    /* 100 kHz from XTAL: 40 MHz / 1, 200 + 200 cycles */
++    qtest_writel(qts, I2C_CLK_CONF, BIT(21));
++    qtest_writel(qts, I2C_SCL_LOW, 199);
++    qtest_writel(qts, I2C_SCL_HIGH, 199);
++    qtest_writel(qts, I2C_CTR, CTR_MS_MODE | CTR_CONF_UPGATE);
++    qtest_writel(qts, I2C_FIFO_CONF, BIT(12) | BIT(13));     /* Reset both FIFOs */
++    qtest_writel(qts, I2C_FIFO_CONF, 0);
++    return qts;
++}
++
++static uint32_t go(QTestState *qts, const uint32_t *cmds, int n)
++{
++    for (int i = 0; i < n; i++) {
++        qtest_writel(qts, I2C_COMD(i), cmds[i]);
++    }
++    qtest_writel(qts, I2C_INT_CLR, 0x3FFFF);
++    qtest_writel(qts, I2C_CTR, CTR_MS_MODE | CTR_TRANS_START);
++    qtest_clock_step(qts, 50 * 1000 * 1000);
++    return qtest_readl(qts, I2C_INT_RAW);
++}
++
++static void test_tmp105(void)
++{
++    QTestState *qts = start();
++    qobject_unref(qtest_qmp(qts, "{'execute': 'qom-set', 'arguments': {'path': '/machine/peripheral/temp', 'property': 'temperature', 'value': 31250}}"));
++
++    /* i2c_master_transmit_receive: pointer 0, repeated start, 2 bytes */
++    qtest_writel(qts, I2C_DATA, TMP105 << 1);
++    qtest_writel(qts, I2C_DATA, 0x00);
++    qtest_writel(qts, I2C_DATA, TMP105 << 1 | 1);
++    const uint32_t cmds[] = { RSTART, WRITE(2), RSTART, WRITE(1), READ(1, 0), READ(1, 1), STOP };
++    qtest_writel(qts, I2C_INT_ENA, INT_TRANS_COMPLETE | INT_NACK);
++    uint32_t raw = go(qts, cmds, 7);
++    g_assert_cmphex(raw & (INT_TRANS_COMPLETE | INT_NACK), ==, INT_TRANS_COMPLETE);
++    g_assert_true(qtest_readl(qts, INTMATRIX_STATUS1) & BIT(I2C0_SOURCE - 32));
++    g_assert_cmpint((qtest_readl(qts, I2C_SR) >> 8) & 0x3F, ==, 2);
++    uint8_t hi = qtest_readl(qts, I2C_DATA), lo = qtest_readl(qts, I2C_DATA);
++    /* 31.25 C, 12 bits at power-up resolution 9 bits: 0x1F40 masked to 0x1F00 */
++    g_assert_cmphex(hi, ==, 0x1F);
++    g_assert_cmphex(lo & 0x80, ==, 0x00);
++    g_assert_cmphex(qtest_readl(qts, I2C_COMD(6)) >> 31, ==, 1);    /* STOP done */
++    qtest_writel(qts, I2C_INT_CLR, 0x3FFFF);
++    g_assert_false(qtest_readl(qts, INTMATRIX_STATUS1) & BIT(I2C0_SOURCE - 32));
++    qtest_quit(qts);
++}
++
++static void test_nack(void)
++{
++    QTestState *qts = start();
++
++    /* i2c_master_probe of an empty address */
++    qtest_writel(qts, I2C_DATA, 0x3C << 1);
++    const uint32_t cmds[] = { RSTART, WRITE(1), STOP };
++    uint32_t raw = go(qts, cmds, 3);
++    g_assert_cmphex(raw & INT_NACK, ==, INT_NACK);
++    g_assert_cmphex(qtest_readl(qts, I2C_SR) & 1, ==, 1);          /* RESP_REC: NACK */
++
++    /* And one that's there */
++    qtest_writel(qts, I2C_DATA, TMP105 << 1);
++    raw = go(qts, cmds, 3);
++    g_assert_cmphex(raw & (INT_NACK | INT_TRANS_COMPLETE), ==, INT_TRANS_COMPLETE);
++    qtest_quit(qts);
++}
++
++static void test_eeprom_long_write(void)
++{
++    QTestState *qts = start();
++
++    /* 40 bytes at offset 16: more than the FIFO, so END, refill, go on (as the driver does) */
++    qtest_writel(qts, I2C_DATA, EEPROM << 1);
++    qtest_writel(qts, I2C_DATA, 16);
++    for (int i = 0; i < 30; i++) {
++        qtest_writel(qts, I2C_DATA, 0xA0 + i);
++    }
++    const uint32_t first[] = { RSTART, WRITE(32), END };
++    g_assert_cmphex(go(qts, first, 3) & (INT_END_DETECT | INT_NACK), ==, INT_END_DETECT);
++    for (int i = 30; i < 40; i++) {
++        qtest_writel(qts, I2C_DATA, 0xA0 + i);
++    }
++    const uint32_t second[] = { WRITE(10), STOP };
++    g_assert_cmphex(go(qts, second, 2) & (INT_TRANS_COMPLETE | INT_NACK), ==, INT_TRANS_COMPLETE);
++
++    /* Read them back */
++    qtest_writel(qts, I2C_DATA, EEPROM << 1);
++    qtest_writel(qts, I2C_DATA, 16);
++    qtest_writel(qts, I2C_DATA, EEPROM << 1 | 1);
++    const uint32_t rd[] = { RSTART, WRITE(2), RSTART, WRITE(1), READ(29, 0), READ(1, 1), END };
++    g_assert_cmphex(go(qts, rd, 7) & INT_END_DETECT, ==, INT_END_DETECT);
++    for (int i = 0; i < 30; i++) {
++        g_assert_cmphex(qtest_readl(qts, I2C_DATA), ==, 0xA0 + i);
++    }
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/i2c/tmp105", test_tmp105);
++    qtest_add_func("/esp32s3/i2c/nack", test_nack);
++    qtest_add_func("/esp32s3/i2c/eeprom_long_write", test_eeprom_long_write);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 9e308e2..9df41a0 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+
