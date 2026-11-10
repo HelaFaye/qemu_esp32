@@ -1,0 +1,92 @@
+name: Firmware in QEMU
+
+# Real firmware, built from its own repository at a pinned commit, booted on emulated
+# boards (firmware/boards.py) with the patched QEMU, and checked by its serial output.
+on:
+  push:
+    paths: ["patches/espressif-qemu/**", "firmware/**", "radio/**", ".github/workflows/firmware.yml"]
+  workflow_dispatch:
+
+jobs:
+  qemu:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: ${{ runner.temp }}/qemu-dist
+          key: qemu-xtensa-${{ hashFiles('patches/espressif-qemu/**') }}
+      - name: Build QEMU
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libglib2.0-dev libpixman-1-dev libgcrypt20-dev libslirp-dev flex bison
+          patches/espressif-qemu/build.sh "$RUNNER_TEMP/esp-qemu"
+          mkdir -p "$RUNNER_TEMP/qemu-dist/bios"
+          cp "$RUNNER_TEMP/esp-qemu/build/qemu-system-xtensa" "$RUNNER_TEMP/qemu-dist/"
+          cp "$RUNNER_TEMP"/esp-qemu/pc-bios/esp32* "$RUNNER_TEMP/qemu-dist/bios/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qemu-xtensa
+          path: ${{ runner.temp }}/qemu-dist
+
+  meshcore-bare:
+    needs: qemu
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-espidf-${{ hashFiles('firmware/meshcore-bare/COMMIT') }}
+      - name: Tools
+        run: |
+          pip install -q platformio esptool
+          sudo apt-get update && sudo apt-get install -y libglib2.0-0 libpixman-1-0 libgcrypt20 libslirp0
+      - uses: actions/download-artifact@v4
+        with:
+          name: qemu-xtensa
+          path: ${{ runner.temp }}/qemu
+      - name: Build the firmware (stock and emulator)
+        run: firmware/meshcore-bare/build.sh "$RUNNER_TEMP/mcb"
+      - name: Two nodes on one air
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: |
+          chmod +x "$QEMU_XTENSA"
+          python3 firmware/meshcore-bare/two_nodes.py "$RUNNER_TEMP/mcb/emulator/flash.bin" "$RUNNER_TEMP/mcb/run"
+      - name: The stock build, alone (how far it gets without the S3's BLE controller)
+        if: always()
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: |
+          python3 - <<'EOF'
+          import os, sys, time
+          sys.path.insert(0, "firmware")
+          from boards import boot
+          work = os.path.join(os.environ["RUNNER_TEMP"], "mcb", "stock-run")
+          os.makedirs(work, exist_ok=True)
+          n = boot("meshcore-bare", os.path.join(os.environ["RUNNER_TEMP"], "mcb", "stock", "flash.bin"), work)
+          time.sleep(40)
+          n.stop()
+          print("\n".join(n.log().splitlines()[-80:]))
+          EOF
+      - name: Decode any backtrace
+        if: failure()
+        run: |
+          for log in "$RUNNER_TEMP"/mcb/run/*.log; do
+            grep -o "Backtrace:.*" "$log" | head -1 | tr ' ' '\n' | grep -o "0x4[0-9a-f]*" | \
+              xargs -r ~/.platformio/packages/toolchain-xtensa-esp32s3/bin/xtensa-esp32s3-elf-addr2line \
+                -pfiaC -e "$RUNNER_TEMP/mcb/emulator/firmware.elf" || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: meshcore-bare-logs
+          path: ${{ runner.temp }}/mcb/*run*
