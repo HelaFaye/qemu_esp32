@@ -1,0 +1,1221 @@
+From c969c73c662d76cac75c466494a422f14a2f6e96 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Tue, 10 Nov 2026 05:32:12 +0000
+Subject: [PATCH 2/2] esp32s3: GP-SPI2/3 masters with GDMA; pin-link to wire
+ boards
+
+GP-SPI2 (0x60024000) and GP-SPI3 (0x60025000) were missing. Each now
+has an SSI bus (spi2, spi3) and runs master transactions as ESP-IDF's
+spi_ll drives them: command, address, dummy and data phases, W0-W15 or
+GDMA (SPI2/SPI3 peripheral channels), full or half duplex, bit order,
+CS0-5 per MISC (polarity, keep-active). TRANS_DONE comes after the
+bits' time at the configured clock, with ETS_SPI2/3_INTR_SOURCE.
+
+Chip selects are the FSPICSn/SPI3_CSn signals into the GPIO matrix, or
+the IO_MUX for SPI2's own pins (GPIO9-14, function 4), so a device is
+selected by its pin, whether the controller or the firmware drives it.
+
+esp32s3.pin-link wires a pin to a device's GPIO line from the command
+line (in, out, open drain, board pull resistor, invert); the GPIO model
+gains pin-pull inputs and listeners so several devices can follow a pin.
+---
+ hw/gpio/esp32s3_gpio.c           |  73 ++++-
+ hw/gpio/esp32s3_pin_link.c       | 166 ++++++++++++
+ hw/gpio/meson.build              |   2 +-
+ hw/ssi/esp32s3_gpspi.c           | 448 +++++++++++++++++++++++++++++++
+ hw/ssi/meson.build               |   2 +-
+ hw/xtensa/esp32s3.c              |  28 ++
+ include/hw/gpio/esp32s3_gpio.h   |  12 +-
+ include/hw/ssi/esp32s3_gpspi.h   |  46 ++++
+ tests/qtest/esp32s3-gpspi-test.c | 228 ++++++++++++++++
+ tests/qtest/meson.build          |   2 +-
+ 10 files changed, 1001 insertions(+), 6 deletions(-)
+ create mode 100644 hw/gpio/esp32s3_pin_link.c
+ create mode 100644 hw/ssi/esp32s3_gpspi.c
+ create mode 100644 include/hw/ssi/esp32s3_gpspi.h
+ create mode 100644 tests/qtest/esp32s3-gpspi-test.c
+
+diff --git a/hw/gpio/esp32s3_gpio.c b/hw/gpio/esp32s3_gpio.c
+index 548c928..b97039f 100644
+--- a/hw/gpio/esp32s3_gpio.c
++++ b/hw/gpio/esp32s3_gpio.c
+@@ -91,11 +91,41 @@ enum { INT_DISABLED, INT_POSEDGE, INT_NEGEDGE, INT_ANYEDGE, INT_LOW_LEVEL, INT_H
+ #define FUN_PU              BIT(8)
+ #define FUN_IE              BIT(9)
+ #define IOMUX_RESET         (FUN_IE | (2 << 10))     /* Input on, drive strength 2 */
++#define MCU_SEL(v)          (((v) >> 12) & 0x7)
++
++/*
++ * A pin's own peripheral functions (IO_MUX MCU_SEL), which bypass the GPIO matrix: the
++ * output signal each drives. ESP-IDF uses them when a bus is on its native pins.
++ */
++static const struct { uint8_t pin, func; uint16_t sig; } iomux_funcs[] = {
++    { 9,  4, 104 },     /* FSPIHD */
++    { 10, 4, 110 },     /* FSPICS0 */
++    { 11, 4, 103 },     /* FSPID */
++    { 12, 4, 101 },     /* FSPICLK */
++    { 13, 4, 102 },     /* FSPIQ */
++    { 14, 4, 105 },     /* FSPIWP */
++    { 43, 0, 12 },      /* U0TXD */
++};
++
++/* The output signal driving pin n through the IO_MUX, or -1 for the GPIO matrix */
++static int iomux_signal(ESP32S3GPIOState *s, int n)
++{
++    int func = MCU_SEL(s->iomux_regs[n]);
++    for (size_t i = 0; i < ARRAY_SIZE(iomux_funcs); i++) {
++        if (iomux_funcs[i].pin == n && iomux_funcs[i].func == func) {
++            return iomux_funcs[i].sig;
++        }
++    }
++    return -1;
++}
+ 
+ static bool pin_output_enabled(ESP32S3GPIOState *s, int n)
+ {
+     uint32_t sel = s->func_out_sel[n];
+     bool oe;
++    if (iomux_signal(s, n) >= 0) {
++        return true;            /* The peripheral drives its own pin */
++    }
+     if (OUT_SEL(sel) == ESP32S3_GPIO_OUT_SEL_GPIO || (sel & OEN_SEL)) {
+         oe = (s->enable >> n) & 1;
+     } else {
+@@ -111,6 +141,10 @@ static int pin_output_value(ESP32S3GPIOState *s, int n)
+ {
+     uint32_t sel = s->func_out_sel[n];
+     int v;
++    int sig = iomux_signal(s, n);
++    if (sig >= 0) {
++        return s->sig_out[sig];
++    }
+     if (OUT_SEL(sel) == ESP32S3_GPIO_OUT_SEL_GPIO) {
+         v = (s->out >> n) & 1;
+     } else {
+@@ -138,7 +172,13 @@ static int pin_level(ESP32S3GPIOState *s, int n)
+     if (s->iomux_regs[n] & FUN_PU) {
+         return 1;
+     }
+-    return 0;           /* Pulled down, or floating */
++    if (s->iomux_regs[n] & FUN_PD) {
++        return 0;
++    }
++    if ((s->board_pulled >> n) & 1) {
++        return (s->board_pull_level >> n) & 1;
++    }
++    return 0;           /* Floating */
+ }
+ 
+ static uint64_t input_value(ESP32S3GPIOState *s)
+@@ -196,6 +236,11 @@ static void update_pins(ESP32S3GPIOState *s)
+             s->status |= 1ULL << n;
+         }
+         qemu_set_irq(s->pin_out[n], l);
++        if (s->listeners[n]) {
++            for (guint i = 0; i < s->listeners[n]->len; i++) {
++                qemu_set_irq(g_ptr_array_index(s->listeners[n], i), l);
++            }
++        }
+     }
+     latch_levels(s);
+     update_irq(s);
+@@ -346,6 +391,29 @@ static void esp32s3_gpio_pin_in(void *opaque, int n, int level)
+     update_pins(s);
+ }
+ 
++/* A resistor on the board: 1 up, 0 down, anything else none */
++static void esp32s3_gpio_pin_pull(void *opaque, int n, int level)
++{
++    ESP32S3GPIOState *s = ESP32S3_GPIO(opaque);
++    if (level == 0 || level == 1) {
++        s->board_pulled |= 1ULL << n;
++        s->board_pull_level = (s->board_pull_level & ~(1ULL << n)) | ((uint64_t)level << n);
++    } else {
++        s->board_pulled &= ~(1ULL << n);
++    }
++    update_pins(s);
++}
++
++void esp32s3_gpio_add_listener(ESP32S3GPIOState *s, int pin, qemu_irq irq)
++{
++    assert(pin >= 0 && pin < PINS);
++    if (!s->listeners[pin]) {
++        s->listeners[pin] = g_ptr_array_new();
++    }
++    g_ptr_array_add(s->listeners[pin], irq);
++    qemu_set_irq(irq, (s->level >> pin) & 1);
++}
++
+ /* A peripheral's output signal (index: the signal number in FUNC_OUT_SEL_CFG) */
+ static void esp32s3_gpio_sig_out(void *opaque, int sig, int level)
+ {
+@@ -365,7 +433,7 @@ static void esp32s3_gpio_reset_hold(Object *obj, ResetType type)
+     memset(s->func_in_sel, 0, sizeof(s->func_in_sel));
+     for (int n = 0; n < PINS; n++) {
+         s->func_out_sel[n] = ESP32S3_GPIO_OUT_SEL_GPIO;
+-        s->iomux_regs[n] = IOMUX_RESET;
++        s->iomux_regs[n] = IOMUX_RESET;     /* MCU_SEL 0: GPIO, but U0TXD on pin 43 */
+     }
+     /* External drives and peripheral signals are wires: they survive a chip reset */
+     update_pins(s);
+@@ -385,6 +453,7 @@ static void esp32s3_gpio_init(Object *obj)
+     qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpio_pin_in, ESP32S3_GPIO_PIN_IN, PINS);
+     qdev_init_gpio_out_named(DEVICE(s), s->pin_out, ESP32S3_GPIO_PIN_OUT, PINS);
+     qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpio_sig_out, ESP32S3_GPIO_SIG_OUT, ESP32S3_GPIO_SIGNALS);
++    qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpio_pin_pull, ESP32S3_GPIO_PIN_PULL, PINS);
+ }
+ 
+ static Property esp32s3_gpio_properties[] = {
+diff --git a/hw/gpio/esp32s3_pin_link.c b/hw/gpio/esp32s3_pin_link.c
+new file mode 100644
+index 0000000..a3fc917
+--- /dev/null
++++ b/hw/gpio/esp32s3_pin_link.c
+@@ -0,0 +1,166 @@
++/*
++ * A wire between an ESP32-S3 pin and a device's GPIO line, set from the command line, so
++ * that a board is a list of -device options:
++ *
++ *   -device ili9341,bus=spi2,id=lcd
++ *   -device esp32s3.pin-link,pin=10,dev=lcd,line=ssi-gpio-cs       (pin to device input)
++ *   -device esp32s3.pin-link,pin=9,dev=lcd,line=dc
++ *   -device esp32s3.pin-link,pin=17,dev=touch,line=penirq,dir=out,open-drain=on,pull=up
++ *   -device esp32s3.pin-link,pin=0,pull=up                          (a resistor alone)
++ *
++ * dir=in (the default): the device input follows the pin's level. Many links can share
++ * a pin. dir=out: the device output drives the pin; with open-drain=on it only pulls low
++ * and a 1 releases the pin. pull=up/down: a resistor on the board. invert=on: an inverter
++ * in between. dev is an id (-device ...,id=) or a QOM path; line is a named GPIO line, or
++ * empty for the device's unnamed lines; n is the index within it.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/qdev-core.h"
++#include "hw/qdev-properties.h"
++#include "hw/irq.h"
++#include "hw/gpio/esp32s3_gpio.h"
++
++#define TYPE_ESP32S3_PIN_LINK "esp32s3.pin-link"
++OBJECT_DECLARE_SIMPLE_TYPE(ESP32S3PinLinkState, ESP32S3_PIN_LINK)
++
++struct ESP32S3PinLinkState {
++    DeviceState parent_obj;
++
++    int32_t pin;
++    char *dev;
++    char *line;
++    int32_t n;
++    char *dir;
++    char *pull;
++    bool open_drain;
++    bool invert;
++
++    ESP32S3GPIOState *gpio;
++    qemu_irq target;            /* dir=in: the device's input */
++    qemu_irq pin_in;            /* dir=out: the pin */
++};
++
++/* Pin level to the device */
++static void link_to_device(void *opaque, int n, int level)
++{
++    ESP32S3PinLinkState *s = opaque;
++    qemu_set_irq(s->target, s->invert ? !level : level);
++}
++
++/* Device output to the pin */
++static void link_to_pin(void *opaque, int n, int level)
++{
++    ESP32S3PinLinkState *s = opaque;
++    level = level ? 1 : 0;
++    if (s->invert) {
++        level = !level;
++    }
++    qemu_set_irq(s->pin_in, (s->open_drain && level) ? -1 : level);
++}
++
++static void esp32s3_pin_link_realize(DeviceState *dev, Error **errp)
++{
++    ESP32S3PinLinkState *s = ESP32S3_PIN_LINK(dev);
++
++    s->gpio = (ESP32S3GPIOState *)object_dynamic_cast(object_resolve_path("/machine/soc/gpio", NULL),
++                                                      TYPE_ESP32S3_GPIO);
++    if (!s->gpio) {
++        error_setg(errp, "no ESP32-S3 GPIO (use -machine esp32s3)");
++        return;
++    }
++    if (s->pin < 0 || s->pin >= ESP32S3_GPIO_PINS) {
++        error_setg(errp, "pin must be 0-%d", ESP32S3_GPIO_PINS - 1);
++        return;
++    }
++
++    if (s->pull && *s->pull) {
++        int level = !strcmp(s->pull, "up") ? 1 : !strcmp(s->pull, "down") ? 0 : -2;
++        if (level < 0) {
++            error_setg(errp, "pull must be up or down");
++            return;
++        }
++        qemu_set_irq(qdev_get_gpio_in_named(DEVICE(s->gpio), ESP32S3_GPIO_PIN_PULL, s->pin), level);
++    }
++    if (!s->dev || !*s->dev) {
++        return;                 /* A resistor alone */
++    }
++
++    g_autofree char *path = s->dev[0] == '/' ? g_strdup(s->dev)
++                                             : g_strdup_printf("/machine/peripheral/%s", s->dev);
++    Object *obj = object_resolve_path(path, NULL);
++    DeviceState *target = (DeviceState *)object_dynamic_cast(obj, TYPE_DEVICE);
++    if (!target) {
++        error_setg(errp, "no device '%s' (it must come before the link)", s->dev);
++        return;
++    }
++    const char *line = (s->line && *s->line) ? s->line : NULL;
++    NamedGPIOList *gl;
++    QLIST_FOREACH(gl, &target->gpios, node) {
++        if (g_strcmp0(gl->name, line) == 0) {
++            break;
++        }
++    }
++
++    if (!s->dir || !strcmp(s->dir, "in")) {
++        if (!gl || s->n < 0 || s->n >= gl->num_in) {
++            error_setg(errp, "'%s' has no input line %s[%d]", s->dev, line ? line : "", s->n);
++            return;
++        }
++        s->target = qdev_get_gpio_in_named(target, line, s->n);
++        esp32s3_gpio_add_listener(s->gpio, s->pin, qemu_allocate_irq(link_to_device, s, 0));
++    } else if (!strcmp(s->dir, "out")) {
++        if (!gl || s->n < 0 || s->n >= gl->num_out) {
++            error_setg(errp, "'%s' has no output line %s[%d]", s->dev, line ? line : "", s->n);
++            return;
++        }
++        s->pin_in = qdev_get_gpio_in_named(DEVICE(s->gpio), ESP32S3_GPIO_PIN_IN, s->pin);
++        qdev_connect_gpio_out_named(target, line, s->n, qemu_allocate_irq(link_to_pin, s, 0));
++        if (s->open_drain) {
++            qemu_set_irq(s->pin_in, -1);    /* Released until the device pulls it low */
++        }
++    } else {
++        error_setg(errp, "dir must be in or out");
++    }
++}
++
++static Property esp32s3_pin_link_properties[] = {
++    DEFINE_PROP_INT32("pin", ESP32S3PinLinkState, pin, -1),
++    DEFINE_PROP_STRING("dev", ESP32S3PinLinkState, dev),
++    DEFINE_PROP_STRING("line", ESP32S3PinLinkState, line),
++    DEFINE_PROP_INT32("n", ESP32S3PinLinkState, n, 0),
++    DEFINE_PROP_STRING("dir", ESP32S3PinLinkState, dir),
++    DEFINE_PROP_STRING("pull", ESP32S3PinLinkState, pull),
++    DEFINE_PROP_BOOL("open-drain", ESP32S3PinLinkState, open_drain, false),
++    DEFINE_PROP_BOOL("invert", ESP32S3PinLinkState, invert, false),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void esp32s3_pin_link_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = esp32s3_pin_link_realize;
++    dc->user_creatable = true;
++    dc->desc = "A wire from an ESP32-S3 pin to a device's GPIO line";
++    device_class_set_props(dc, esp32s3_pin_link_properties);
++}
++
++static const TypeInfo esp32s3_pin_link_info = {
++    .name = TYPE_ESP32S3_PIN_LINK,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(ESP32S3PinLinkState),
++    .class_init = esp32s3_pin_link_class_init,
++};
++
++static void esp32s3_pin_link_register_types(void)
++{
++    type_register_static(&esp32s3_pin_link_info);
++}
++
++type_init(esp32s3_pin_link_register_types)
+diff --git a/hw/gpio/meson.build b/hw/gpio/meson.build
+index bb965df..eca929e 100644
+--- a/hw/gpio/meson.build
++++ b/hw/gpio/meson.build
+@@ -25,5 +25,5 @@ system_ss.add(when: 'CONFIG_RISCV_ESP32H4', if_true: files('esp32_gpio.c', 'esp3
+ system_ss.add(when: 'CONFIG_RISCV_ESP32P4', if_true: files('esp32_gpio.c', 'esp32c3_gpio.c', 'esp32p4_gpio.c'))
+ system_ss.add(when: 'CONFIG_RISCV_ESP32C6', if_true: files('esp32_gpio.c', 'esp32c3_gpio.c', 'esp32c6_gpio.c'))
+ system_ss.add(when: 'CONFIG_RISCV_ESP32H2', if_true: files('esp32_gpio.c', 'esp32c3_gpio.c', 'esp32h2_gpio.c'))
+-system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32_gpio.c', 'esp32s3_gpio.c'))
++system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32_gpio.c', 'esp32s3_gpio.c', 'esp32s3_pin_link.c'))
+ system_ss.add(when: 'CONFIG_PCF8574', if_true: files('pcf8574.c'))
+diff --git a/hw/ssi/esp32s3_gpspi.c b/hw/ssi/esp32s3_gpspi.c
+new file mode 100644
+index 0000000..ebbee9b
+--- /dev/null
++++ b/hw/ssi/esp32s3_gpspi.c
+@@ -0,0 +1,448 @@
++/*
++ * ESP32-S3 general purpose SPI controllers (GP-SPI2 and GP-SPI3), master mode
++ *
++ * A transaction (CMD.USR) runs its phases on the SSI bus a byte at a time: command
++ * (USER2, low byte first), address (ADDR, from bit 31), dummy cycles, then data from the
++ * W0-W15 buffer or the GDMA (DMA_CONF.DMA_TX_ENA / DMA_RX_ENA), full duplex (USER.DOUTDIN)
++ * or half. Chip selects follow MISC: the enabled ones go active for the transaction
++ * (MASTER_CS_POL) and stay so with CS_KEEP_ACTIVE. TRANS_DONE comes once the bits would
++ * have gone out at the configured clock, so a driver's timing is the chip's.
++ * Register layout: ESP-IDF's soc/esp32s3/register/soc/spi_struct.h and hal/spi_ll.h.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/ssi/esp32s3_gpspi.h"
++
++#define A_CMD           0x00
++#define A_ADDR          0x04
++#define A_CTRL          0x08
++#define A_CLOCK         0x0C
++#define A_USER          0x10
++#define A_USER1         0x14
++#define A_USER2         0x18
++#define A_MS_DLEN       0x1C
++#define A_MISC          0x20
++#define A_DIN_MODE      0x24
++#define A_DIN_NUM       0x28
++#define A_DOUT_MODE     0x2C
++#define A_DMA_CONF      0x30
++#define A_DMA_INT_ENA   0x34
++#define A_DMA_INT_CLR   0x38
++#define A_DMA_INT_RAW   0x3C
++#define A_DMA_INT_ST    0x40
++#define A_DMA_INT_SET   0x44
++#define A_W0            0x98
++#define A_W15           0xD4
++#define A_SLAVE         0xE0
++#define A_SLAVE1        0xE4
++#define A_CLK_GATE      0xE8
++#define A_DATE          0xF0
++
++#define CMD_UPDATE      BIT(23)
++#define CMD_USR         BIT(24)
++
++#define CTRL_RD_BIT_ORDER(v)    (((v) >> 23) & 3)
++#define CTRL_WR_BIT_ORDER(v)    (((v) >> 25) & 3)
++
++#define CLOCK_EQU_SYSCLK        BIT(31)
++#define CLOCK_N(v)              (((v) >> 12) & 0x3F)
++#define CLOCK_PRE(v)            (((v) >> 18) & 0xF)
++
++#define USER_DOUTDIN            BIT(0)
++#define USER_CS_HOLD            BIT(6)
++#define USER_CS_SETUP           BIT(7)
++#define USER_MISO_HIGHPART      BIT(24)
++#define USER_MOSI_HIGHPART      BIT(25)
++#define USER_MOSI               BIT(27)
++#define USER_MISO               BIT(28)
++#define USER_DUMMY              BIT(29)
++#define USER_ADDR               BIT(30)
++#define USER_COMMAND            BIT(31)
++
++#define USER1_DUMMY_CYCLES(v)   (((v) & 0xFF) + 1)
++#define USER1_ADDR_BITS(v)      ((((v) >> 27) & 0x1F) + 1)
++#define USER2_CMD_BITS(v)       ((((v) >> 28) & 0xF) + 1)
++
++#define MISC_CS_DIS(n)          BIT(n)
++#define MISC_CS_POL(n)          BIT(7 + (n))
++#define MISC_CS_KEEP_ACTIVE     BIT(30)
++
++#define DMA_CONF_RX_ENA         BIT(27)
++#define DMA_CONF_TX_ENA         BIT(28)
++#define DMA_CONF_RESETS         (BIT(29) | BIT(30) | BIT(31))   /* Self-clearing */
++
++#define INT_RD_DMA_DONE         BIT(8)
++#define INT_WR_DMA_DONE         BIT(9)
++#define INT_RD_BUF_DONE         BIT(10)
++#define INT_WR_BUF_DONE         BIT(11)
++#define INT_TRANS_DONE          BIT(12)
++#define INT_MASK                0x1FFFFF
++
++#define CLK_GATE_MST_CLK_SEL    BIT(2)
++
++#define DATE_VALUE              0x2101220
++#define APB_HZ                  80000000ULL
++#define XTAL_HZ                 40000000ULL
++#define MAX_DATA_BYTES          ((1 << 18) / 8)     /* MS_DLEN is 18 bits */
++
++static int cs_count(ESP32S3GPSPIState *s)
++{
++    return s->port == 2 ? 6 : 3;
++}
++
++static void update_irq(ESP32S3GPSPIState *s)
++{
++    qemu_set_irq(s->irq, (s->int_raw & s->int_ena) != 0);
++}
++
++static void set_cs(ESP32S3GPSPIState *s, bool active)
++{
++    for (int n = 0; n < cs_count(s); n++) {
++        bool pol_high = s->misc & MISC_CS_POL(n);
++        bool on = active && !(s->misc & MISC_CS_DIS(n));
++        qemu_set_irq(s->cs[n], on == pol_high);
++    }
++}
++
++static uint8_t bitrev8(uint8_t b)
++{
++    b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
++    b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
++    b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
++    return b;
++}
++
++static uint8_t xfer(ESP32S3GPSPIState *s, uint8_t out)
++{
++    if (CTRL_WR_BIT_ORDER(s->ctrl)) {
++        out = bitrev8(out);
++    }
++    uint8_t in = ssi_transfer(s->bus, out);
++    if (CTRL_RD_BIT_ORDER(s->ctrl)) {
++        in = bitrev8(in);
++    }
++    return in;
++}
++
++/* The SPI clock: APB (or XTAL) / (PRE + 1) / (N + 1), or the APB clock itself */
++static uint64_t sclk_hz(ESP32S3GPSPIState *s)
++{
++    uint64_t src = (s->clk_gate & CLK_GATE_MST_CLK_SEL) ? APB_HZ : XTAL_HZ;
++    if (s->clock & CLOCK_EQU_SYSCLK) {
++        return src;
++    }
++    return src / (CLOCK_PRE(s->clock) + 1) / (CLOCK_N(s->clock) + 1);
++}
++
++static void buf_bytes(ESP32S3GPSPIState *s, uint8_t *out, bool highpart, size_t n)
++{
++    const uint8_t *src = (const uint8_t *)s->data + (highpart ? 32 : 0);
++    size_t avail = sizeof(s->data) - (highpart ? 32 : 0);
++    memset(out, 0, n);
++    memcpy(out, src, MIN(n, avail));
++}
++
++static void store_buf(ESP32S3GPSPIState *s, const uint8_t *in, bool highpart, size_t n)
++{
++    uint8_t *dst = (uint8_t *)s->data + (highpart ? 32 : 0);
++    size_t avail = sizeof(s->data) - (highpart ? 32 : 0);
++    memcpy(dst, in, MIN(n, avail));
++}
++
++static void run_transaction(ESP32S3GPSPIState *s)
++{
++    uint64_t bits = 0;
++    const bool tx_dma = s->dma_conf & DMA_CONF_TX_ENA;
++    const bool rx_dma = s->dma_conf & DMA_CONF_RX_ENA;
++
++    set_cs(s, true);
++
++    if (s->user & USER_COMMAND) {
++        int n = USER2_CMD_BITS(s->user2);
++        uint16_t v = s->user2 & 0xFFFF;
++        xfer(s, v & 0xFF);
++        if (n > 8) {
++            xfer(s, v >> 8);
++        }
++        bits += n;
++    }
++    if (s->user & USER_ADDR) {
++        int n = USER1_ADDR_BITS(s->user1);
++        for (int i = 0; i < DIV_ROUND_UP(n, 8); i++) {
++            xfer(s, s->addr >> (24 - 8 * i));
++        }
++        bits += n;
++    }
++    if (s->user & USER_DUMMY) {
++        int n = USER1_DUMMY_CYCLES(s->user1);
++        for (int i = 0; i < DIV_ROUND_UP(n, 8); i++) {
++            xfer(s, 0xFF);
++        }
++        bits += n;
++    }
++
++    const bool mosi = s->user & USER_MOSI, miso = s->user & USER_MISO;
++    if (mosi || miso) {
++        size_t nbits = (s->ms_dlen & 0x3FFFF) + 1;
++        size_t n = DIV_ROUND_UP(nbits, 8);
++        g_autofree uint8_t *tx = g_malloc(n);
++        g_autofree uint8_t *rx = g_malloc0(n);
++        const bool duplex = s->user & USER_DOUTDIN;
++        uint32_t chan;
++
++        if (mosi) {
++            if (tx_dma) {
++                if (!s->gdma || !esp_gdma_get_channel_periph(s->gdma, s->port == 2 ? GDMA_SPI2 : GDMA_SPI3,
++                                                             ESP_GDMA_OUT_IDX, &chan) ||
++                    !esp_gdma_read_channel(s->gdma, chan, tx, n)) {
++                    qemu_log_mask(LOG_GUEST_ERROR, "esp32s3.spi%u: no TX DMA data\n", s->port);
++                    memset(tx, 0xFF, n);
++                }
++            } else {
++                buf_bytes(s, tx, s->user & USER_MOSI_HIGHPART, n);
++            }
++        } else {
++            memset(tx, 0xFF, n);        /* MOSI idles high while reading */
++        }
++
++        if (duplex || !mosi || !miso) {
++            for (size_t i = 0; i < n; i++) {
++                rx[i] = xfer(s, tx[i]);
++            }
++            bits += nbits;
++        } else {
++            /* Half duplex with both phases: write, then read the same length */
++            for (size_t i = 0; i < n; i++) {
++                xfer(s, tx[i]);
++            }
++            for (size_t i = 0; i < n; i++) {
++                rx[i] = xfer(s, 0xFF);
++            }
++            bits += 2 * nbits;
++        }
++        if (nbits % 8 && miso) {
++            rx[n - 1] &= 0xFF << (8 - nbits % 8);       /* Bits not clocked in */
++        }
++
++        if (miso) {
++            if (rx_dma) {
++                if (!s->gdma || !esp_gdma_get_channel_periph(s->gdma, s->port == 2 ? GDMA_SPI2 : GDMA_SPI3,
++                                                             ESP_GDMA_IN_IDX, &chan) ||
++                    !esp_gdma_write_channel(s->gdma, chan, rx, n)) {
++                    qemu_log_mask(LOG_GUEST_ERROR, "esp32s3.spi%u: no RX DMA buffer\n", s->port);
++                }
++            } else {
++                store_buf(s, rx, s->user & USER_MISO_HIGHPART, n);
++            }
++        }
++    }
++
++    if (!(s->misc & MISC_CS_KEEP_ACTIVE)) {
++        set_cs(s, false);
++    }
++
++    /* Done when the last bit would have gone out (CS setup and hold are a few cycles more) */
++    if (s->user & USER_CS_SETUP) {
++        bits += ((s->user1 >> 17) & 0x1F) + 1;
++    }
++    if (s->user & USER_CS_HOLD) {
++        bits += ((s->user1 >> 22) & 0x1F) + 1;
++    }
++    uint64_t ns = muldiv64(bits, NANOSECONDS_PER_SECOND, MAX(sclk_hz(s), 1));
++    timer_mod(s->done_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MAX(ns, 1));
++}
++
++static void transaction_done(void *opaque)
++{
++    ESP32S3GPSPIState *s = ESP32S3_GPSPI(opaque);
++    uint32_t done = INT_TRANS_DONE;
++    if (s->user & USER_MOSI) {
++        done |= (s->dma_conf & DMA_CONF_TX_ENA) ? INT_WR_DMA_DONE : INT_WR_BUF_DONE;
++    }
++    if (s->user & USER_MISO) {
++        done |= (s->dma_conf & DMA_CONF_RX_ENA) ? INT_RD_DMA_DONE : INT_RD_BUF_DONE;
++    }
++    s->cmd &= ~CMD_USR;
++    s->int_raw |= done;
++    update_irq(s);
++}
++
++static uint64_t esp32s3_gpspi_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    ESP32S3GPSPIState *s = ESP32S3_GPSPI(opaque);
++
++    if (addr >= A_W0 && addr <= A_W15) {
++        return s->data[(addr - A_W0) / 4];
++    }
++    switch (addr) {
++    case A_CMD:         return s->cmd;
++    case A_ADDR:        return s->addr;
++    case A_CTRL:        return s->ctrl;
++    case A_CLOCK:       return s->clock;
++    case A_USER:        return s->user;
++    case A_USER1:       return s->user1;
++    case A_USER2:       return s->user2;
++    case A_MS_DLEN:     return s->ms_dlen;
++    case A_MISC:        return s->misc;
++    case A_DIN_MODE:    return s->din_mode;
++    case A_DIN_NUM:     return s->din_num;
++    case A_DOUT_MODE:   return s->dout_mode;
++    case A_DMA_CONF:    return s->dma_conf | BIT(0);      /* OUTFIFO_EMPTY */
++    case A_DMA_INT_ENA: return s->int_ena;
++    case A_DMA_INT_RAW: return s->int_raw;
++    case A_DMA_INT_ST:  return s->int_raw & s->int_ena;
++    case A_SLAVE:       return s->slave;
++    case A_SLAVE1:      return s->slave1;
++    case A_CLK_GATE:    return s->clk_gate;
++    case A_DATE:        return DATE_VALUE;
++    default:
++        return 0;
++    }
++}
++
++static void esp32s3_gpspi_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
++{
++    ESP32S3GPSPIState *s = ESP32S3_GPSPI(opaque);
++
++    if (addr >= A_W0 && addr <= A_W15) {
++        s->data[(addr - A_W0) / 4] = value;
++        return;
++    }
++    switch (addr) {
++    case A_CMD:
++        /* UPDATE (copy the configuration to the SPI clock domain) is done at once */
++        s->cmd = value & ~CMD_UPDATE & ~CMD_USR;
++        if (value & CMD_USR) {
++            if (s->slave & BIT(26)) {
++                qemu_log_mask(LOG_UNIMP, "esp32s3.spi%u: slave mode\n", s->port);
++                return;
++            }
++            s->cmd |= CMD_USR;
++            run_transaction(s);
++        }
++        break;
++    case A_ADDR:        s->addr = value; break;
++    case A_CTRL:        s->ctrl = value; break;
++    case A_CLOCK:       s->clock = value; break;
++    case A_USER:        s->user = value; break;
++    case A_USER1:       s->user1 = value; break;
++    case A_USER2:       s->user2 = value; break;
++    case A_MS_DLEN:     s->ms_dlen = value & 0x3FFFF; break;
++    case A_MISC: {
++        bool keep = s->misc & MISC_CS_KEEP_ACTIVE;
++        s->misc = value;
++        if (keep && !(value & MISC_CS_KEEP_ACTIVE)) {
++            set_cs(s, false);           /* The end of a CS_KEEP_ACTIVE run */
++        }
++        break;
++    }
++    case A_DIN_MODE:    s->din_mode = value; break;
++    case A_DIN_NUM:     s->din_num = value; break;
++    case A_DOUT_MODE:   s->dout_mode = value; break;
++    case A_DMA_CONF:    s->dma_conf = value & ~DMA_CONF_RESETS; break;
++    case A_DMA_INT_ENA: s->int_ena = value & INT_MASK; update_irq(s); break;
++    case A_DMA_INT_CLR: s->int_raw &= ~value; update_irq(s); break;
++    case A_DMA_INT_RAW: s->int_raw = value & INT_MASK; update_irq(s); break;
++    case A_DMA_INT_SET: s->int_raw |= value & INT_MASK; update_irq(s); break;
++    case A_SLAVE:       s->slave = value & ~BIT(27); break;    /* SOFT_RESET clears itself */
++    case A_SLAVE1:      s->slave1 = value; break;
++    case A_CLK_GATE:    s->clk_gate = value; break;
++    default:
++        qemu_log_mask(LOG_UNIMP, "esp32s3.spi%u: write to 0x%" HWADDR_PRIx "\n", s->port, addr);
++        break;
++    }
++}
++
++static const MemoryRegionOps esp32s3_gpspi_ops = {
++    .read = esp32s3_gpspi_read,
++    .write = esp32s3_gpspi_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static void esp32s3_gpspi_reset_hold(Object *obj, ResetType type)
++{
++    ESP32S3GPSPIState *s = ESP32S3_GPSPI(obj);
++
++    timer_del(s->done_timer);
++    s->cmd = s->addr = s->ctrl = 0;
++    s->clock = 0x80003043;              /* Reset values from the TRM */
++    s->user = 0x800000C0;
++    s->user1 = 0xB8410007;
++    s->user2 = 0x78000000;
++    s->ms_dlen = 0;
++    s->misc = 0x3E;                     /* CS1-CS5 disabled, CS0 enabled */
++    s->din_mode = s->din_num = s->dout_mode = 0;
++    s->dma_conf = 0;
++    s->int_ena = s->int_raw = 0;
++    memset(s->data, 0, sizeof(s->data));
++    s->slave = 0x280000;
++    s->slave1 = 0;
++    s->clk_gate = 0;
++    set_cs(s, false);
++    update_irq(s);
++}
++
++static void esp32s3_gpspi_realize(DeviceState *dev, Error **errp)
++{
++    ESP32S3GPSPIState *s = ESP32S3_GPSPI(dev);
++
++    if (s->port != 2 && s->port != 3) {
++        error_setg(errp, "port must be 2 or 3");
++        return;
++    }
++    g_autofree char *name = g_strdup_printf("spi%u", s->port);
++    s->bus = ssi_create_bus(dev, name);
++}
++
++static void esp32s3_gpspi_init(Object *obj)
++{
++    ESP32S3GPSPIState *s = ESP32S3_GPSPI(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &esp32s3_gpspi_ops, s, TYPE_ESP32S3_GPSPI, ESP32S3_GPSPI_REGS);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    qdev_init_gpio_out_named(DEVICE(s), s->cs, ESP32S3_GPSPI_CS_OUT, ESP32S3_GPSPI_CS_COUNT);
++    s->done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, transaction_done, s);
++}
++
++static Property esp32s3_gpspi_properties[] = {
++    DEFINE_PROP_UINT32("port", ESP32S3GPSPIState, port, 2),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void esp32s3_gpspi_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    dc->realize = esp32s3_gpspi_realize;
++    rc->phases.hold = esp32s3_gpspi_reset_hold;
++    device_class_set_props(dc, esp32s3_gpspi_properties);
++}
++
++static const TypeInfo esp32s3_gpspi_info = {
++    .name = TYPE_ESP32S3_GPSPI,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(ESP32S3GPSPIState),
++    .instance_init = esp32s3_gpspi_init,
++    .class_init = esp32s3_gpspi_class_init,
++};
++
++static void esp32s3_gpspi_register_types(void)
++{
++    type_register_static(&esp32s3_gpspi_info);
++}
++
++type_init(esp32s3_gpspi_register_types)
+diff --git a/hw/ssi/meson.build b/hw/ssi/meson.build
+index 4c12114..c254062 100644
+--- a/hw/ssi/meson.build
++++ b/hw/ssi/meson.build
+@@ -18,7 +18,7 @@ system_ss.add(when: 'CONFIG_RISCV_ESP32H4', if_true: files('esp32c3_spi.c', 'esp
+ system_ss.add(when: 'CONFIG_RISCV_ESP32P4', if_true: files('esp32c3_spi.c', 'esp32p4_spi.c'))
+ system_ss.add(when: 'CONFIG_RISCV_ESP32C6', if_true: files('esp32c3_spi.c', 'esp32c6_spi.c'))
+ system_ss.add(when: 'CONFIG_RISCV_ESP32H2', if_true: files('esp32c3_spi.c', 'esp32h2_spi.c'))
+-system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32s3_spi.c'))
++system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32s3_spi.c', 'esp32s3_gpspi.c'))
+ system_ss.add(when: 'CONFIG_IBEX', if_true: files('ibex_spi_host.c'))
+ system_ss.add(when: 'CONFIG_BCM2835_SPI', if_true: files('bcm2835_spi.c'))
+ system_ss.add(when: 'CONFIG_PNV_SPI', if_true: files('pnv_spi.c'))
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index e07ae81..038d796 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -61,6 +61,7 @@
+ #include "hw/timer/esp32s3_timg.h"
+ #include "hw/timer/esp32s3_systimer.h"
+ #include "hw/gpio/esp32s3_gpio.h"
++#include "hw/ssi/esp32s3_gpspi.h"
+ #include "hw/misc/esp32s3_xts_aes.h"
+ #include "hw/misc/esp32s3_pms.h"
+ #include "hw/net/can/esp32s3_twai.h"
+@@ -123,6 +124,7 @@ typedef struct Esp32s3SocState {
+     Esp32s3IntMatrixState intmatrix;
+     ESP32S3UARTState uart[ESP32S3_UART_COUNT];
+     ESP32S3GPIOState gpio;
++    ESP32S3GPSPIState gpspi[2];         /* GP-SPI2 and GP-SPI3 */
+     Esp32s3RngState rng;
+     Esp32S3TWAIState twai;
+ 
+@@ -756,6 +758,8 @@ static void esp32s3_machine_init(MachineState *machine)
+     object_initialize_child(OBJECT(ss), "efuse", &ss->efuse, TYPE_ESP32S3_EFUSE);
+     object_initialize_child(OBJECT(ss), "jtag", &ss->jtag, TYPE_ESP32C3_JTAG);
+     object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ESP32S3_GPIO);
++    object_initialize_child(OBJECT(ss), "spi2", &ss->gpspi[0], TYPE_ESP32S3_GPSPI);
++    object_initialize_child(OBJECT(ss), "spi3", &ss->gpspi[1], TYPE_ESP32S3_GPSPI);
+     object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
+ 
+     object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
+@@ -931,6 +935,30 @@ static void esp32s3_machine_init(MachineState *machine)
+         }
+    }
+ 
++    /* GP-SPI2 and GP-SPI3: chip selects to the GPIO matrix (FSPICS0-5; SPI3_CS0-2) */
++    {
++        static const int cs_sig[2][ESP32S3_GPSPI_CS_COUNT] = {
++            { 110, 111, 112, 113, 114, 115 },
++            { 71, 72, 127, -1, -1, -1 },
++        };
++        static const hwaddr base[2] = { DR_REG_SPI2_BASE, DR_REG_SPI3_BASE };
++        for (int i = 0; i < 2; i++) {
++            ESP32S3GPSPIState *spi = &ss->gpspi[i];
++            qdev_prop_set_uint32(DEVICE(spi), "port", 2 + i);
++            spi->gdma = ESP_GDMA(&ss->gdma);
++            sysbus_realize(SYS_BUS_DEVICE(spi), &error_fatal);
++            memory_region_add_subregion_overlap(sys_mem, base[i],
++                                                sysbus_mmio_get_region(SYS_BUS_DEVICE(spi), 0), 0);
++            sysbus_connect_irq(SYS_BUS_DEVICE(spi), 0,
++                               qdev_get_gpio_in(intmatrix_dev, ETS_SPI2_INTR_SOURCE + i));
++            for (int n = 0; n < ESP32S3_GPSPI_CS_COUNT && cs_sig[i][n] >= 0; n++) {
++                qdev_connect_gpio_out_named(DEVICE(spi), ESP32S3_GPSPI_CS_OUT, n,
++                                            qdev_get_gpio_in_named(DEVICE(&ss->gpio), ESP32S3_GPIO_SIG_OUT,
++                                                                   cs_sig[i][n]));
++            }
++        }
++    }
++
+     /* SHA realization */
+     {
+         ss->sha.parent.gdma = ESP_GDMA(&ss->gdma);
+diff --git a/include/hw/gpio/esp32s3_gpio.h b/include/hw/gpio/esp32s3_gpio.h
+index df571a6..a17973b 100644
+--- a/include/hw/gpio/esp32s3_gpio.h
++++ b/include/hw/gpio/esp32s3_gpio.h
+@@ -6,7 +6,10 @@
+  *                       value releases it, and the chip or the pull resistors decide
+  *   "pin-out" [49] out: the pin's level, each time it changes
+  *   "sig-out" [256] in: peripheral output signals, routed to pins by the GPIO matrix
+- *                       (FUNC_OUT_SEL_CFG)
++ *                       (FUNC_OUT_SEL_CFG) or, for a pin's own functions, the IO_MUX
++ *   "pin-pull" [49] in: a resistor on the board: 1 pulls the pin up, 0 down, any other
++ *                       value removes it. The chip's own pulls (IO_MUX) come first.
++ * More than one device can follow a pin: esp32s3_gpio_add_listener().
+  *
+  * Copyright (c) 2023 Espressif Systems (Shanghai) Co. Ltd.
+  *
+@@ -33,6 +36,7 @@
+ #define ESP32S3_GPIO_PIN_IN   "pin-in"
+ #define ESP32S3_GPIO_PIN_OUT  "pin-out"
+ #define ESP32S3_GPIO_SIG_OUT  "sig-out"
++#define ESP32S3_GPIO_PIN_PULL "pin-pull"
+ 
+ typedef struct ESP32S3GPIOState {
+     SysBusDevice parent_obj;
+@@ -50,6 +54,9 @@ typedef struct ESP32S3GPIOState {
+     uint64_t ext_driven;                        /* Pins driven from outside... */
+     uint64_t ext_level;                         /* ...and their levels */
+     uint64_t level;                             /* Each pin's current level */
++    uint64_t board_pulled;                      /* Pins with a resistor on the board... */
++    uint64_t board_pull_level;                  /* ...and which way it pulls */
++    GPtrArray *listeners[ESP32S3_GPIO_PINS];    /* More qemu_irqs following each pin */
+     uint8_t sig_out[ESP32S3_GPIO_SIGNALS];      /* Peripheral output signals */
+     uint32_t pin[ESP32S3_GPIO_PINS];            /* PINn: interrupt type and enable, driver */
+     uint32_t func_out_sel[ESP32S3_GPIO_PINS];
+@@ -58,3 +65,6 @@ typedef struct ESP32S3GPIOState {
+     uint32_t iomux_pin_ctrl;
+     uint32_t bt_select, sdio_select, clock_gate;
+ } ESP32S3GPIOState;
++
++/* Have `irq` follow the level of `pin` from now on (and set it to the current level) */
++void esp32s3_gpio_add_listener(ESP32S3GPIOState *s, int pin, qemu_irq irq);
+diff --git a/include/hw/ssi/esp32s3_gpspi.h b/include/hw/ssi/esp32s3_gpspi.h
+new file mode 100644
+index 0000000..aa1c276
+--- /dev/null
++++ b/include/hw/ssi/esp32s3_gpspi.h
+@@ -0,0 +1,46 @@
++/*
++ * ESP32-S3 general purpose SPI controllers (GP-SPI2 and GP-SPI3), master mode
++ *
++ * Each controller has an SSI bus, "spi2" or "spi3": attach devices with
++ *   -device <model>,bus=spi2
++ * and connect their chip select to the pin the board wires it to (esp32s3.pin-link),
++ * because a device is selected by its CS pin's level. Its CS can be the controller's (the
++ * FSPICSn / SPI3_CSn signals, routed to a pin by the GPIO matrix or the IO_MUX) or a pin
++ * the firmware toggles by hand: both work as on the chip.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++#pragma once
++
++#include "hw/sysbus.h"
++#include "hw/ssi/ssi.h"
++#include "hw/dma/esp_gdma.h"
++
++#define TYPE_ESP32S3_GPSPI "esp32s3.gpspi"
++OBJECT_DECLARE_SIMPLE_TYPE(ESP32S3GPSPIState, ESP32S3_GPSPI)
++
++#define ESP32S3_GPSPI_CS_COUNT  6       /* SPI2: 6, SPI3: 3 */
++#define ESP32S3_GPSPI_CS_OUT    "cs"    /* The CSn signals, to the GPIO matrix */
++#define ESP32S3_GPSPI_REGS      0x100
++#define ESP32S3_GPSPI_BUF_WORDS 16
++
++struct ESP32S3GPSPIState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;
++    SSIBus *bus;
++    qemu_irq irq;
++    qemu_irq cs[ESP32S3_GPSPI_CS_COUNT];
++    QEMUTimer *done_timer;
++    ESPGdmaState *gdma;
++
++    uint32_t port;                      /* 2 or 3 */
++
++    uint32_t cmd, addr, ctrl, clock, user, user1, user2, ms_dlen, misc;
++    uint32_t din_mode, din_num, dout_mode;
++    uint32_t dma_conf, int_ena, int_raw;
++    uint32_t data[ESP32S3_GPSPI_BUF_WORDS];
++    uint32_t slave, slave1, clk_gate;
++};
+diff --git a/tests/qtest/esp32s3-gpspi-test.c b/tests/qtest/esp32s3-gpspi-test.c
+new file mode 100644
+index 0000000..2ba681d
+--- /dev/null
++++ b/tests/qtest/esp32s3-gpspi-test.c
+@@ -0,0 +1,228 @@
++/*
++ * QTest for the ESP32-S3 GP-SPI2 controller: a SPI NOR flash (gd25q32) on the spi2 bus,
++ * its chip select wired to a pin, read through the W buffer and through the GDMA.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "libqtest.h"
++
++#define SPI2            0x60024000
++#define SPI_CMD         (SPI2 + 0x00)
++#define SPI_CLOCK       (SPI2 + 0x0C)
++#define SPI_USER        (SPI2 + 0x10)
++#define SPI_USER1       (SPI2 + 0x14)
++#define SPI_USER2       (SPI2 + 0x18)
++#define SPI_MS_DLEN     (SPI2 + 0x1C)
++#define SPI_MISC        (SPI2 + 0x20)
++#define SPI_DMA_CONF    (SPI2 + 0x30)
++#define SPI_INT_ENA     (SPI2 + 0x34)
++#define SPI_INT_CLR     (SPI2 + 0x38)
++#define SPI_INT_RAW     (SPI2 + 0x3C)
++#define SPI_W0          (SPI2 + 0x98)
++#define SPI_CLK_GATE    (SPI2 + 0xE8)
++
++#define CMD_UPDATE      BIT(23)
++#define CMD_USR         BIT(24)
++#define USER_DOUTDIN    BIT(0)
++#define USER_MOSI       BIT(27)
++#define USER_MISO       BIT(28)
++#define USER_COMMAND    BIT(31)
++#define TRANS_DONE      BIT(12)
++
++#define GPIO            0x60004000
++#define GPIO_OUT_W1TS   (GPIO + 0x08)
++#define GPIO_EN_W1TS    (GPIO + 0x24)
++#define OUT_SEL(n)      (GPIO + 0x554 + 4 * (n))
++#define IN              (GPIO + 0x3C)
++#define IO_MUX(n)       (0x60009004 + 4 * (n))
++#define FSPICS0         110
++
++#define GDMA            0x6003F000
++#define GDMA_IN(ch, r)  (GDMA + (ch) * 0xC0 + (r))
++#define GDMA_OUT(ch, r) (GDMA + (ch) * 0xC0 + 0x60 + (r))
++#define LINK            0x20
++#define PERI_SEL        0x48
++#define OUT_LINK_START  BIT(21)
++#define IN_LINK_START   BIT(22)
++
++#define INTMATRIX_STATUS0   0x600C218C
++#define SPI2_SOURCE         21
++
++#define CS_PIN          14
++#define JEDEC_GD25Q32   0x1640C8        /* C8 40 16, read as a little-endian word */
++
++static QTestState *start(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3 "
++                                 "-device gd25q32,bus=spi2,id=flash "
++                                 "-device esp32s3.pin-link,pin=14,dev=flash,line=ssi-gpio-cs,pull=up");
++    /* As spi_master: the controller's clock on, 10 MHz (80 MHz / 8), CS0 only */
++    qtest_writel(qts, SPI_CLK_GATE, 0x7);
++    qtest_writel(qts, SPI_CLOCK, (7 << 12) | (3 << 6) | 7);
++    qtest_writel(qts, SPI_MISC, 0x3E);
++    return qts;
++}
++
++/* JEDEC ID (0x9F), full duplex: 4 bytes out, 4 in */
++static void jedec_setup(QTestState *qts)
++{
++    qtest_writel(qts, SPI_USER, USER_DOUTDIN | USER_MOSI | USER_MISO);
++    qtest_writel(qts, SPI_MS_DLEN, 31);
++    qtest_writel(qts, SPI_CMD, CMD_UPDATE);
++    g_assert_cmphex(qtest_readl(qts, SPI_CMD), ==, 0);     /* The update is done at once */
++}
++
++static void run(QTestState *qts)
++{
++    qtest_writel(qts, SPI_CMD, CMD_USR);
++    qtest_clock_step(qts, 1000000);
++}
++
++static void test_cs_through_matrix(void)
++{
++    QTestState *qts = start();
++
++    /* The pull-up holds the flash deselected */
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(CS_PIN), ==, BIT(CS_PIN));
++
++    /* FSPICS0 to the pin: idle high, low during a transaction */
++    qtest_writel(qts, OUT_SEL(CS_PIN), FSPICS0);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(CS_PIN), ==, BIT(CS_PIN));
++
++    jedec_setup(qts);
++    qtest_writel(qts, SPI_W0, 0xFFFFFF9F);
++    run(qts);
++    g_assert_cmphex(qtest_readl(qts, SPI_INT_RAW) & TRANS_DONE, ==, TRANS_DONE);
++    g_assert_cmphex(qtest_readl(qts, SPI_CMD) & CMD_USR, ==, 0);
++    g_assert_cmphex(qtest_readl(qts, SPI_W0) >> 8, ==, JEDEC_GD25Q32);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(CS_PIN), ==, BIT(CS_PIN));
++
++    /* CS0 disabled: nobody answers */
++    qtest_writel(qts, SPI_INT_CLR, TRANS_DONE);
++    qtest_writel(qts, SPI_MISC, 0x3F);
++    qtest_writel(qts, SPI_W0, 0xFFFFFF9F);
++    run(qts);
++    g_assert_cmphex(qtest_readl(qts, SPI_W0), ==, 0);
++    qtest_quit(qts);
++}
++
++static void test_cs_by_hand(void)
++{
++    QTestState *qts = start();
++
++    /* The CS pin as a plain output, as Arduino's SD library does */
++    qtest_writel(qts, GPIO_EN_W1TS, BIT(CS_PIN));
++    qtest_writel(qts, GPIO_OUT_W1TS, BIT(CS_PIN));
++    jedec_setup(qts);
++    qtest_writel(qts, SPI_W0, 0xFFFFFF9F);
++    run(qts);
++    g_assert_cmphex(qtest_readl(qts, SPI_W0), ==, 0);      /* High: not selected */
++
++    qtest_writel(qts, GPIO + 0x0C, BIT(CS_PIN));            /* OUT_W1TC */
++    qtest_writel(qts, SPI_W0, 0xFFFFFF9F);
++    run(qts);
++    g_assert_cmphex(qtest_readl(qts, SPI_W0) >> 8, ==, JEDEC_GD25Q32);
++    qtest_quit(qts);
++}
++
++static void test_command_phase(void)
++{
++    QTestState *qts = start();
++
++    /* 0x9F in the command phase (as spi_ll_set_command leaves it), then 24 bits in */
++    qtest_writel(qts, OUT_SEL(CS_PIN), FSPICS0);
++    qtest_writel(qts, SPI_USER, USER_COMMAND | USER_MISO);
++    qtest_writel(qts, SPI_USER2, (7u << 28) | 0x9F);
++    qtest_writel(qts, SPI_MS_DLEN, 23);
++    run(qts);
++    g_assert_cmphex(qtest_readl(qts, SPI_W0) & 0xFFFFFF, ==, JEDEC_GD25Q32);
++    qtest_quit(qts);
++}
++
++static void test_timing_and_irq(void)
++{
++    QTestState *qts = start();
++
++    qtest_writel(qts, OUT_SEL(CS_PIN), FSPICS0);
++    qtest_writel(qts, SPI_INT_ENA, TRANS_DONE);
++    jedec_setup(qts);
++    qtest_writel(qts, SPI_W0, 0xFFFFFF9F);
++
++    /* 32 bits at 10 MHz: 3.2 us */
++    qtest_writel(qts, SPI_CMD, CMD_USR);
++    qtest_clock_step(qts, 3000);
++    g_assert_cmphex(qtest_readl(qts, SPI_INT_RAW) & TRANS_DONE, ==, 0);
++    g_assert_false(qtest_readl(qts, INTMATRIX_STATUS0) & BIT(SPI2_SOURCE));
++    qtest_clock_step(qts, 300);
++    g_assert_cmphex(qtest_readl(qts, SPI_INT_RAW) & TRANS_DONE, ==, TRANS_DONE);
++    g_assert_true(qtest_readl(qts, INTMATRIX_STATUS0) & BIT(SPI2_SOURCE));
++
++    qtest_writel(qts, SPI_INT_CLR, TRANS_DONE);
++    g_assert_false(qtest_readl(qts, INTMATRIX_STATUS0) & BIT(SPI2_SOURCE));
++    qtest_quit(qts);
++}
++
++static void test_iomux_cs(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3 "
++                                 "-device gd25q32,bus=spi2,id=flash "
++                                 "-device esp32s3.pin-link,pin=10,dev=flash,line=ssi-gpio-cs,pull=up");
++    qtest_writel(qts, SPI_CLK_GATE, 0x7);
++    qtest_writel(qts, SPI_MISC, 0x3E);
++    /* GPIO10's own function 4 is FSPICS0: no GPIO matrix */
++    qtest_writel(qts, IO_MUX(10), (4 << 12) | BIT(9));
++    jedec_setup(qts);
++    qtest_writel(qts, SPI_W0, 0xFFFFFF9F);
++    run(qts);
++    g_assert_cmphex(qtest_readl(qts, SPI_W0) >> 8, ==, JEDEC_GD25Q32);
++    qtest_quit(qts);
++}
++
++static void test_dma(void)
++{
++    QTestState *qts = start();
++    const uint32_t tx_desc = 0x3FCA0000, rx_desc = 0x3FCA0010;
++    const uint32_t tx_buf = 0x3FCA0100, rx_buf = 0x3FCA0200;
++    const uint8_t cmd[4] = { 0x9F, 0xFF, 0xFF, 0xFF };
++
++    qtest_writel(qts, OUT_SEL(CS_PIN), FSPICS0);
++    qtest_memwrite(qts, tx_buf, cmd, sizeof(cmd));
++    qtest_memset(qts, rx_buf, 0xAA, 4);
++    /* Descriptors: size, length, suc_eof, owner = DMA; buffer; next (none) */
++    qtest_writel(qts, tx_desc, BIT(31) | BIT(30) | (4 << 12) | 4);
++    qtest_writel(qts, tx_desc + 4, tx_buf);
++    qtest_writel(qts, tx_desc + 8, 0);
++    qtest_writel(qts, rx_desc, BIT(31) | (0 << 12) | 4);
++    qtest_writel(qts, rx_desc + 4, rx_buf);
++    qtest_writel(qts, rx_desc + 8, 0);
++
++    /* Channel 0 to SPI2, both directions */
++    qtest_writel(qts, GDMA_OUT(0, PERI_SEL), 0);
++    qtest_writel(qts, GDMA_IN(0, PERI_SEL), 0);
++    qtest_writel(qts, GDMA_OUT(0, LINK), (tx_desc & 0xFFFFF) | OUT_LINK_START);
++    qtest_writel(qts, GDMA_IN(0, LINK), (rx_desc & 0xFFFFF) | IN_LINK_START);
++
++    qtest_writel(qts, SPI_DMA_CONF, BIT(27) | BIT(28));
++    jedec_setup(qts);
++    run(qts);
++    g_assert_cmphex(qtest_readl(qts, SPI_INT_RAW) & TRANS_DONE, ==, TRANS_DONE);
++    g_assert_cmphex(qtest_readl(qts, rx_buf) >> 8, ==, JEDEC_GD25Q32);
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/gpspi/cs_through_matrix", test_cs_through_matrix);
++    qtest_add_func("/esp32s3/gpspi/cs_by_hand", test_cs_by_hand);
++    qtest_add_func("/esp32s3/gpspi/command_phase", test_command_phase);
++    qtest_add_func("/esp32s3/gpspi/timing_and_irq", test_timing_and_irq);
++    qtest_add_func("/esp32s3/gpspi/iomux_cs", test_iomux_cs);
++    qtest_add_func("/esp32s3/gpspi/dma", test_dma);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 1f2304b..171393e 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+

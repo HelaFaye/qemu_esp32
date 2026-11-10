@@ -1,0 +1,764 @@
+From daa6af0e44c501821b8b225a20527f7e98e6a57c Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Tue, 10 Nov 2026 05:25:03 +0000
+Subject: [PATCH 1/2] esp32s3: GPIO pins as wires: matrix, IO_MUX pulls,
+ interrupts
+
+The S3's GPIO was register loopback: no pin levels, no IO_MUX (an unimp
+device), no interrupt line. Now each of the 49 pins has a level: the
+chip's output (GPIO_OUT or a peripheral signal through FUNC_OUT_SEL_CFG,
+inverted, push-pull or open drain), else an external drive, else the
+IO_MUX pull. IN/IN1 read it (0 with FUN_IE clear). PINn edge and level
+interrupts set STATUS, PCPU_INT gates them, and the line goes to
+ETS_GPIO_INTR_SOURCE.
+
+Named GPIO lines let boards and tests wire devices to pins: pin-in
+(drive a pin), pin-out (a pin's level), sig-out (peripheral signals).
+---
+ hw/gpio/esp32s3_gpio.c          | 386 +++++++++++++++++++++++++++++++-
+ hw/xtensa/esp32s3.c             |   5 +-
+ include/hw/gpio/esp32s3_gpio.h  |  58 ++++-
+ tests/qtest/esp32s3-gpio-test.c | 196 ++++++++++++++++
+ tests/qtest/meson.build         |   2 +-
+ 5 files changed, 626 insertions(+), 21 deletions(-)
+ create mode 100644 tests/qtest/esp32s3-gpio-test.c
+
+diff --git a/hw/gpio/esp32s3_gpio.c b/hw/gpio/esp32s3_gpio.c
+index 0a0e477..548c928 100644
+--- a/hw/gpio/esp32s3_gpio.c
++++ b/hw/gpio/esp32s3_gpio.c
+@@ -1,5 +1,12 @@
+ /*
+- * ESP32-S3 GPIO emulation
++ * ESP32-S3 GPIO, GPIO matrix and IO_MUX emulation
++ *
++ * Pins 0-48: output and output enable (GPIO_OUT or a peripheral signal through the GPIO
++ * matrix, inverted or not, push-pull or open drain), inputs (driven from outside, looped
++ * back from the output, or the pull resistor's level; read as 0 with the input disabled),
++ * interrupts on edges or levels (PINn), and the IO_MUX's pull and input-enable bits.
++ * Register layout: ESP32-S3 TRM, chapter "IO MUX and GPIO Matrix"; ESP-IDF's
++ * soc/esp32s3/register/soc/gpio_reg.h and io_mux_reg.h.
+  *
+  * Copyright (c) 2023 Espressif Systems (Shanghai) Co. Ltd.
+  *
+@@ -10,35 +17,396 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/log.h"
+-#include "qemu/error-report.h"
+ #include "qapi/error.h"
+ #include "hw/hw.h"
+ #include "hw/sysbus.h"
+-#include "hw/registerfields.h"
+ #include "hw/irq.h"
+ #include "hw/qdev-properties.h"
++#include "migration/vmstate.h"
+ #include "hw/gpio/esp32s3_gpio.h"
+ 
++#define PINS            ESP32S3_GPIO_PINS
++#define PIN_MASK        ((1ULL << PINS) - 1)
++
++/* GPIO registers */
++#define A_BT_SELECT         0x000
++#define A_OUT               0x004
++#define A_OUT_W1TS          0x008
++#define A_OUT_W1TC          0x00C
++#define A_OUT1              0x010
++#define A_OUT1_W1TS         0x014
++#define A_OUT1_W1TC         0x018
++#define A_SDIO_SELECT       0x01C
++#define A_ENABLE            0x020
++#define A_ENABLE_W1TS       0x024
++#define A_ENABLE_W1TC       0x028
++#define A_ENABLE1           0x02C
++#define A_ENABLE1_W1TS      0x030
++#define A_ENABLE1_W1TC      0x034
++#define A_STRAP             0x038
++#define A_IN                0x03C
++#define A_IN1               0x040
++#define A_STATUS            0x044
++#define A_STATUS_W1TS       0x048
++#define A_STATUS_W1TC       0x04C
++#define A_STATUS1           0x050
++#define A_STATUS1_W1TS      0x054
++#define A_STATUS1_W1TC      0x058
++#define A_PCPU_INT          0x05C
++#define A_PCPU_NMI_INT      0x060
++#define A_CPUSDIO_INT       0x064
++#define A_PCPU_INT1         0x068
++#define A_PCPU_NMI_INT1     0x06C
++#define A_CPUSDIO_INT1      0x070
++#define A_PIN0              0x074
++#define A_PIN48             0x134
++#define A_STATUS_NEXT       0x14C
++#define A_STATUS_NEXT1      0x150
++#define A_FUNC0_IN_SEL      0x154
++#define A_FUNC255_IN_SEL    0x550
++#define A_FUNC0_OUT_SEL     0x554
++#define A_FUNC48_OUT_SEL    0x614
++#define A_CLOCK_GATE        0x62C
++#define A_DATE              0x6FC
++#define GPIO_DATE_VALUE     0x1907040
++
++/* PINn */
++#define PIN_PAD_DRIVER      BIT(2)          /* Open drain */
++#define PIN_INT_TYPE(v)     (((v) >> 7) & 0x7)
++#define PIN_INT_ENA(v)      (((v) >> 13) & 0x1F)
++#define INT_ENA_CPU         BIT(0)          /* Both CPUs, through PCPU_INT */
++#define INT_ENA_NMI         BIT(1)
++
++enum { INT_DISABLED, INT_POSEDGE, INT_NEGEDGE, INT_ANYEDGE, INT_LOW_LEVEL, INT_HIGH_LEVEL };
++
++/* FUNCn_OUT_SEL_CFG */
++#define OUT_SEL(v)          ((v) & 0x1FF)
++#define OUT_INV_SEL         BIT(9)
++#define OEN_SEL             BIT(10)         /* Output enable from GPIO_ENABLE, not the peripheral */
++#define OEN_INV_SEL         BIT(11)
++
++/* IO_MUX: GPIOn at 0x04 + 4 * n */
++#define IOMUX_PIN0          0x04
++#define FUN_PD              BIT(7)
++#define FUN_PU              BIT(8)
++#define FUN_IE              BIT(9)
++#define IOMUX_RESET         (FUN_IE | (2 << 10))     /* Input on, drive strength 2 */
++
++static bool pin_output_enabled(ESP32S3GPIOState *s, int n)
++{
++    uint32_t sel = s->func_out_sel[n];
++    bool oe;
++    if (OUT_SEL(sel) == ESP32S3_GPIO_OUT_SEL_GPIO || (sel & OEN_SEL)) {
++        oe = (s->enable >> n) & 1;
++    } else {
++        oe = true;              /* The peripheral drives the pin (it enables its output) */
++    }
++    if (sel & OEN_INV_SEL) {
++        oe = !oe;
++    }
++    return oe;
++}
++
++static int pin_output_value(ESP32S3GPIOState *s, int n)
++{
++    uint32_t sel = s->func_out_sel[n];
++    int v;
++    if (OUT_SEL(sel) == ESP32S3_GPIO_OUT_SEL_GPIO) {
++        v = (s->out >> n) & 1;
++    } else {
++        v = OUT_SEL(sel) < ESP32S3_GPIO_SIGNALS ? s->sig_out[OUT_SEL(sel)] : 0;
++    }
++    if (sel & OUT_INV_SEL) {
++        v = !v;
++    }
++    return v;
++}
++
++/* The level on the pad: the chip's output, else what drives it from outside, else the pull */
++static int pin_level(ESP32S3GPIOState *s, int n)
++{
++    bool open_drain = s->pin[n] & PIN_PAD_DRIVER;
++    if (pin_output_enabled(s, n)) {
++        int v = pin_output_value(s, n);
++        if (!open_drain || v == 0) {
++            return v;
++        }
++    }
++    if ((s->ext_driven >> n) & 1) {
++        return (s->ext_level >> n) & 1;
++    }
++    if (s->iomux_regs[n] & FUN_PU) {
++        return 1;
++    }
++    return 0;           /* Pulled down, or floating */
++}
++
++static uint64_t input_value(ESP32S3GPIOState *s)
++{
++    uint64_t v = 0;
++    for (int n = 0; n < PINS; n++) {
++        if ((s->iomux_regs[n] & FUN_IE) && ((s->level >> n) & 1)) {
++            v |= 1ULL << n;
++        }
++    }
++    return v;
++}
++
++static uint64_t cpu_int_mask(ESP32S3GPIOState *s, uint32_t which)
++{
++    uint64_t m = 0;
++    for (int n = 0; n < PINS; n++) {
++        if (PIN_INT_ENA(s->pin[n]) & which) {
++            m |= 1ULL << n;
++        }
++    }
++    return m;
++}
++
++static void update_irq(ESP32S3GPIOState *s)
++{
++    uint64_t pending = s->status & cpu_int_mask(s, INT_ENA_CPU | INT_ENA_NMI);
++    qemu_set_irq(s->irq, pending != 0);
++}
++
++/* Level interrupts stay pending as long as the level holds, even after a clear */
++static void latch_levels(ESP32S3GPIOState *s)
++{
++    for (int n = 0; n < PINS; n++) {
++        int type = PIN_INT_TYPE(s->pin[n]);
++        int l = (s->level >> n) & 1;
++        if ((type == INT_LOW_LEVEL && !l) || (type == INT_HIGH_LEVEL && l)) {
++            s->status |= 1ULL << n;
++        }
++    }
++}
++
++/* Recompute every pin's level: wires out, edge interrupts, then the interrupt line */
++static void update_pins(ESP32S3GPIOState *s)
++{
++    for (int n = 0; n < PINS; n++) {
++        int old = (s->level >> n) & 1;
++        int l = pin_level(s, n);
++        if (l == old) {
++            continue;
++        }
++        s->level = (s->level & ~(1ULL << n)) | ((uint64_t)l << n);
++        int type = PIN_INT_TYPE(s->pin[n]);
++        if ((type == INT_POSEDGE && l) || (type == INT_NEGEDGE && !l) || type == INT_ANYEDGE) {
++            s->status |= 1ULL << n;
++        }
++        qemu_set_irq(s->pin_out[n], l);
++    }
++    latch_levels(s);
++    update_irq(s);
++}
++
++static uint64_t esp32s3_gpio_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    ESP32S3GPIOState *s = ESP32S3_GPIO(opaque);
++
++    if (addr >= A_PIN0 && addr <= A_PIN48) {
++        return s->pin[(addr - A_PIN0) / 4];
++    }
++    if (addr >= A_FUNC0_IN_SEL && addr <= A_FUNC255_IN_SEL) {
++        return s->func_in_sel[(addr - A_FUNC0_IN_SEL) / 4];
++    }
++    if (addr >= A_FUNC0_OUT_SEL && addr <= A_FUNC48_OUT_SEL) {
++        return s->func_out_sel[(addr - A_FUNC0_OUT_SEL) / 4];
++    }
++    switch (addr) {
++    case A_BT_SELECT:       return s->bt_select;
++    case A_OUT:             return (uint32_t)s->out;
++    case A_OUT1:            return (uint32_t)(s->out >> 32);
++    case A_SDIO_SELECT:     return s->sdio_select;
++    case A_ENABLE:          return (uint32_t)s->enable;
++    case A_ENABLE1:         return (uint32_t)(s->enable >> 32);
++    case A_STRAP:           return s->strap_mode;
++    case A_IN:              return (uint32_t)input_value(s);
++    case A_IN1:             return (uint32_t)(input_value(s) >> 32);
++    case A_STATUS:          return (uint32_t)s->status;
++    case A_STATUS1:         return (uint32_t)(s->status >> 32);
++    case A_PCPU_INT:        return (uint32_t)(s->status & cpu_int_mask(s, INT_ENA_CPU));
++    case A_PCPU_NMI_INT:    return (uint32_t)(s->status & cpu_int_mask(s, INT_ENA_NMI));
++    case A_PCPU_INT1:       return (uint32_t)((s->status & cpu_int_mask(s, INT_ENA_CPU)) >> 32);
++    case A_PCPU_NMI_INT1:   return (uint32_t)((s->status & cpu_int_mask(s, INT_ENA_NMI)) >> 32);
++    case A_CPUSDIO_INT:
++    case A_CPUSDIO_INT1:
++    case A_STATUS_NEXT:
++    case A_STATUS_NEXT1:    return 0;
++    case A_CLOCK_GATE:      return s->clock_gate;
++    case A_DATE:            return GPIO_DATE_VALUE;
++    default:
++        qemu_log_mask(LOG_UNIMP, "%s: unimplemented register 0x%" HWADDR_PRIx "\n", __func__, addr);
++        return 0;
++    }
++}
++
++#define LO(v)   ((uint64_t)(uint32_t)(v))
++#define HI(v)   ((uint64_t)((uint32_t)(v) & 0x1FFFFF) << 32)    /* Pins 32-48 */
++
++static void esp32s3_gpio_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
++{
++    ESP32S3GPIOState *s = ESP32S3_GPIO(opaque);
++
++    if (addr >= A_PIN0 && addr <= A_PIN48) {
++        s->pin[(addr - A_PIN0) / 4] = value;
++        latch_levels(s);
++        update_irq(s);
++        return;
++    }
++    if (addr >= A_FUNC0_IN_SEL && addr <= A_FUNC255_IN_SEL) {
++        s->func_in_sel[(addr - A_FUNC0_IN_SEL) / 4] = value & 0xFF;
++        return;
++    }
++    if (addr >= A_FUNC0_OUT_SEL && addr <= A_FUNC48_OUT_SEL) {
++        s->func_out_sel[(addr - A_FUNC0_OUT_SEL) / 4] = value & 0xFFF;
++        update_pins(s);
++        return;
++    }
++    switch (addr) {
++    case A_BT_SELECT:       s->bt_select = value; return;
++    case A_SDIO_SELECT:     s->sdio_select = value; return;
++    case A_CLOCK_GATE:      s->clock_gate = value; return;
++    case A_OUT:             s->out = (s->out & ~LO(~0u)) | LO(value); break;
++    case A_OUT_W1TS:        s->out |= LO(value); break;
++    case A_OUT_W1TC:        s->out &= ~LO(value); break;
++    case A_OUT1:            s->out = (s->out & LO(~0u)) | HI(value); break;
++    case A_OUT1_W1TS:       s->out |= HI(value); break;
++    case A_OUT1_W1TC:       s->out &= ~HI(value); break;
++    case A_ENABLE:          s->enable = (s->enable & ~LO(~0u)) | LO(value); break;
++    case A_ENABLE_W1TS:     s->enable |= LO(value); break;
++    case A_ENABLE_W1TC:     s->enable &= ~LO(value); break;
++    case A_ENABLE1:         s->enable = (s->enable & LO(~0u)) | HI(value); break;
++    case A_ENABLE1_W1TS:    s->enable |= HI(value); break;
++    case A_ENABLE1_W1TC:    s->enable &= ~HI(value); break;
++    case A_STATUS:          s->status = (s->status & ~LO(~0u)) | LO(value); break;
++    case A_STATUS_W1TS:     s->status |= LO(value); break;
++    case A_STATUS_W1TC:     s->status &= ~LO(value); break;
++    case A_STATUS1:         s->status = (s->status & LO(~0u)) | HI(value); break;
++    case A_STATUS1_W1TS:    s->status |= HI(value); break;
++    case A_STATUS1_W1TC:    s->status &= ~HI(value); break;
++    default:
++        qemu_log_mask(LOG_UNIMP, "%s: unimplemented register 0x%" HWADDR_PRIx "\n", __func__, addr);
++        return;
++    }
++    update_pins(s);
++}
++
++static const MemoryRegionOps esp32s3_gpio_ops = {
++    .read = esp32s3_gpio_read,
++    .write = esp32s3_gpio_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static uint64_t esp32s3_iomux_read(void *opaque, hwaddr addr, unsigned int size)
++{
++    ESP32S3GPIOState *s = ESP32S3_GPIO(opaque);
++    if (addr == 0) {
++        return s->iomux_pin_ctrl;
++    }
++    int n = (addr - IOMUX_PIN0) / 4;
++    return (addr >= IOMUX_PIN0 && n < PINS) ? s->iomux_regs[n] : 0;
++}
++
++static void esp32s3_iomux_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
++{
++    ESP32S3GPIOState *s = ESP32S3_GPIO(opaque);
++    if (addr == 0) {
++        s->iomux_pin_ctrl = value;
++        return;
++    }
++    int n = (addr - IOMUX_PIN0) / 4;
++    if (addr >= IOMUX_PIN0 && n < PINS) {
++        s->iomux_regs[n] = value;
++        update_pins(s);         /* A pull changes an undriven pin's level */
++    }
++}
++
++static const MemoryRegionOps esp32s3_iomux_ops = {
++    .read = esp32s3_iomux_read,
++    .write = esp32s3_iomux_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++/* A level driven onto pin n from outside; anything but 0 or 1 releases the pin */
++static void esp32s3_gpio_pin_in(void *opaque, int n, int level)
++{
++    ESP32S3GPIOState *s = ESP32S3_GPIO(opaque);
++    if (level == 0 || level == 1) {
++        s->ext_driven |= 1ULL << n;
++        s->ext_level = (s->ext_level & ~(1ULL << n)) | ((uint64_t)level << n);
++    } else {
++        s->ext_driven &= ~(1ULL << n);
++    }
++    update_pins(s);
++}
++
++/* A peripheral's output signal (index: the signal number in FUNC_OUT_SEL_CFG) */
++static void esp32s3_gpio_sig_out(void *opaque, int sig, int level)
++{
++    ESP32S3GPIOState *s = ESP32S3_GPIO(opaque);
++    s->sig_out[sig] = level ? 1 : 0;
++    update_pins(s);
++}
++
++static void esp32s3_gpio_reset_hold(Object *obj, ResetType type)
++{
++    ESP32S3GPIOState *s = ESP32S3_GPIO(obj);
++
++    s->out = s->enable = s->status = 0;
++    s->bt_select = s->sdio_select = s->clock_gate = 0;
++    s->iomux_pin_ctrl = 0x7FF;
++    memset(s->pin, 0, sizeof(s->pin));
++    memset(s->func_in_sel, 0, sizeof(s->func_in_sel));
++    for (int n = 0; n < PINS; n++) {
++        s->func_out_sel[n] = ESP32S3_GPIO_OUT_SEL_GPIO;
++        s->iomux_regs[n] = IOMUX_RESET;
++    }
++    /* External drives and peripheral signals are wires: they survive a chip reset */
++    update_pins(s);
++}
+ 
+ static void esp32s3_gpio_init(Object *obj)
+ {
+-    /* Set the default value for the property */
+-    object_property_set_int(obj, "strap_mode", ESP32S3_STRAP_MODE_FLASH_BOOT, &error_fatal);
++    ESP32S3GPIOState *s = ESP32S3_GPIO(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &esp32s3_gpio_ops, s, TYPE_ESP32S3_GPIO, 0x1000);
++    sysbus_init_mmio(sbd, &s->iomem);
++    memory_region_init_io(&s->iomux, obj, &esp32s3_iomux_ops, s, TYPE_ESP32S3_GPIO ".iomux", 0x2000);
++    sysbus_init_mmio(sbd, &s->iomux);
++    sysbus_init_irq(sbd, &s->irq);
++
++    qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpio_pin_in, ESP32S3_GPIO_PIN_IN, PINS);
++    qdev_init_gpio_out_named(DEVICE(s), s->pin_out, ESP32S3_GPIO_PIN_OUT, PINS);
++    qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpio_sig_out, ESP32S3_GPIO_SIG_OUT, ESP32S3_GPIO_SIGNALS);
+ }
+ 
+-/* If we need to override any function from the parent (reset, realize, ...), it shall be done
+- * in this class_init function */
++static Property esp32s3_gpio_properties[] = {
++    DEFINE_PROP_UINT32("strap_mode", ESP32S3GPIOState, strap_mode, ESP32S3_STRAP_MODE_FLASH_BOOT),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
+ static void esp32s3_gpio_class_init(ObjectClass *klass, void *data)
+ {
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    rc->phases.hold = esp32s3_gpio_reset_hold;
++    device_class_set_props(dc, esp32s3_gpio_properties);
+ }
+ 
+ static const TypeInfo esp32s3_gpio_info = {
+     .name = TYPE_ESP32S3_GPIO,
+-    .parent = TYPE_ESP32_GPIO,
++    .parent = TYPE_SYS_BUS_DEVICE,
+     .instance_size = sizeof(ESP32S3GPIOState),
+     .instance_init = esp32s3_gpio_init,
+     .class_init = esp32s3_gpio_class_init,
+-    .class_size = sizeof(ESP32S3GPIOClass),
+ };
+ 
+ static void esp32s3_gpio_register_types(void)
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index 5a60acf..e07ae81 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -889,6 +889,10 @@ static void esp32s3_machine_init(MachineState *machine)
+         sysbus_realize(SYS_BUS_DEVICE(&ss->gpio), &error_fatal);
+         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gpio), 0);
+         memory_region_add_subregion_overlap(sys_mem, DR_REG_GPIO_BASE, mr, 0);
++        mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gpio), 1);
++        memory_region_add_subregion_overlap(sys_mem, DR_REG_IO_MUX_BASE, mr, 0);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->gpio), 0,
++                           qdev_get_gpio_in(intmatrix_dev, ETS_GPIO_INTR_SOURCE));
+     }
+ 
+     {
+@@ -1000,7 +1004,6 @@ static void esp32s3_machine_init(MachineState *machine)
+     }
+ 
+     esp32s3_soc_add_unimp_device(sys_mem, "esp32s3.rmt", DR_REG_RMT_BASE, 0x1000);
+-    esp32s3_soc_add_unimp_device(sys_mem, "esp32s3.iomux", DR_REG_IO_MUX_BASE, 0x2000);
+ 
+     
+     esp32s3_machine_init_sd(ss);
+diff --git a/include/hw/gpio/esp32s3_gpio.h b/include/hw/gpio/esp32s3_gpio.h
+index 7d6bb4b..df571a6 100644
+--- a/include/hw/gpio/esp32s3_gpio.h
++++ b/include/hw/gpio/esp32s3_gpio.h
+@@ -1,22 +1,60 @@
++/*
++ * ESP32-S3 GPIO, GPIO matrix and IO_MUX
++ *
++ * The pins are wires: named GPIO lines let boards and tests connect devices to them.
++ *   "pin-in"  [49] in:  a level driven onto the pin from outside (0 or 1); any other
++ *                       value releases it, and the chip or the pull resistors decide
++ *   "pin-out" [49] out: the pin's level, each time it changes
++ *   "sig-out" [256] in: peripheral output signals, routed to pins by the GPIO matrix
++ *                       (FUNC_OUT_SEL_CFG)
++ *
++ * Copyright (c) 2023 Espressif Systems (Shanghai) Co. Ltd.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
+ #pragma once
+ 
+ #include "hw/sysbus.h"
+ #include "hw/hw.h"
+ #include "hw/registerfields.h"
+-#include "esp32_gpio.h"
+ 
+ #define TYPE_ESP32S3_GPIO "esp32s3.gpio"
+-#define ESP32S3_GPIO(obj)           OBJECT_CHECK(ESP32S3GPIOState, (obj), TYPE_ESP32S3_GPIO)
+-#define ESP32S3_GPIO_GET_CLASS(obj) OBJECT_GET_CLASS(ESP32S3GPIOClass, obj, TYPE_ESP32S3_GPIO)
+-#define ESP32S3_GPIO_CLASS(klass)   OBJECT_CLASS_CHECK(ESP32S3GPIOClass, klass, TYPE_ESP32S3_GPIO)
++#define ESP32S3_GPIO(obj) OBJECT_CHECK(ESP32S3GPIOState, (obj), TYPE_ESP32S3_GPIO)
+ 
+ /* Bootstrap options for ESP32-S3 (4-bit) */
+ #define ESP32S3_STRAP_MODE_FLASH_BOOT 0x4   /* SPI Boot */
+ 
+-typedef struct ESP32S3State {
+-    Esp32GpioState parent;
+-} ESP32S3GPIOState;
++#define ESP32S3_GPIO_PINS         49
++#define ESP32S3_GPIO_SIGNALS      256
++#define ESP32S3_GPIO_OUT_SEL_GPIO 256       /* FUNC_OUT_SEL_CFG: the GPIO_OUT register */
++
++#define ESP32S3_GPIO_PIN_IN   "pin-in"
++#define ESP32S3_GPIO_PIN_OUT  "pin-out"
++#define ESP32S3_GPIO_SIG_OUT  "sig-out"
++
++typedef struct ESP32S3GPIOState {
++    SysBusDevice parent_obj;
+ 
+-typedef struct ESP32S3GPIOClass {
+-    Esp32GpioClass parent;
+-} ESP32S3GPIOClass;
++    MemoryRegion iomem;
++    MemoryRegion iomux;
++    qemu_irq irq;                               /* ETS_GPIO_INTR_SOURCE */
++    qemu_irq pin_out[ESP32S3_GPIO_PINS];
++
++    uint32_t strap_mode;
++
++    uint64_t out;                               /* OUT (pins 0-31) and OUT1 (32-48) */
++    uint64_t enable;
++    uint64_t status;
++    uint64_t ext_driven;                        /* Pins driven from outside... */
++    uint64_t ext_level;                         /* ...and their levels */
++    uint64_t level;                             /* Each pin's current level */
++    uint8_t sig_out[ESP32S3_GPIO_SIGNALS];      /* Peripheral output signals */
++    uint32_t pin[ESP32S3_GPIO_PINS];            /* PINn: interrupt type and enable, driver */
++    uint32_t func_out_sel[ESP32S3_GPIO_PINS];
++    uint32_t func_in_sel[ESP32S3_GPIO_SIGNALS];
++    uint32_t iomux_regs[ESP32S3_GPIO_PINS];
++    uint32_t iomux_pin_ctrl;
++    uint32_t bt_select, sdio_select, clock_gate;
++} ESP32S3GPIOState;
+diff --git a/tests/qtest/esp32s3-gpio-test.c b/tests/qtest/esp32s3-gpio-test.c
+new file mode 100644
+index 0000000..c1152ae
+--- /dev/null
++++ b/tests/qtest/esp32s3-gpio-test.c
+@@ -0,0 +1,196 @@
++/*
++ * QTest for the ESP32-S3 GPIO, GPIO matrix and IO_MUX
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "libqtest.h"
++
++#define GPIO            0x60004000
++#define IO_MUX          0x60009000
++#define OUT             (GPIO + 0x04)
++#define OUT_W1TS        (GPIO + 0x08)
++#define OUT_W1TC        (GPIO + 0x0C)
++#define OUT1_W1TS       (GPIO + 0x14)
++#define ENABLE_W1TS     (GPIO + 0x24)
++#define ENABLE_W1TC     (GPIO + 0x28)
++#define ENABLE1_W1TS    (GPIO + 0x30)
++#define STRAP           (GPIO + 0x38)
++#define IN              (GPIO + 0x3C)
++#define IN1             (GPIO + 0x40)
++#define STATUS          (GPIO + 0x44)
++#define STATUS_W1TC     (GPIO + 0x4C)
++#define STATUS1         (GPIO + 0x50)
++#define PCPU_INT        (GPIO + 0x5C)
++#define PCPU_INT1       (GPIO + 0x68)
++#define PIN(n)          (GPIO + 0x74 + 4 * (n))
++#define OUT_SEL(n)      (GPIO + 0x554 + 4 * (n))
++#define DATE            (GPIO + 0x6FC)
++#define IOMUX(n)        (IO_MUX + 0x04 + 4 * (n))
++
++#define PAD_DRIVER      BIT(2)
++#define INT_TYPE(t)     ((t) << 7)
++#define INT_ENA_CPU     BIT(13)
++#define FUN_PD          BIT(7)
++#define FUN_PU          BIT(8)
++#define FUN_IE          BIT(9)
++
++#define INTMATRIX_CORE0_STATUS  0x600C218C
++#define GPIO_SOURCE             16
++
++static void drive(QTestState *qts, int pin, int level)
++{
++    qtest_set_irq_in(qts, "/machine/soc/gpio", "pin-in", pin, level);
++}
++
++static void sig_out(QTestState *qts, int sig, int level)
++{
++    qtest_set_irq_in(qts, "/machine/soc/gpio", "sig-out", sig, level);
++}
++
++static bool gpio_irq(QTestState *qts)
++{
++    return qtest_readl(qts, INTMATRIX_CORE0_STATUS) & BIT(GPIO_SOURCE);
++}
++
++static void test_reset(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++
++    g_assert_cmphex(qtest_readl(qts, STRAP), ==, 0x4);
++    g_assert_cmphex(qtest_readl(qts, DATE), ==, 0x1907040);
++    g_assert_cmphex(qtest_readl(qts, OUT_SEL(5)), ==, 0x100);
++    g_assert_cmphex(qtest_readl(qts, IOMUX(5)), ==, FUN_IE | (2 << 10));
++    g_assert_cmphex(qtest_readl(qts, IN), ==, 0);
++    g_assert_false(gpio_irq(qts));
++    qtest_quit(qts);
++}
++
++static void test_output_loopback(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++
++    /* An output that isn't enabled doesn't reach the pad */
++    qtest_writel(qts, OUT_W1TS, BIT(4));
++    g_assert_cmphex(qtest_readl(qts, OUT), ==, BIT(4));
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(4), ==, 0);
++
++    /* Enabled: the input reads the pad back */
++    qtest_writel(qts, ENABLE_W1TS, BIT(4));
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(4), ==, BIT(4));
++    qtest_writel(qts, OUT_W1TC, BIT(4));
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(4), ==, 0);
++
++    /* Pins 32-48 */
++    qtest_writel(qts, ENABLE1_W1TS, BIT(48 - 32));
++    qtest_writel(qts, OUT1_W1TS, BIT(48 - 32));
++    g_assert_cmphex(qtest_readl(qts, IN1), ==, BIT(48 - 32));
++
++    /* The input disabled in the IO_MUX reads 0 */
++    qtest_writel(qts, IOMUX(48), 0);
++    g_assert_cmphex(qtest_readl(qts, IN1), ==, 0);
++    qtest_quit(qts);
++}
++
++static void test_external_and_pulls(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++
++    drive(qts, 15, 1);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(15), ==, BIT(15));
++    drive(qts, 15, 0);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(15), ==, 0);
++
++    /* Released: the pull-up decides (a button to ground with INPUT_PULLUP) */
++    drive(qts, 15, -1);
++    qtest_writel(qts, IOMUX(15), FUN_IE | FUN_PU);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(15), ==, BIT(15));
++    qtest_writel(qts, IOMUX(15), FUN_IE | FUN_PD);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(15), ==, 0);
++
++    /* Open drain: the chip can only pull low; an external low wins over a released high */
++    qtest_writel(qts, IOMUX(9), FUN_IE | FUN_PU);
++    qtest_writel(qts, PIN(9), PAD_DRIVER);
++    qtest_writel(qts, ENABLE_W1TS, BIT(9));
++    qtest_writel(qts, OUT_W1TS, BIT(9));
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(9), ==, BIT(9));
++    drive(qts, 9, 0);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(9), ==, 0);
++    drive(qts, 9, -1);
++    qtest_writel(qts, OUT_W1TC, BIT(9));
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(9), ==, 0);
++    qtest_quit(qts);
++}
++
++static void test_matrix(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++
++    /* Peripheral signal 101 to pin 11, inverted; output enable from the peripheral */
++    qtest_writel(qts, OUT_SEL(11), 101 | BIT(9));
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(11), ==, BIT(11));
++    sig_out(qts, 101, 1);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(11), ==, 0);
++
++    /* Output enable from GPIO_ENABLE instead (OEN_SEL) */
++    qtest_writel(qts, OUT_SEL(11), 101 | BIT(10));
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(11), ==, 0);    /* Not enabled, floating */
++    qtest_writel(qts, ENABLE_W1TS, BIT(11));
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(11), ==, BIT(11));
++    qtest_quit(qts);
++}
++
++static void test_interrupts(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++
++    /* Falling edge on pin 17 (a touch controller's PENIRQ) */
++    drive(qts, 17, 1);
++    qtest_writel(qts, PIN(17), INT_TYPE(2) | INT_ENA_CPU);
++    g_assert_cmphex(qtest_readl(qts, STATUS), ==, 0);
++    drive(qts, 17, 0);
++    g_assert_cmphex(qtest_readl(qts, STATUS), ==, BIT(17));
++    g_assert_cmphex(qtest_readl(qts, PCPU_INT), ==, BIT(17));
++    g_assert_true(gpio_irq(qts));
++    qtest_writel(qts, STATUS_W1TC, BIT(17));
++    g_assert_cmphex(qtest_readl(qts, STATUS), ==, 0);
++    g_assert_false(gpio_irq(qts));
++    drive(qts, 17, 1);                  /* Rising edge: not this type */
++    g_assert_cmphex(qtest_readl(qts, STATUS), ==, 0);
++
++    /* Low level on pin 36 (an expander's INT): stays pending while low */
++    drive(qts, 36, 0);
++    qtest_writel(qts, PIN(36), INT_TYPE(4) | INT_ENA_CPU);
++    g_assert_cmphex(qtest_readl(qts, STATUS1), ==, BIT(36 - 32));
++    g_assert_cmphex(qtest_readl(qts, PCPU_INT1), ==, BIT(36 - 32));
++    g_assert_true(gpio_irq(qts));
++    qtest_writel(qts, GPIO + 0x58, BIT(36 - 32));
++    g_assert_cmphex(qtest_readl(qts, STATUS1), ==, BIT(36 - 32));
++    drive(qts, 36, 1);
++    qtest_writel(qts, GPIO + 0x58, BIT(36 - 32));
++    g_assert_cmphex(qtest_readl(qts, STATUS1), ==, 0);
++    g_assert_false(gpio_irq(qts));
++
++    /* Status without an enable doesn't interrupt */
++    qtest_writel(qts, PIN(5), INT_TYPE(3));
++    drive(qts, 5, 1);
++    g_assert_cmphex(qtest_readl(qts, STATUS), ==, BIT(5));
++    g_assert_cmphex(qtest_readl(qts, PCPU_INT), ==, 0);
++    g_assert_false(gpio_irq(qts));
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/gpio/reset", test_reset);
++    qtest_add_func("/esp32s3/gpio/output_loopback", test_output_loopback);
++    qtest_add_func("/esp32s3/gpio/external_and_pulls", test_external_and_pulls);
++    qtest_add_func("/esp32s3/gpio/matrix", test_matrix);
++    qtest_add_func("/esp32s3/gpio/interrupts", test_interrupts);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index c1bea7e..1f2304b 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+

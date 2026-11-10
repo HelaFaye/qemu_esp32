@@ -1,0 +1,30 @@
+name: Espressif QEMU patches
+
+on:
+  push:
+    paths: ["patches/espressif-qemu/**", ".github/workflows/espressif-qemu.yml"]
+  pull_request:
+    paths: ["patches/espressif-qemu/**", ".github/workflows/espressif-qemu.yml"]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libglib2.0-dev libpixman-1-dev libgcrypt20-dev \
+            libslirp-dev python3-venv flex bison
+      - name: Build
+        run: patches/espressif-qemu/build.sh "$RUNNER_TEMP/esp-qemu"
+      - name: QTests
+        working-directory: ${{ runner.temp }}/esp-qemu/build
+        run: |
+          tests="esp-periph-test esp-spi-test esp32s3-intmatrix-test esp32s3-gpio-test esp32s3-gpspi-test"
+          ninja $(for t in $tests; do echo tests/qtest/$t; done)
+          for t in $tests; do
+            echo "== $t"
+            QTEST_QEMU_BINARY=./qemu-system-xtensa ./tests/qtest/$t --tap -k
+          done
