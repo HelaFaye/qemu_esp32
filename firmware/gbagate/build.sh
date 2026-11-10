@@ -24,7 +24,8 @@ for board in carrier-touch devkit; do
     (cd "$SRC" && BOARD=$board tools/build_hw.sh gate)
     dir="$SRC/build/hw-gate-$board"
     mkdir -p "$OUT/$board"
-    (cd "$dir" && python3 -m esptool --chip esp32s3 merge-bin --pad-to-size 4MB \
+    # merge_bin and --fill-flash-size: esptool 4 (ESP-IDF 5.5) knows only these, and 5 still takes them
+    (cd "$dir" && python3 -m esptool --chip esp32s3 merge_bin --fill-flash-size 4MB \
         -o "$OUT/$board/flash.bin" @flash_args)
     cp "$dir/gbagate.elf" "$OUT/$board/"
 done
