@@ -17,7 +17,8 @@ matters exact:
   supervision timeout (a link that gets nothing through disconnects both ends) and outage
   windows.
 
-Not tied to one project: BlueCubeMod uses it, and it is meant for others (gbagate).
+Not tied to one project: firmware whose Bluetooth controller QEMU lacks runs its own host
+stack against it (BlueCubeMod was the first; meshcore-bare-esp32s3, gbagate and others next).
 
 ## Pieces
 

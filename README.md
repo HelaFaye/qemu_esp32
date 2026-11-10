@@ -1,6 +1,88 @@
-# qemu_esp32
+# qemu_esp32 (HelaFaye's fork)
 
-ESP32 emulation in QEMU (2026) with Bluetooth, WiFi and TTGO T-Display support.
+Emulated ESP32 boards accurate enough to test real firmware on: the chip's peripherals
+modeled from Espressif's register definitions and drivers, the parts boards wire to them
+(displays, touch, SD cards, LoRa radios, buttons, I/O expanders, keyboards), and the radio
+links between boards (Bluetooth, LoRa). Each model has QTest coverage against the way
+ESP-IDF and Arduino drive it, and real firmware is built and booted in CI.
+
+This fork adds four things to Ebiroll's tools and examples (kept below):
+
+| Where | What |
+|---|---|
+| [`patches/espressif-qemu/`](patches/espressif-qemu) | A patch series for [Espressif's QEMU](https://github.com/espressif/qemu) (pinned in `BASE`; `build.sh` fetches, applies, builds): ESP32-S3 GPIO, GP-SPI2/3, I2C, USB Serial/JTAG; SPI displays, touch, SD; I2C OLEDs, touch, keyboards, expanders; buttons and encoders; SX126x LoRa |
+| [`radio/`](radio) | `airhub.py`: the air between LoRa radios in different QEMUs, with per-link RSSI, SNR, loss and corruption |
+| [`bluetooth/`](bluetooth) | Virtual Bluetooth: the firmware's own host stack over HCI to a virtual controller (Bumble) on a modeled radio link |
+| [`firmware/`](firmware) | Real firmware on emulated boards: `boards.py` (boards as QEMU command lines), per-project builds at pinned commits and scenarios checked by serial output |
+
+## Quick start
+
+```sh
+patches/espressif-qemu/build.sh ~/esp-qemu        # Espressif's QEMU + these patches
+~/esp-qemu/build/qemu-system-xtensa -machine esp32s3 -nographic \
+  -drive file=flash.bin,if=mtd,format=raw \
+  -device ili9341,bus=spi2,id=lcd \
+  -device esp32s3.pin-link,pin=10,dev=lcd,line=ssi-gpio-cs,pull=up \
+  -device esp32s3.pin-link,pin=9,dev=lcd,line=dc
+```
+
+A flash image is the whole chip (4, 8 or 16 MB; `esptool merge-bin --pad-to-size`).
+Serial ports in order: `-serial` UART0, UART1, UART2, then (S3) the USB Serial/JTAG, which
+is plugged in when given. `-device help` lists the models; their properties and wiring are
+in [`patches/espressif-qemu/README.md`](patches/espressif-qemu/README.md).
+
+## What's emulated
+
+| ESP32-S3 | |
+|---|---|
+| GPIO, GPIO matrix, IO_MUX | Pin levels from outputs, peripheral signals, external drives and pulls; edge and level interrupts |
+| GP-SPI2, GP-SPI3 | Master transactions, W buffer and GDMA, chip selects through the matrix or IO_MUX, timing |
+| I2C0, I2C1 | Command lists, FIFOs, ACK checks, interrupts, SCL timing |
+| USB Serial/JTAG | The CDC serial side, SOF frames while plugged in |
+| (Espressif's) | CPUs, flash, PSRAM, UART, GDMA, crypto, timers, SDMMC, TWAI, RGB framebuffer |
+
+| Board devices | |
+|---|---|
+| Displays (SPI) | `ili9341` `ili9488` `st7735` `st7789` `st7796` `gc9a01`, each a screen `screendump` captures |
+| Displays (I2C) | `ssd1306` `sh1106` |
+| Touch | `xpt2046` (SPI); `gt911` `cst816` `ft6336` (I2C) |
+| Storage | `ssi-sd` (SD over SPI, `drive=`), `at24c-eeprom` |
+| Input | `gpio-button` (buttons, rotary encoders), `tdeck-keyboard`, `mcp23017` |
+| Radio | `sx1262` `sx1261` `sx1268` (LoRa over `radio/airhub.py`) |
+| Wiring | `esp32s3.pin-link` (any device line to any pin, open drain, board pulls) |
+
+Not yet: the S3's LCD_CAM (8080 parallel displays), ADC, LEDC/PWM, RMT, Wi-Fi and the S3's
+Bluetooth controller (firmware runs its host stack over HCI instead, see `bluetooth/`), SX127x
+radios, and the classic ESP32's peripherals beyond Espressif's (Marauder's boards).
+
+## Firmware tested in CI
+
+| Firmware | Board | Checked |
+|---|---|---|
+| [meshcore-bare-esp32s3](https://github.com/mytechnotalent/meshcore-bare-esp32s3) | ESP32-S3 + SX1262 | Two nodes on one air: radios up, adverts sent, heard, stored as contacts |
+
+Planned: LilyGO T-Deck and T-Display-S3, MeshCore, Bruce, ESP32 Marauder, gbagate's boards,
+SlimeVR. See `firmware/README.md`.
+
+## Tests
+
+```sh
+cd ~/esp-qemu/build
+for t in esp32s3-gpio-test esp32s3-gpspi-test esp32s3-spi-devices-test esp32s3-i2c-test \
+         esp32s3-i2c-devices-test esp32s3-sx1262-test esp32s3-usb-serial-jtag-test; do
+  ninja tests/qtest/$t && QTEST_QEMU_BINARY=./qemu-system-xtensa ./tests/qtest/$t
+done
+```
+
+CI: `.github/workflows/espressif-qemu.yml` (the patches and their tests),
+`.github/workflows/firmware.yml` (real firmware).
+
+---
+
+# Ebiroll's qemu_esp32 (original documentation)
+
+
+ESP32 emulation in QEMU (2026), [Ebiroll/calib](https://github.com/Ebiroll/calib), with Bluetooth, WiFi and TTGO T-Display support.
 
 ## Overview
 

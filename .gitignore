@@ -40,4 +40,5 @@ sdkconfig
 # Debug files
 *.dSYM/
 *.su
-/build
+/build__pycache__/
+*.pyc
