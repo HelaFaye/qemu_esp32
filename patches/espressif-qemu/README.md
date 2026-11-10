@@ -11,6 +11,7 @@ in `BASE`; `build.sh [dir]` fetches it, applies them and builds `qemu-system-xte
 | 0002 | GP-SPI2/3 masters (W buffer and GDMA, all phases, chip selects, timing at the configured clock); `esp32s3.pin-link` to wire boards from the command line |
 | 0003 | SPI displays `ili9341` `ili9488` `st7735` `st7789` `st7796` `gc9a01` (MIPI DCS; each a screen `screendump` can capture), `xpt2046` touch, `ssi-sd` SD cards with `drive=` |
 | 0004 | I2C0/I2C1 masters (`i2c0`, `i2c1` buses): command lists, FIFOs, ACK checks, interrupts, SCL timing |
+| 0006 | `sx1262` `sx1261` `sx1268` LoRa radios: the SX126x command set, BUSY/DIO1/NRESET, time on air; packets between QEMUs over a chardev (`radio/airhub.py` for meshes) |
 | 0005 | I2C board devices: `ssd1306`/`sh1106` OLEDs (screens), `gt911` `cst816` `ft6336` touch, `tdeck-keyboard`, `mcp23017`; `gpio-button` (buttons and rotary encoders on pins or expander lines) |
 
 ## Wiring a board
@@ -64,7 +65,24 @@ I2C devices go on `i2c0`/`i2c1` with their address; inputs are driven with `qom-
 # qom-set /machine/peripheral/knob turn 3          (an encoder: 3 detents)
 ```
 
+LoRa: radios in different QEMUs hear each other through the air hub:
+
+```
+python3 radio/airhub.py --port 7400 [--links links.json] &
+qemu-system-xtensa -machine esp32s3 ... \
+  -chardev socket,id=air,host=127.0.0.1,port=7400 \
+  -device sx1262,bus=spi2,cs=1,id=lora,chardev=air \
+  -device esp32s3.pin-link,pin=7,dev=lora,line=ssi-gpio-cs,pull=up \
+  -device esp32s3.pin-link,pin=8,dev=lora,line=reset,pull=up \
+  -device esp32s3.pin-link,pin=15,dev=lora,line=busy,dir=out \
+  -device esp32s3.pin-link,pin=16,dev=lora,line=dio1,dir=out
+```
+
+(meshcore-bare-esp32s3's wiring.) Two QEMUs can also share a socket chardev directly
+(one `server=on`). `links.json` sets each pair's RSSI, SNR, loss and corruption; see
+`radio/airhub.py`.
+
 ## Tests
 
-`tests/qtest/esp32s3-gpio-test.c`, `esp32s3-gpspi-test.c`, `esp32s3-spi-devices-test.c`, `esp32s3-i2c-test.c` and `esp32s3-i2c-devices-test.c`; CI runs them with
+`tests/qtest/esp32s3-gpio-test.c`, `esp32s3-gpspi-test.c`, `esp32s3-spi-devices-test.c`, `esp32s3-i2c-test.c`, `esp32s3-i2c-devices-test.c` and `esp32s3-sx1262-test.c` (two QEMUs on one air); `radio/test_airhub.py` for the hub; CI runs them with
 Espressif's own ESP qtests (`.github/workflows/espressif-qemu.yml`).

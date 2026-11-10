@@ -1,0 +1,1088 @@
+From 309bbce5030e9ed8c0427c7a42d9b7e488f1538d Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Tue, 10 Nov 2026 10:43:26 +0000
+Subject: [PATCH 6/6] SX1262/SX1261/SX1268 LoRa radios with a shared air
+
+The SX126x command interface on SPI: run on NSS rising, the status
+byte shifted out during opcodes and status positions, BUSY while a
+command runs (calibration 3.5 ms, cold start, sleep until NSS falls),
+NRESET, DIO1 from the IRQ masks. Standby/sleep/FS/TX/RX (single,
+timed, continuous, duty cycle)/CAD, packet type, frequency,
+modulation and packet parameters, buffers and base addresses,
+registers (version string, sync word, random numbers), IRQ, RX buffer
+and packet status, instantaneous RSSI, errors and stats.
+
+TX_DONE comes after Semtech's LoRa time on air for the parameters.
+With chardev=, packets go to and come from other radios (another QEMU,
+or many through a hub that sets RSSI/SNR, loss and corruption): a
+radio listening on the same frequency, SF, BW, sync word and IQ gets
+the packet at its end (RX_DONE, HEADER_VALID, CRC_ERR if corrupted);
+overlapping packets collide unless one is 6 dB stronger; CAD and
+GetRssiInst see the channel busy.
+---
+ hw/misc/Kconfig                   |   4 +
+ hw/misc/meson.build               |   1 +
+ hw/misc/sx126x.c                  | 783 ++++++++++++++++++++++++++++++
+ hw/xtensa/Kconfig                 |   4 +-
+ tests/qtest/esp32s3-sx1262-test.c | 203 ++++++++
+ tests/qtest/meson.build           |   2 +-
+ 6 files changed, 994 insertions(+), 3 deletions(-)
+ create mode 100644 hw/misc/sx126x.c
+ create mode 100644 tests/qtest/esp32s3-sx1262-test.c
+
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index 84eb364..8f51582 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -220,3 +220,7 @@ source macio/Kconfig
+ config ESP_BOARD_PERIPHERALS
+     bool
+     depends on I2C
++
++config SX126X
++    bool
++    depends on SSI
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index dc9ff35..fd4ff58 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -349,3 +349,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ 
+ # HPPA devices
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
++system_ss.add(when: 'CONFIG_SX126X', if_true: files('sx126x.c'))
+diff --git a/hw/misc/sx126x.c b/hw/misc/sx126x.c
+new file mode 100644
+index 0000000..b579d76
+--- /dev/null
++++ b/hw/misc/sx126x.c
+@@ -0,0 +1,783 @@
++/*
++ * Semtech SX1262 / SX1261 / SX1268 LoRa transceivers (SX126x command interface)
++ *
++ * SPI commands (an opcode and its parameters, run when NSS rises): standby, sleep, FS,
++ * TX, RX (single, timed, continuous; RX duty cycle as continuous), CAD, packet type,
++ * RF frequency, modulation (SF, BW, CR, LDRO) and packet (preamble, header, length, CRC,
++ * IQ) parameters, buffer base addresses and FIFO reads/writes, register reads/writes
++ * (sync word, version string, random number generator...), DIO IRQ masks, IRQ status,
++ * RX buffer and packet status (RSSI, SNR), instantaneous RSSI, device errors, PA, TCXO,
++ * regulator and calibration commands (accepted; calibration keeps BUSY high as long as
++ * on the chip). Every byte shifted out during a command's opcode and status bytes is the
++ * status (chip mode, command status).
++ *
++ * Lines: NSS ("ssi-gpio-cs"), "reset" (NRESET, active low), "busy" and "dio1" outputs
++ * (DIO2/DIO3 as RF switch and TCXO control need no lines).
++ *
++ * The air: a packet sent is as long on the air as LoRa takes for its parameters
++ * (Semtech's time-on-air formula); TX_DONE comes after it. With chardev=, packets go to
++ * and come from other radios: other QEMUs (two connected directly, or many through
++ * qemu_esp32's radio hub, which decides RSSI, SNR, loss and collisions). A packet is
++ * received when the radio listens on its frequency with the same SF, BW, sync word and
++ * IQ inversion, from its start to its end; RX_DONE (with HEADER_VALID, or CRC_ERR when
++ * the hub corrupted it) when it ends. CAD sees a packet on the air.
++ *
++ *   -chardev socket,id=air,host=127.0.0.1,port=7400 \
++ *   -device sx1262,bus=spi2,cs=1,id=lora,chardev=air
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include <math.h>
++#include "qemu/log.h"
++#include "qemu/timer.h"
++#include "qemu/guest-random.h"
++#include "qapi/error.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
++#include "hw/ssi/ssi.h"
++#include "chardev/char-fe.h"
++#include "qom/object.h"
++
++#define TYPE_SX126X "sx126x"
++OBJECT_DECLARE_SIMPLE_TYPE(SX126xState, SX126X)
++
++/* Opcodes */
++#define OP_SET_SLEEP            0x84
++#define OP_SET_STANDBY          0x80
++#define OP_SET_FS               0xC1
++#define OP_SET_TX               0x83
++#define OP_SET_RX               0x82
++#define OP_STOP_TIMER_ON_PRE    0x9F
++#define OP_SET_RX_DUTY_CYCLE    0x94
++#define OP_SET_CAD              0xC5
++#define OP_SET_TX_CW            0xD1
++#define OP_SET_TX_INF_PRE       0xD2
++#define OP_SET_REGULATOR        0x96
++#define OP_CALIBRATE            0x89
++#define OP_CALIBRATE_IMAGE      0x98
++#define OP_SET_PA_CONFIG        0x95
++#define OP_SET_FALLBACK         0x93
++#define OP_WRITE_REGISTER       0x0D
++#define OP_READ_REGISTER        0x1D
++#define OP_WRITE_BUFFER         0x0E
++#define OP_READ_BUFFER          0x1E
++#define OP_SET_DIO_IRQ          0x08
++#define OP_GET_IRQ_STATUS       0x12
++#define OP_CLR_IRQ_STATUS       0x02
++#define OP_SET_DIO2_RF_SWITCH   0x9D
++#define OP_SET_DIO3_TCXO        0x97
++#define OP_SET_RF_FREQUENCY     0x86
++#define OP_SET_PACKET_TYPE      0x8A
++#define OP_GET_PACKET_TYPE      0x11
++#define OP_SET_TX_PARAMS        0x8E
++#define OP_SET_MODULATION       0x8B
++#define OP_SET_PACKET_PARAMS    0x8C
++#define OP_SET_CAD_PARAMS       0x88
++#define OP_SET_BUFFER_BASE      0x8F
++#define OP_SET_SYMB_TIMEOUT     0xA0
++#define OP_GET_STATUS           0xC0
++#define OP_GET_RSSI_INST        0x15
++#define OP_GET_RX_BUFFER_STATUS 0x13
++#define OP_GET_PACKET_STATUS    0x14
++#define OP_GET_DEVICE_ERRORS    0x17
++#define OP_CLR_DEVICE_ERRORS    0x07
++#define OP_GET_STATS            0x10
++#define OP_RESET_STATS          0x00
++
++/* IRQs */
++#define IRQ_TX_DONE         BIT(0)
++#define IRQ_RX_DONE         BIT(1)
++#define IRQ_PREAMBLE        BIT(2)
++#define IRQ_SYNCWORD        BIT(3)
++#define IRQ_HEADER_VALID    BIT(4)
++#define IRQ_HEADER_ERR      BIT(5)
++#define IRQ_CRC_ERR         BIT(6)
++#define IRQ_CAD_DONE        BIT(7)
++#define IRQ_CAD_DETECTED    BIT(8)
++#define IRQ_TIMEOUT         BIT(9)
++
++/* Status: chip modes and command statuses */
++enum { MODE_SLEEP = 0, MODE_STBY_RC = 2, MODE_STBY_XOSC = 3, MODE_FS = 4, MODE_RX = 5, MODE_TX = 6 };
++enum { CMD_OK = 0, CMD_DATA = 2, CMD_TIMEOUT = 3, CMD_ERROR = 4, CMD_FAIL = 5, CMD_TX_DONE = 6 };
++
++#define REG_BASE        0x0000
++#define REG_SIZE        0x1000
++#define REG_VERSION     0x0320
++#define REG_RANDOM      0x0819
++#define REG_SYNC_LORA   0x0740
++
++/* The air: frames on the chardev */
++#define AIR_MAGIC       0x41524F4C      /* "LORA" */
++#define AIR_TX          1               /* A radio started a packet */
++#define AIR_RX          2               /* The hub: this packet, as you hear it */
++
++typedef struct QEMU_PACKED AirHeader {
++    uint32_t magic;
++    uint16_t len;                       /* Of what follows this header */
++    uint8_t type;
++    uint8_t sf;
++    uint32_t freq_hz;
++    uint32_t bw_hz;
++    uint8_t cr;                         /* 1-4: 4/5-4/8 */
++    uint8_t flags;                      /* Bit 0 IQ inverted, 1 CRC, 2 implicit header, 3 FSK */
++    uint16_t sync;
++    int8_t power_dbm;
++    int8_t rssi_dbm;                    /* AIR_RX */
++    int8_t snr_q;                       /* AIR_RX: SNR x 4 */
++    uint8_t corrupt;                    /* AIR_RX: CRC fails */
++    uint32_t airtime_us;
++    uint16_t preamble;
++    uint16_t payload_len;
++} AirHeader;
++
++#define AIR_FLAG_IQ     BIT(0)
++#define AIR_FLAG_CRC    BIT(1)
++#define AIR_FLAG_IMPL   BIT(2)
++#define AIR_FLAG_FSK    BIT(3)
++
++struct SX126xState {
++    SSIPeripheral parent_obj;
++
++    CharBackend chr;
++    qemu_irq busy, dio1;
++    QEMUTimer *busy_timer, *op_timer, *rx_timer;
++
++    /* The SPI command being shifted in */
++    uint8_t cmd[300];
++    uint32_t ncmd;
++    uint8_t out[300];                   /* What to shift out at each position */
++    bool sleeping_cs;
++
++    /* State */
++    uint8_t mode, cmd_status;
++    bool reset_low, is_busy;
++    uint8_t packet_type;
++    uint32_t freq_hz;
++    int8_t power;
++    uint8_t sf, bw_code, cr, ldro;
++    uint16_t preamble;
++    uint8_t header_impl, payload_len, crc_on, iq_inv;
++    uint8_t tx_base, rx_base;
++    uint16_t irq, irq_mask, dio1_mask;
++    uint8_t buf[256];
++    uint8_t regs[REG_SIZE];
++    uint8_t rx_len, rx_start;
++    int8_t pkt_rssi, pkt_snr_q;
++    uint16_t errors;
++    uint16_t stats_rx, stats_crc, stats_hdr;
++    bool rx_continuous;
++
++    /* The air as this radio hears it */
++    int64_t air_busy_until;
++    bool receiving;                     /* A packet is coming in */
++    AirHeader rx_hdr;
++    uint8_t rx_payload[256];
++    int64_t rx_end;
++    uint8_t chr_buf[sizeof(AirHeader) + 256];
++    uint32_t chr_len;
++};
++
++static const uint32_t bw_hz_table[16] = {
++    [0x00] = 7810, [0x08] = 10420, [0x01] = 15630, [0x09] = 20830, [0x02] = 31250,
++    [0x0A] = 41670, [0x03] = 62500, [0x04] = 125000, [0x05] = 250000, [0x06] = 500000,
++};
++
++static uint32_t bw_hz(SX126xState *s)
++{
++    uint32_t bw = bw_hz_table[s->bw_code & 0xF];
++    return bw ? bw : 125000;
++}
++
++static uint8_t status_byte(SX126xState *s)
++{
++    return (s->mode & 7) << 4 | (s->cmd_status & 7) << 1;
++}
++
++static void update_dio1(SX126xState *s)
++{
++    qemu_set_irq(s->dio1, (s->irq & s->dio1_mask) != 0);
++}
++
++static void raise_irq(SX126xState *s, uint16_t bits)
++{
++    s->irq |= bits & s->irq_mask;
++    update_dio1(s);
++}
++
++static void set_busy(SX126xState *s, bool b)
++{
++    s->is_busy = b;
++    qemu_set_irq(s->busy, b);
++}
++
++static void busy_for(SX126xState *s, int64_t ns)
++{
++    set_busy(s, true);
++    timer_mod(s->busy_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
++}
++
++static void busy_done(void *opaque)
++{
++    SX126xState *s = SX126X(opaque);
++    if (s->mode != MODE_SLEEP) {
++        set_busy(s, false);
++    }
++}
++
++/* Semtech's LoRa time on air, in microseconds */
++static uint64_t lora_airtime_us(uint8_t sf, uint32_t bw, uint8_t cr, uint16_t preamble,
++                                bool implicit, bool crc, bool ldro, uint32_t len)
++{
++    double tsym = (double)(1u << sf) / bw;          /* Seconds */
++    double tpre = (preamble + 4.25 + (sf < 7 ? 2 : 0)) * tsym;
++    int de = ldro ? 1 : 0;
++    double num = 8.0 * len - 4.0 * sf + 28 + 16 * (crc ? 1 : 0) - 20 * (implicit ? 1 : 0);
++    double den = 4.0 * (sf - 2 * de);
++    double n = ceil(num / den);
++    double payload_syms = 8 + MAX(n * (cr + 4), 0.0);
++    return (uint64_t)((tpre + payload_syms * tsym) * 1e6);
++}
++
++static uint64_t current_airtime_us(SX126xState *s, uint32_t len)
++{
++    if (s->packet_type != 1) {
++        /* GFSK: roughly 4 bytes of preamble+sync at 50 kbps plus the payload */
++        return (len + 8) * 8 * 1000000ull / 50000;
++    }
++    return lora_airtime_us(s->sf, bw_hz(s), s->cr, s->preamble, s->header_impl, s->crc_on,
++                           s->ldro, len);
++}
++
++static uint16_t lora_sync(SX126xState *s)
++{
++    return s->regs[REG_SYNC_LORA] << 8 | s->regs[REG_SYNC_LORA + 1];
++}
++
++static void to_standby(SX126xState *s)
++{
++    timer_del(s->op_timer);
++    timer_del(s->rx_timer);
++    s->mode = MODE_STBY_RC;
++    s->receiving = false;
++}
++
++/* TX done, RX timeout, CAD done */
++static void op_done(void *opaque)
++{
++    SX126xState *s = SX126X(opaque);
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    switch (s->mode) {
++    case MODE_TX:
++        s->mode = MODE_STBY_RC;
++        s->cmd_status = CMD_TX_DONE;
++        raise_irq(s, IRQ_TX_DONE);
++        break;
++    case MODE_RX:
++        if (!s->receiving) {
++            s->mode = MODE_STBY_RC;
++            s->cmd_status = CMD_TIMEOUT;
++            raise_irq(s, IRQ_TIMEOUT);
++        }
++        break;
++    case MODE_FS:       /* CAD runs in FS-like mode here */
++        s->mode = MODE_STBY_RC;
++        raise_irq(s, IRQ_CAD_DONE | (s->air_busy_until > now ? IRQ_CAD_DETECTED : 0));
++        break;
++    default:
++        break;
++    }
++}
++
++/* A packet's end: received, if this radio listened all along */
++static void rx_end(void *opaque)
++{
++    SX126xState *s = SX126X(opaque);
++    if (!s->receiving || s->mode != MODE_RX) {
++        s->receiving = false;
++        return;
++    }
++    s->receiving = false;
++    uint32_t len = s->rx_hdr.payload_len;
++    for (uint32_t i = 0; i < len; i++) {
++        s->buf[(uint8_t)(s->rx_base + i)] = s->rx_payload[i];
++    }
++    s->rx_len = len;
++    s->rx_start = s->rx_base;
++    s->pkt_rssi = s->rx_hdr.rssi_dbm;
++    s->pkt_snr_q = s->rx_hdr.snr_q;
++    s->stats_rx++;
++    uint16_t bits = IRQ_RX_DONE | IRQ_PREAMBLE | IRQ_HEADER_VALID | IRQ_SYNCWORD;
++    if (s->rx_hdr.corrupt && (s->rx_hdr.flags & AIR_FLAG_CRC)) {
++        bits |= IRQ_CRC_ERR;
++        s->stats_crc++;
++    }
++    if (!s->rx_continuous) {
++        s->mode = MODE_STBY_RC;
++        timer_del(s->op_timer);
++    }
++    s->cmd_status = CMD_DATA;
++    raise_irq(s, bits);
++}
++
++static void air_send(SX126xState *s, uint32_t len, uint64_t airtime_us)
++{
++    if (!qemu_chr_fe_backend_connected(&s->chr)) {
++        return;
++    }
++    AirHeader h = {
++        .magic = cpu_to_le32(AIR_MAGIC),
++        .len = cpu_to_le16(sizeof(AirHeader) - 6 + len),
++        .type = AIR_TX,
++        .sf = s->sf,
++        .freq_hz = cpu_to_le32(s->freq_hz),
++        .bw_hz = cpu_to_le32(bw_hz(s)),
++        .cr = s->cr,
++        .flags = (s->iq_inv ? AIR_FLAG_IQ : 0) | (s->crc_on ? AIR_FLAG_CRC : 0) |
++                 (s->header_impl ? AIR_FLAG_IMPL : 0) | (s->packet_type != 1 ? AIR_FLAG_FSK : 0),
++        .sync = cpu_to_le16(lora_sync(s)),
++        .power_dbm = s->power,
++        .airtime_us = cpu_to_le32(airtime_us),
++        .preamble = cpu_to_le16(s->preamble),
++        .payload_len = cpu_to_le16(len),
++    };
++    uint8_t frame[sizeof(h) + 256];
++    memcpy(frame, &h, sizeof(h));
++    for (uint32_t i = 0; i < len; i++) {
++        frame[sizeof(h) + i] = s->buf[(uint8_t)(s->tx_base + i)];
++    }
++    qemu_chr_fe_write_all(&s->chr, frame, sizeof(h) + len);
++}
++
++static bool hears(SX126xState *s, const AirHeader *h)
++{
++    int32_t df = (int32_t)(le32_to_cpu(h->freq_hz) - s->freq_hz);
++    if (abs(df) > (int32_t)bw_hz(s) / 4) {
++        return false;
++    }
++    if (!!(h->flags & AIR_FLAG_FSK) != (s->packet_type != 1)) {
++        return false;
++    }
++    if (s->packet_type == 1) {
++        return h->sf == s->sf && le32_to_cpu(h->bw_hz) == bw_hz(s) &&
++               le16_to_cpu(h->sync) == lora_sync(s) && !!(h->flags & AIR_FLAG_IQ) == !!s->iq_inv;
++    }
++    return true;
++}
++
++/* A packet starts on the air near this radio */
++static void air_packet(SX126xState *s, AirHeader *h, const uint8_t *payload)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    int64_t end = now + (int64_t)le32_to_cpu(h->airtime_us) * 1000;
++    if (h->type == AIR_TX) {               /* Straight from another radio: a good link */
++        h->rssi_dbm = -60;
++        h->snr_q = 40;
++        h->corrupt = 0;
++    }
++    s->air_busy_until = MAX(s->air_busy_until, end);
++
++    if (s->mode != MODE_RX || !hears(s, h)) {
++        return;
++    }
++    if (s->receiving) {
++        /* Two at once: the stronger by 6 dB survives, else the first is lost too */
++        if (h->rssi_dbm >= s->rx_hdr.rssi_dbm + 6) {
++            /* Capture by the new one */
++        } else {
++            if (h->rssi_dbm + 6 > s->rx_hdr.rssi_dbm) {
++                s->rx_hdr.corrupt = 1;
++            }
++            return;
++        }
++    }
++    s->receiving = true;
++    s->rx_hdr = *h;
++    s->rx_hdr.payload_len = le16_to_cpu(h->payload_len);
++    memcpy(s->rx_payload, payload, MIN(s->rx_hdr.payload_len, sizeof(s->rx_payload)));
++    s->rx_end = end;
++    timer_del(s->op_timer);             /* A preamble stops the RX timeout */
++    timer_mod(s->rx_timer, end);
++}
++
++static int air_can_receive(void *opaque)
++{
++    SX126xState *s = SX126X(opaque);
++    return sizeof(s->chr_buf) - s->chr_len;
++}
++
++static void air_receive(void *opaque, const uint8_t *buf, int size)
++{
++    SX126xState *s = SX126X(opaque);
++    memcpy(s->chr_buf + s->chr_len, buf, size);
++    s->chr_len += size;
++
++    while (s->chr_len >= 6) {
++        AirHeader *h = (AirHeader *)s->chr_buf;
++        if (le32_to_cpu(h->magic) != AIR_MAGIC) {
++            /* Lost sync: drop a byte */
++            memmove(s->chr_buf, s->chr_buf + 1, --s->chr_len);
++            continue;
++        }
++        uint32_t total = 6 + le16_to_cpu(h->len);
++        if (total > sizeof(s->chr_buf) || total < sizeof(AirHeader)) {
++            s->chr_len = 0;
++            return;
++        }
++        if (s->chr_len < total) {
++            return;
++        }
++        air_packet(s, h, s->chr_buf + sizeof(AirHeader));
++        memmove(s->chr_buf, s->chr_buf + total, s->chr_len - total);
++        s->chr_len -= total;
++    }
++}
++
++static void execute(SX126xState *s)
++{
++    uint8_t *c = s->cmd;
++    uint32_t n = s->ncmd;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    uint64_t busy_ns = 2 * SCALE_US;
++
++    if (!n) {
++        return;
++    }
++    s->cmd_status = CMD_OK;
++    switch (c[0]) {
++    case OP_SET_SLEEP:
++        to_standby(s);
++        s->mode = MODE_SLEEP;
++        set_busy(s, true);              /* Until NSS falls to wake it */
++        return;
++    case OP_SET_STANDBY:
++        to_standby(s);
++        s->mode = (n > 1 && c[1]) ? MODE_STBY_XOSC : MODE_STBY_RC;
++        break;
++    case OP_SET_FS:
++        to_standby(s);
++        s->mode = MODE_FS;
++        break;
++    case OP_SET_TX: {
++        to_standby(s);
++        uint64_t t = current_airtime_us(s, s->payload_len);
++        s->mode = MODE_TX;
++        air_send(s, s->payload_len, t);
++        /* This radio's own packet is on the air: it doesn't hear others meanwhile */
++        timer_mod(s->op_timer, now + t * 1000 + 300 * SCALE_US);    /* + PA ramp, PLL lock */
++        break;
++    }
++    case OP_SET_RX:
++    case OP_SET_RX_DUTY_CYCLE: {
++        to_standby(s);
++        s->mode = MODE_RX;
++        uint32_t timeout = 0xFFFFFF;
++        if (c[0] == OP_SET_RX && n >= 4) {
++            timeout = c[1] << 16 | c[2] << 8 | c[3];
++        }
++        s->rx_continuous = timeout == 0xFFFFFF || c[0] == OP_SET_RX_DUTY_CYCLE;
++        if (timeout && timeout != 0xFFFFFF) {
++            timer_mod(s->op_timer, now + (int64_t)timeout * 15625);     /* 15.625 us steps */
++        }
++        break;
++    }
++    case OP_SET_CAD: {
++        to_standby(s);
++        s->mode = MODE_FS;
++        /* About 2 symbols to decide */
++        uint64_t tsym_ns = (uint64_t)(1u << s->sf) * NANOSECONDS_PER_SECOND / bw_hz(s);
++        timer_mod(s->op_timer, now + 2 * tsym_ns);
++        break;
++    }
++    case OP_SET_TX_CW:
++    case OP_SET_TX_INF_PRE:
++        to_standby(s);
++        s->mode = MODE_TX;
++        break;
++    case OP_CALIBRATE:
++        busy_ns = 3500 * SCALE_US;
++        break;
++    case OP_CALIBRATE_IMAGE:
++        busy_ns = 1000 * SCALE_US;
++        break;
++    case OP_WRITE_REGISTER:
++        if (n >= 3) {
++            uint16_t a = c[1] << 8 | c[2];
++            for (uint32_t i = 3; i < n; i++, a++) {
++                if (a < REG_SIZE) {
++                    s->regs[a] = c[i];
++                }
++            }
++        }
++        break;
++    case OP_WRITE_BUFFER:
++        if (n >= 2) {
++            for (uint32_t i = 2; i < n; i++) {
++                s->buf[(uint8_t)(c[1] + i - 2)] = c[i];
++            }
++        }
++        break;
++    case OP_SET_DIO_IRQ:
++        if (n >= 5) {
++            s->irq_mask = c[1] << 8 | c[2];
++            s->dio1_mask = c[3] << 8 | c[4];
++            update_dio1(s);
++        }
++        break;
++    case OP_CLR_IRQ_STATUS:
++        if (n >= 3) {
++            s->irq &= ~(c[1] << 8 | c[2]);
++            update_dio1(s);
++        }
++        break;
++    case OP_SET_RF_FREQUENCY:
++        if (n >= 5) {
++            uint32_t f = (uint32_t)c[1] << 24 | c[2] << 16 | c[3] << 8 | c[4];
++            s->freq_hz = (uint64_t)f * 32000000 / (1 << 25);
++        }
++        break;
++    case OP_SET_PACKET_TYPE:
++        if (n >= 2) {
++            s->packet_type = c[1];
++        }
++        break;
++    case OP_SET_TX_PARAMS:
++        if (n >= 2) {
++            s->power = (int8_t)c[1];
++        }
++        break;
++    case OP_SET_MODULATION:
++        if (n >= 5 && s->packet_type == 1) {
++            s->sf = c[1];
++            s->bw_code = c[2];
++            s->cr = c[3];
++            s->ldro = c[4];
++        }
++        break;
++    case OP_SET_PACKET_PARAMS:
++        if (n >= 7 && s->packet_type == 1) {
++            s->preamble = c[1] << 8 | c[2];
++            s->header_impl = c[3];
++            s->payload_len = c[4];
++            s->crc_on = c[5];
++            s->iq_inv = c[6];
++        }
++        break;
++    case OP_SET_BUFFER_BASE:
++        if (n >= 3) {
++            s->tx_base = c[1];
++            s->rx_base = c[2];
++        }
++        break;
++    case OP_CLR_DEVICE_ERRORS:
++        s->errors = 0;
++        break;
++    case OP_RESET_STATS:
++        s->stats_rx = s->stats_crc = s->stats_hdr = 0;
++        break;
++    default:
++        /* Reads were answered while shifting; the rest have nothing to emulate */
++        break;
++    }
++    busy_for(s, busy_ns);
++}
++
++/* What the chip shifts out at byte i of a command, decided from its opcode */
++static uint8_t reply_byte(SX126xState *s, uint32_t i)
++{
++    uint8_t op = s->cmd[0];
++    uint8_t st = status_byte(s);
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (i == 0) {
++        return st;
++    }
++    switch (op) {
++    case OP_READ_REGISTER:
++        if (i < 4) {
++            return st;
++        } else {
++            uint16_t a = (s->cmd[1] << 8 | s->cmd[2]) + (i - 4);
++            if (a >= REG_RANDOM && a < REG_RANDOM + 4) {
++                uint8_t r;
++                qemu_guest_getrandom_nofail(&r, 1);
++                return r;
++            }
++            return a < REG_SIZE ? s->regs[a] : 0;
++        }
++    case OP_READ_BUFFER:
++        return i < 3 ? st : s->buf[(uint8_t)(s->cmd[1] + i - 3)];
++    case OP_GET_IRQ_STATUS: {
++        const uint8_t r[] = { s->irq >> 8, s->irq & 0xFF };
++        return i < 2 ? st : i - 2 < sizeof(r) ? r[i - 2] : 0;
++    }
++    case OP_GET_RX_BUFFER_STATUS: {
++        const uint8_t r[] = { s->rx_len, s->rx_start };
++        return i < 2 ? st : i - 2 < sizeof(r) ? r[i - 2] : 0;
++    }
++    case OP_GET_PACKET_STATUS: {
++        /* RssiPkt = -x/2 dBm, SnrPkt = x/4 dB (signed), SignalRssiPkt */
++        uint8_t rssi = (uint8_t)MIN(255, -2 * s->pkt_rssi);
++        const uint8_t r[] = { rssi, (uint8_t)s->pkt_snr_q, rssi };
++        return i < 2 ? st : i - 2 < sizeof(r) ? r[i - 2] : 0;
++    }
++    case OP_GET_RSSI_INST: {
++        int rssi = s->air_busy_until > now ? -60 : -118;
++        const uint8_t r[] = { (uint8_t)(-2 * rssi) };
++        return i < 2 ? st : i - 2 < sizeof(r) ? r[i - 2] : 0;
++    }
++    case OP_GET_DEVICE_ERRORS: {
++        const uint8_t r[] = { s->errors >> 8, s->errors & 0xFF };
++        return i < 2 ? st : i - 2 < sizeof(r) ? r[i - 2] : 0;
++    }
++    case OP_GET_PACKET_TYPE: {
++        const uint8_t r[] = { s->packet_type };
++        return i < 2 ? st : i - 2 < sizeof(r) ? r[i - 2] : 0;
++    }
++    case OP_GET_STATS: {
++        const uint8_t r[] = { s->stats_rx >> 8, s->stats_rx, s->stats_crc >> 8, s->stats_crc,
++                              s->stats_hdr >> 8, s->stats_hdr };
++        return i < 2 ? st : i - 2 < sizeof(r) ? r[i - 2] : 0;
++    }
++    case OP_GET_STATUS:
++        return st;
++    default:
++        return st;
++    }
++}
++
++static uint32_t sx126x_transfer(SSIPeripheral *dev, uint32_t val)
++{
++    SX126xState *s = SX126X(dev);
++    if (s->reset_low) {
++        return 0;
++    }
++    if (s->ncmd < sizeof(s->cmd)) {
++        s->cmd[s->ncmd] = val;
++    }
++    uint8_t r = reply_byte(s, s->ncmd);
++    s->ncmd++;
++    return r;
++}
++
++static int sx126x_set_cs(SSIPeripheral *dev, bool level)
++{
++    SX126xState *s = SX126X(dev);
++    if (!level) {
++        /* NSS falls: a command starts; from sleep, the chip wakes */
++        s->ncmd = 0;
++        if (s->mode == MODE_SLEEP) {
++            s->mode = MODE_STBY_RC;
++            busy_for(s, 3500 * SCALE_US);
++        }
++    } else {
++        execute(s);
++        s->ncmd = 0;
++    }
++    return 0;
++}
++
++static void chip_reset(SX126xState *s)
++{
++    timer_del(s->op_timer);
++    timer_del(s->rx_timer);
++    s->mode = MODE_STBY_RC;
++    s->cmd_status = CMD_OK;
++    s->packet_type = 0;
++    s->freq_hz = 915000000;
++    s->power = 14;
++    s->sf = 7;
++    s->bw_code = 4;
++    s->cr = 1;
++    s->ldro = 0;
++    s->preamble = 8;
++    s->header_impl = 0;
++    s->payload_len = 0xFF;
++    s->crc_on = 1;
++    s->iq_inv = 0;
++    s->tx_base = s->rx_base = 0;
++    s->irq = s->irq_mask = s->dio1_mask = 0;
++    s->rx_len = s->rx_start = 0;
++    s->errors = 0;
++    s->receiving = false;
++    memset(s->regs, 0, sizeof(s->regs));
++    memcpy(&s->regs[REG_VERSION], "SX1261 V2D 2D02", 16);
++    s->regs[REG_SYNC_LORA] = 0x14;      /* Private network sync word 0x12 */
++    s->regs[REG_SYNC_LORA + 1] = 0x24;
++    s->regs[0x08E7] = 0x18;             /* OCP */
++    s->regs[0x08AC] = 0x94;             /* RX gain */
++    s->regs[0x0736] = 0x0D;             /* IQ polarity setup */
++    s->regs[0x0889] = 0x1E;             /* TX clamp */
++    update_dio1(s);
++    busy_for(s, 3500 * SCALE_US);       /* Cold start */
++}
++
++static void sx126x_set_reset(void *opaque, int n, int level)
++{
++    SX126xState *s = SX126X(opaque);
++    bool low = !level;
++    if (low && !s->reset_low) {
++        set_busy(s, true);
++    } else if (!low && s->reset_low) {
++        s->reset_low = false;
++        chip_reset(s);
++        return;
++    }
++    s->reset_low = low;
++}
++
++static void sx126x_realize(SSIPeripheral *d, Error **errp)
++{
++    SX126xState *s = SX126X(d);
++    qdev_init_gpio_out_named(DEVICE(d), &s->busy, "busy", 1);
++    qdev_init_gpio_out_named(DEVICE(d), &s->dio1, "dio1", 1);
++    qdev_init_gpio_in_named(DEVICE(d), sx126x_set_reset, "reset", 1);
++    s->busy_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, busy_done, s);
++    s->op_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, op_done, s);
++    s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rx_end, s);
++    qemu_chr_fe_set_handlers(&s->chr, air_can_receive, air_receive, NULL, NULL, s, NULL, true);
++}
++
++static void sx126x_reset(DeviceState *dev)
++{
++    chip_reset(SX126X(dev));
++}
++
++static Property sx126x_properties[] = {
++    DEFINE_PROP_CHR("chardev", SX126xState, chr),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void sx126x_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
++
++    k->realize = sx126x_realize;
++    k->transfer = sx126x_transfer;
++    k->set_cs = sx126x_set_cs;
++    k->cs_polarity = SSI_CS_LOW;
++    device_class_set_legacy_reset(dc, sx126x_reset);
++    device_class_set_props(dc, sx126x_properties);
++    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
++}
++
++static const TypeInfo sx126x_types[] = {
++    {
++        .name = TYPE_SX126X,
++        .parent = TYPE_SSI_PERIPHERAL,
++        .instance_size = sizeof(SX126xState),
++        .class_init = sx126x_class_init,
++        .abstract = true,
++    },
++    { .name = "sx1262", .parent = TYPE_SX126X },
++    { .name = "sx1261", .parent = TYPE_SX126X },
++    { .name = "sx1268", .parent = TYPE_SX126X },
++};
++
++DEFINE_TYPES(sx126x_types)
+diff --git a/hw/xtensa/Kconfig b/hw/xtensa/Kconfig
+index ac9fb0a..af9d51c 100644
+--- a/hw/xtensa/Kconfig
++++ b/hw/xtensa/Kconfig
+@@ -37,8 +37,7 @@ config XTENSA_ESP32
+     select SSI_SD
+     select AT24C
+     select ESP_BOARD_PERIPHERALS
+-    select AT24C
+-    select ESP_BOARD_PERIPHERALS
++    select SX126X
+ 
+ config XTENSA_ESP32S3
+     bool
+@@ -56,5 +55,6 @@ config XTENSA_ESP32S3
+     select SSI_SD
+     select AT24C
+     select ESP_BOARD_PERIPHERALS
++    select SX126X
+ 
+ 
+diff --git a/tests/qtest/esp32s3-sx1262-test.c b/tests/qtest/esp32s3-sx1262-test.c
+new file mode 100644
+index 0000000..ea96230
+--- /dev/null
++++ b/tests/qtest/esp32s3-sx1262-test.c
+@@ -0,0 +1,203 @@
++/*
++ * QTest for the SX1262 LoRa radio on the ESP32-S3's GP-SPI2, wired as
++ * meshcore-bare-esp32s3 wires it (NSS GPIO7, BUSY GPIO15, DIO1 GPIO16, NRESET GPIO8),
++ * with two QEMUs sharing the air over a socket: one sends, the other receives, after
++ * LoRa's time on air.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "libqtest.h"
++
++#define SPI2            0x60024000
++#define SPI_CMD         (SPI2 + 0x00)
++#define SPI_CLOCK       (SPI2 + 0x0C)
++#define SPI_USER        (SPI2 + 0x10)
++#define SPI_MS_DLEN     (SPI2 + 0x1C)
++#define SPI_MISC        (SPI2 + 0x20)
++#define SPI_INT_CLR     (SPI2 + 0x38)
++#define SPI_W0          (SPI2 + 0x98)
++#define SPI_CLK_GATE    (SPI2 + 0xE8)
++
++#define GPIO            0x60004000
++#define OUT_W1TS        (GPIO + 0x08)
++#define OUT_W1TC        (GPIO + 0x0C)
++#define ENABLE_W1TS     (GPIO + 0x24)
++#define IN              (GPIO + 0x3C)
++
++#define PIN_NSS         7
++#define PIN_RESET       8
++#define PIN_BUSY        15
++#define PIN_DIO1        16
++
++#define WIRING \
++    "-device sx1262,bus=spi2,id=lora,chardev=air " \
++    "-device esp32s3.pin-link,pin=7,dev=lora,line=ssi-gpio-cs,pull=up " \
++    "-device esp32s3.pin-link,pin=8,dev=lora,line=reset,pull=up " \
++    "-device esp32s3.pin-link,pin=15,dev=lora,line=busy,dir=out " \
++    "-device esp32s3.pin-link,pin=16,dev=lora,line=dio1,dir=out "
++
++static QTestState *node(const char *sock, bool server)
++{
++    g_autofree char *args = g_strdup_printf("-machine esp32s3 -chardev socket,id=air,path=%s%s " WIRING,
++                                            sock, server ? ",server=on,wait=off" : "");
++    QTestState *qts = qtest_init(args);
++    qtest_writel(qts, SPI_CLK_GATE, 0x7);
++    qtest_writel(qts, SPI_CLOCK, (7 << 12) | (3 << 6) | 7);   /* 10 MHz */
++    qtest_writel(qts, SPI_MISC, 0x3F);
++    qtest_writel(qts, SPI_USER, BIT(0) | BIT(27) | BIT(28));
++    qtest_writel(qts, OUT_W1TS, BIT(PIN_NSS) | BIT(PIN_RESET));
++    qtest_writel(qts, ENABLE_W1TS, BIT(PIN_NSS) | BIT(PIN_RESET));
++    return qts;
++}
++
++static bool pin(QTestState *qts, int n)
++{
++    return qtest_readl(qts, IN) & BIT(n);
++}
++
++static void wait_not_busy(QTestState *qts)
++{
++    for (int i = 0; i < 100 && pin(qts, PIN_BUSY); i++) {
++        qtest_clock_step(qts, 100 * 1000);
++    }
++    g_assert_false(pin(qts, PIN_BUSY));
++}
++
++/* One command: NSS low, the bytes, NSS high (when the chip runs it) */
++static void cmd(QTestState *qts, const uint8_t *tx, uint8_t *rx, size_t n)
++{
++    wait_not_busy(qts);
++    qtest_writel(qts, OUT_W1TC, BIT(PIN_NSS));
++    uint32_t w[16] = { 0 };
++    g_assert(n <= 64);
++    memcpy(w, tx, n);
++    for (int i = 0; i < 16; i++) {
++        qtest_writel(qts, SPI_W0 + 4 * i, w[i]);
++    }
++    qtest_writel(qts, SPI_MS_DLEN, n * 8 - 1);
++    qtest_writel(qts, SPI_INT_CLR, BIT(12));
++    qtest_writel(qts, SPI_CMD, BIT(24));
++    qtest_clock_step(qts, 20000);
++    for (int i = 0; i < 16; i++) {
++        w[i] = qtest_readl(qts, SPI_W0 + 4 * i);
++    }
++    if (rx) {
++        memcpy(rx, w, n);
++    }
++    qtest_writel(qts, OUT_W1TS, BIT(PIN_NSS));
++}
++
++#define CMD(qts, ...) do { const uint8_t _c[] = { __VA_ARGS__ }; cmd(qts, _c, NULL, sizeof(_c)); } while (0)
++
++/* RadioLib's begin() for a MeshCore-like profile: LoRa, SF7, BW125, CR 4/5, sync 0x12 */
++static void setup(QTestState *qts, uint8_t sf)
++{
++    qtest_writel(qts, OUT_W1TC, BIT(PIN_RESET));
++    qtest_clock_step(qts, 1000 * 1000);
++    qtest_writel(qts, OUT_W1TS, BIT(PIN_RESET));
++    g_assert_true(pin(qts, PIN_BUSY));                  /* Cold start */
++    wait_not_busy(qts);
++
++    uint8_t tx[20] = { 0x1D, 0x03, 0x20, 0x00 }, rx[20];
++    cmd(qts, tx, rx, 20);
++    g_assert_cmpmem(rx + 4, 15, "SX1261 V2D 2D02", 15);
++
++    CMD(qts, 0x80, 0x00);                               /* Standby RC */
++    CMD(qts, 0x96, 0x01);                               /* DC-DC */
++    CMD(qts, 0x97, 0x01, 0x00, 0x01, 0x40);             /* DIO3 TCXO 1.8 V */
++    CMD(qts, 0x89, 0x7F);                               /* Calibrate all: 3.5 ms busy */
++    g_assert_true(pin(qts, PIN_BUSY));
++    CMD(qts, 0x9D, 0x01);                               /* DIO2 as RF switch */
++    CMD(qts, 0x8A, 0x01);                               /* LoRa */
++    /* 869.525 MHz: f * 2^25 / 32 MHz */
++    uint32_t frf = (uint32_t)(869525000ull * (1 << 25) / 32000000);
++    CMD(qts, 0x86, frf >> 24, frf >> 16, frf >> 8, frf);
++    CMD(qts, 0x8B, sf, 0x04, 0x01, 0x00);               /* SF, BW125, CR4/5, LDRO off */
++    CMD(qts, 0x0D, 0x07, 0x40, 0x14, 0x24);             /* Sync word 0x12 */
++    CMD(qts, 0x8C, 0x00, 0x08, 0x00, 10, 0x01, 0x00);   /* Preamble 8, explicit, 10 bytes, CRC */
++    CMD(qts, 0x8F, 0x00, 0x80);                         /* TX base 0, RX base 128 */
++    CMD(qts, 0x08, 0x03, 0xFF, 0x03, 0xFF, 0, 0, 0, 0); /* All IRQs on DIO1 */
++}
++
++static uint16_t irq_status(QTestState *qts)
++{
++    uint8_t tx[4] = { 0x12 }, rx[4];
++    cmd(qts, tx, rx, 4);
++    return rx[2] << 8 | rx[3];
++}
++
++static void test_link(void)
++{
++    g_autofree char *sock = g_strdup_printf("%s/qtest-air-%d.sock", g_get_tmp_dir(), getpid());
++    QTestState *a = node(sock, true);
++    QTestState *b = node(sock, false);
++    setup(a, 7);
++    setup(b, 7);
++
++    /* B listens, continuously */
++    CMD(b, 0x82, 0xFF, 0xFF, 0xFF);
++    g_assert_cmphex(irq_status(b), ==, 0);
++
++    /* A sends "hello mesh" */
++    CMD(a, 0x0E, 0x00, 'h', 'e', 'l', 'l', 'o', ' ', 'm', 'e', 's', 's');
++    CMD(a, 0x83, 0x00, 0x00, 0x00);
++    /* SF7/BW125, 8 symbols of preamble, 10 bytes, CRC, CR 4/5: 41.2 ms on the air */
++    qtest_clock_step(a, 40 * 1000 * 1000);
++    g_assert_false(pin(a, PIN_DIO1));
++    g_assert_cmphex(irq_status(a) & BIT(0), ==, 0);
++    qtest_clock_step(a, 2 * 1000 * 1000);
++    g_assert_true(pin(a, PIN_DIO1));
++    g_assert_cmphex(irq_status(a) & BIT(0), ==, BIT(0));      /* TX_DONE */
++
++    /* B: the packet arrives over the socket, ends after its airtime on B's clock */
++    for (int i = 0; i < 50 && !pin(b, PIN_DIO1); i++) {
++        g_usleep(10000);
++        qtest_clock_step(b, 5 * 1000 * 1000);
++    }
++    g_assert_true(pin(b, PIN_DIO1));
++    uint16_t irq = irq_status(b);
++    g_assert_cmphex(irq & (BIT(1) | BIT(4) | BIT(6)), ==, BIT(1) | BIT(4));  /* RX_DONE, HEADER_VALID */
++    uint8_t tx[16] = { 0x13 }, rx[16];
++    cmd(b, tx, rx, 4);
++    g_assert_cmpint(rx[2], ==, 10);                             /* Length */
++    g_assert_cmpint(rx[3], ==, 128);                            /* Where */
++    uint8_t rd[16] = { 0x1E, 128, 0x00 };
++    cmd(b, rd, rx, 13);
++    g_assert_cmpmem(rx + 3, 10, "hello mess", 10);
++    uint8_t ps[5] = { 0x14 };
++    cmd(b, ps, rx, 5);
++    g_assert_cmpint(-rx[2] / 2, ==, -60);                       /* RSSI */
++
++    /* Clear, then a mismatched receiver (SF8) hears nothing */
++    CMD(b, 0x02, 0x03, 0xFF);
++    g_assert_false(pin(b, PIN_DIO1));
++    CMD(b, 0x8B, 8, 0x04, 0x01, 0x00);
++    CMD(b, 0x82, 0xFF, 0xFF, 0xFF);
++    CMD(a, 0x83, 0x00, 0x00, 0x00);
++    for (int i = 0; i < 20; i++) {
++        g_usleep(5000);
++        qtest_clock_step(b, 5 * 1000 * 1000);
++    }
++    g_assert_false(pin(b, PIN_DIO1));
++
++    /* An RX timeout: 0x000280 * 15.625 us = 10 ms */
++    CMD(b, 0x82, 0x00, 0x02, 0x80);
++    qtest_clock_step(b, 11 * 1000 * 1000);
++    g_assert_cmphex(irq_status(b) & BIT(9), ==, BIT(9));
++
++    qtest_quit(b);
++    qtest_quit(a);
++    unlink(sock);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/sx1262/link", test_link);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index b6a0713..41f290a 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+
