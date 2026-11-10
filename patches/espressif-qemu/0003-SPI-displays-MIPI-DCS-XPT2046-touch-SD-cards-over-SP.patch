@@ -1,0 +1,1297 @@
+From b968893b7d1215f5fc0ee4eb113e0d2e2db95ace Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Tue, 10 Nov 2026 10:23:31 +0000
+Subject: [PATCH 3/3] SPI displays (MIPI DCS), XPT2046 touch, SD cards over SPI
+
+mipi-dbi-panel: ILI9341, ILI9488, ST7735, ST7789, ST7796 and GC9A01 on
+an SSI bus, with D/C, reset and backlight lines. Frame memory,
+CASET/RASET windows, MADCTL (MV/MX/MY/BGR), 12/16/18-bit pixels,
+sleep, display on/off, inversion, idle, and the read commands drivers
+probe with (RDDID, RDID1-4, RDDST, RDDPM, ...). Each panel is a graphic
+console showing what the glass would (module mounting, BGR and IPS
+inversion as properties), so screendump checks what firmware drew.
+
+xpt2046: the resistive touch controller (also ADS7843/7846), 8 and 12
+bit conversions, overlapped control bytes as drivers send them,
+PENIRQ; touches from the pointer or qom-set x/y/pressed.
+
+ssi-sd: user-creatable (pin-link wires its CS) with drive= to put a
+card in the slot. The ESP32 and ESP32-S3 machines select all three.
+---
+ hw/display/Kconfig                     |   4 +
+ hw/display/meson.build                 |   1 +
+ hw/display/mipi_dbi_panel.c            | 479 +++++++++++++++++++++++++
+ hw/input/Kconfig                       |   4 +
+ hw/input/meson.build                   |   1 +
+ hw/input/xpt2046.c                     | 238 ++++++++++++
+ hw/sd/ssi-sd.c                         |  24 +-
+ hw/xtensa/Kconfig                      |   6 +
+ include/hw/display/mipi_dbi_panel.h    |  69 ++++
+ tests/qtest/esp32s3-spi-devices-test.c | 308 ++++++++++++++++
+ tests/qtest/meson.build                |   2 +-
+ 11 files changed, 1133 insertions(+), 3 deletions(-)
+ create mode 100644 hw/display/mipi_dbi_panel.c
+ create mode 100644 hw/input/xpt2046.c
+ create mode 100644 include/hw/display/mipi_dbi_panel.h
+ create mode 100644 tests/qtest/esp32s3-spi-devices-test.c
+
+diff --git a/hw/display/Kconfig b/hw/display/Kconfig
+index 4078a29..8b619c4 100644
+--- a/hw/display/Kconfig
++++ b/hw/display/Kconfig
+@@ -143,3 +143,7 @@ config DM163
+ 
+ config ESP_RGB
+     bool
++
++config MIPI_DBI_PANEL
++    bool
++    depends on SSI
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index 36a9ace..8c2a1c6 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -144,3 +144,4 @@ endif
+ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
+ 
+ modules += { 'hw-display': hw_display_modules }
++system_ss.add(when: 'CONFIG_MIPI_DBI_PANEL', if_true: files('mipi_dbi_panel.c'))
+diff --git a/hw/display/mipi_dbi_panel.c b/hw/display/mipi_dbi_panel.c
+new file mode 100644
+index 0000000..b9b2c83
+--- /dev/null
++++ b/hw/display/mipi_dbi_panel.c
+@@ -0,0 +1,479 @@
++/*
++ * MIPI DBI display controllers (MIPI DCS): ILI9341, ILI9488, ST7735, ST7789, ST7796, GC9A01
++ *
++ * Writes: CASET/RASET set the window, RAMWR/RAMWRC fill it from the write pointer in
++ * the order MADCTL says (MV exchange, MX/MY mirror), in the COLMOD pixel format (12, 16
++ * or 18 bits). SLPIN/SLPOUT, DISPOFF/DISPON, INVOFF/INVON, IDMOFF/IDMON and SWRESET
++ * change what the glass shows. Reads: RDDID, RDDST, RDDPM, RDDMADCTL, RDDCOLMOD,
++ * RDID1-3 and ILI9341's RDID4 (0xD3), each after a dummy byte as on the SPI bus.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qapi/error.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "ui/console.h"
++#include "ui/pixel_ops.h"
++#include "hw/display/mipi_dbi_panel.h"
++
++#define DCS_NOP         0x00
++#define DCS_SWRESET     0x01
++#define DCS_RDDID       0x04
++#define DCS_RDDST       0x09
++#define DCS_RDDPM       0x0A
++#define DCS_RDDMADCTL   0x0B
++#define DCS_RDDCOLMOD   0x0C
++#define DCS_SLPIN       0x10
++#define DCS_SLPOUT      0x11
++#define DCS_INVOFF      0x20
++#define DCS_INVON       0x21
++#define DCS_DISPOFF     0x28
++#define DCS_DISPON      0x29
++#define DCS_CASET       0x2A
++#define DCS_RASET       0x2B
++#define DCS_RAMWR       0x2C
++#define DCS_MADCTL      0x36
++#define DCS_IDMOFF      0x38
++#define DCS_IDMON       0x39
++#define DCS_COLMOD      0x3A
++#define DCS_RAMWRC      0x3C
++#define DCS_RDID1       0xDA
++#define DCS_RDID2       0xDB
++#define DCS_RDID3       0xDC
++#define ILI_RDID4       0xD3
++
++#define MADCTL_MY       0x80
++#define MADCTL_MX       0x40
++#define MADCTL_MV       0x20
++#define MADCTL_BGR      0x08
++
++static const MipiDbiPanelModel models[] = {
++    /* name      ram_w ram_h  w    h   xo  yo  id                  mx    my     bgr   inv    666 */
++    { "ili9341", 240, 320, 240, 320, 0, 0, { 0x00, 0x93, 0x41 }, true,  false, true,  false, false },
++    { "ili9488", 320, 480, 320, 480, 0, 0, { 0x54, 0x80, 0x66 }, true,  false, true,  false, true },
++    { "st7735",  132, 162, 128, 160, 2, 1, { 0x7C, 0x89, 0xF0 }, false, false, false, false, false },
++    { "st7789",  240, 320, 240, 320, 0, 0, { 0x85, 0x85, 0x52 }, false, false, false, true,  false },
++    { "st7796",  320, 480, 320, 480, 0, 0, { 0x00, 0x77, 0x96 }, true,  false, true,  false, false },
++    { "gc9a01",  240, 240, 240, 240, 0, 0, { 0x00, 0x9A, 0x01 }, false, false, true,  true,  false },
++};
++
++static uint16_t win_cols(MipiDbiPanelState *s)
++{
++    return (s->madctl & MADCTL_MV) ? s->model->ram_h : s->model->ram_w;
++}
++
++static uint16_t win_rows(MipiDbiPanelState *s)
++{
++    return (s->madctl & MADCTL_MV) ? s->model->ram_w : s->model->ram_h;
++}
++
++static void put_pixel(MipiDbiPanelState *s, uint32_t rgb)
++{
++    uint16_t c = s->col, p = s->row;
++    if (s->madctl & MADCTL_MX) {
++        c = win_cols(s) - 1 - c;
++    }
++    if (s->madctl & MADCTL_MY) {
++        p = win_rows(s) - 1 - p;
++    }
++    uint16_t x = (s->madctl & MADCTL_MV) ? p : c;
++    uint16_t y = (s->madctl & MADCTL_MV) ? c : p;
++    if (x < s->model->ram_w && y < s->model->ram_h) {
++        s->ram[y * s->model->ram_w + x] = rgb;
++        s->dirty = true;
++    }
++    /* Next: along the column, then the next row of the window, wrapping to the start */
++    if (s->col >= s->xe || s->col >= win_cols(s) - 1) {
++        s->col = s->xs;
++        if (s->row >= s->ye || s->row >= win_rows(s) - 1) {
++            s->row = s->ys;
++        } else {
++            s->row++;
++        }
++    } else {
++        s->col++;
++    }
++}
++
++static int pixel_bytes(MipiDbiPanelState *s)
++{
++    switch (s->colmod & 0x7) {
++    case 3: return 3;       /* 12 bits: 3 bytes for 2 pixels */
++    case 5: return s->model->rgb666_only ? 3 : 2;
++    case 6: return 3;
++    default: return s->model->rgb666_only ? 3 : 2;
++    }
++}
++
++static void pixel_byte(MipiDbiPanelState *s, uint8_t b)
++{
++    s->pix[s->npix++] = b;
++    int need = pixel_bytes(s);
++    if (s->npix < need) {
++        return;
++    }
++    s->npix = 0;
++    if (need == 2) {
++        uint16_t v = (s->pix[0] << 8) | s->pix[1];
++        uint8_t r = (v >> 11) & 0x1F, g = (v >> 5) & 0x3F, bl = v & 0x1F;
++        put_pixel(s, ((r << 3 | r >> 2) << 16) | ((g << 2 | g >> 4) << 8) | (bl << 3 | bl >> 2));
++    } else if ((s->colmod & 0x7) == 3) {
++        /* RRRRGGGG BBBBRRRR GGGGBBBB */
++        uint8_t r0 = s->pix[0] >> 4, g0 = s->pix[0] & 0xF, b0 = s->pix[1] >> 4;
++        uint8_t r1 = s->pix[1] & 0xF, g1 = s->pix[2] >> 4, b1 = s->pix[2] & 0xF;
++        put_pixel(s, (r0 * 0x11) << 16 | (g0 * 0x11) << 8 | b0 * 0x11);
++        put_pixel(s, (r1 * 0x11) << 16 | (g1 * 0x11) << 8 | b1 * 0x11);
++    } else {
++        uint8_t r = s->pix[0] & 0xFC, g = s->pix[1] & 0xFC, bl = s->pix[2] & 0xFC;
++        put_pixel(s, (r | r >> 6) << 16 | (g | g >> 6) << 8 | (bl | bl >> 6));
++    }
++}
++
++static void controller_reset(MipiDbiPanelState *s)
++{
++    s->cmd = DCS_NOP;
++    s->nparam = 0;
++    s->sleeping = true;
++    s->display_on = false;
++    s->inversion = false;
++    s->idle = false;
++    s->madctl = 0;
++    s->colmod = 0x66;                   /* 18 bits per pixel after reset */
++    s->xs = 0;
++    s->ys = 0;
++    s->xe = s->model->ram_w - 1;
++    s->ye = s->model->ram_h - 1;
++    s->col = s->row = 0;
++    s->npix = 0;
++    s->rd_len = s->rd_pos = 0;
++    s->dirty = true;
++}
++
++static void reply(MipiDbiPanelState *s, const uint8_t *bytes, int n)
++{
++    s->rd[0] = 0;               /* The dummy clock(s) before the data */
++    memcpy(s->rd + 1, bytes, n);
++    s->rd_len = n + 1;
++    s->rd_pos = 0;
++}
++
++void mipi_dbi_panel_command(MipiDbiPanelState *s, uint8_t cmd)
++{
++    if (s->in_reset) {
++        return;
++    }
++    s->cmd = cmd;
++    s->nparam = 0;
++    s->npix = 0;
++    s->rd_len = 0;
++
++    switch (cmd) {
++    case DCS_SWRESET:
++        controller_reset(s);
++        break;
++    case DCS_SLPIN:     s->sleeping = true; s->dirty = true; break;
++    case DCS_SLPOUT:    s->sleeping = false; s->dirty = true; break;
++    case DCS_INVOFF:    s->inversion = false; s->dirty = true; break;
++    case DCS_INVON:     s->inversion = true; s->dirty = true; break;
++    case DCS_DISPOFF:   s->display_on = false; s->dirty = true; break;
++    case DCS_DISPON:    s->display_on = true; s->dirty = true; break;
++    case DCS_IDMOFF:    s->idle = false; s->dirty = true; break;
++    case DCS_IDMON:     s->idle = true; s->dirty = true; break;
++    case DCS_RAMWR:
++        s->col = s->xs;
++        s->row = s->ys;
++        break;
++    case DCS_RDDID:
++        reply(s, s->model->id, 3);
++        break;
++    case DCS_RDID1: case DCS_RDID2: case DCS_RDID3:
++        reply(s, &s->model->id[cmd - DCS_RDID1], 1);
++        break;
++    case ILI_RDID4: {
++        const uint8_t id4[3] = { 0x00, s->model->id[1], s->model->id[2] };
++        reply(s, id4, 3);
++        break;
++    }
++    case DCS_RDDST: {
++        const uint8_t st[4] = { (s->sleeping ? 0 : 0x08) | (s->madctl & 0xF0) >> 0,
++                                s->colmod & 0x77,
++                                (s->display_on ? 0x04 : 0) | (s->inversion ? 0x20 : 0), 0 };
++        reply(s, st, 4);
++        break;
++    }
++    case DCS_RDDPM: {
++        uint8_t pm = 0x08 | (s->sleeping ? 0 : 0x10) | (s->display_on ? 0x04 : 0) |
++                     (s->idle ? 0x40 : 0) | (s->display_on && !s->sleeping ? 0x80 : 0);
++        reply(s, &pm, 1);
++        break;
++    }
++    case DCS_RDDMADCTL:
++        reply(s, &s->madctl, 1);
++        break;
++    case DCS_RDDCOLMOD:
++        reply(s, &s->colmod, 1);
++        break;
++    default:
++        break;
++    }
++}
++
++void mipi_dbi_panel_data(MipiDbiPanelState *s, uint8_t b)
++{
++    if (s->in_reset) {
++        return;
++    }
++    switch (s->cmd) {
++    case DCS_RAMWR:
++    case DCS_RAMWRC:
++        pixel_byte(s, b);
++        return;
++    case DCS_CASET:
++    case DCS_RASET:
++        if (s->nparam < 4) {
++            s->param[s->nparam++] = b;
++        }
++        if (s->nparam == 4) {
++            uint16_t a = (s->param[0] << 8) | s->param[1];
++            uint16_t e = (s->param[2] << 8) | s->param[3];
++            if (s->cmd == DCS_CASET) {
++                s->xs = a;
++                s->xe = e;
++            } else {
++                s->ys = a;
++                s->ye = e;
++            }
++            s->nparam++;
++        }
++        return;
++    case DCS_MADCTL:
++        if (s->nparam++ == 0) {
++            s->madctl = b;
++            s->dirty = true;
++        }
++        return;
++    case DCS_COLMOD:
++        if (s->nparam++ == 0) {
++            s->colmod = b;
++        }
++        return;
++    default:
++        return;                 /* Other commands' parameters: gamma, power, timing */
++    }
++}
++
++uint8_t mipi_dbi_panel_read(MipiDbiPanelState *s)
++{
++    return s->rd_pos < s->rd_len ? s->rd[s->rd_pos++] : 0;
++}
++
++/* What the glass shows */
++static void panel_update(void *opaque)
++{
++    MipiDbiPanelState *s = MIPI_DBI_PANEL(opaque);
++    DisplaySurface *surface = qemu_console_surface(s->con);
++
++    if (!s->dirty || !surface) {
++        return;
++    }
++    s->dirty = false;
++
++    bool lit = s->display_on && !s->sleeping && !s->in_reset &&
++               (!s->backlight_wired || s->backlight != s->backlight_active_low);
++    bool swap_rb = !!(s->madctl & MADCTL_BGR) != s->bgr;
++    bool invert = s->inversion != s->inverted;
++    uint8_t *dst = surface_data(surface);
++    int stride = surface_stride(surface);
++
++    for (uint32_t y = 0; y < s->height; y++) {
++        uint32_t *line = (uint32_t *)(dst + y * stride);
++        for (uint32_t x = 0; x < s->width; x++) {
++            uint32_t mx = s->mirror_x ? s->width - 1 - x : x;
++            uint32_t my = s->mirror_y ? s->height - 1 - y : y;
++            uint32_t rx = mx + s->x_off, ry = my + s->y_off;
++            uint32_t v = 0;
++            if (lit && rx < s->model->ram_w && ry < s->model->ram_h) {
++                v = s->ram[ry * s->model->ram_w + rx];
++                if (swap_rb) {
++                    v = (v & 0x00FF00) | (v >> 16 & 0xFF) | (v & 0xFF) << 16;
++                }
++                if (invert) {
++                    v ^= 0xFFFFFF;
++                }
++                if (s->idle) {          /* 8 colors */
++                    v = (v & 0x800000 ? 0xFF0000 : 0) | (v & 0x8000 ? 0xFF00 : 0) | (v & 0x80 ? 0xFF : 0);
++                }
++            }
++            line[x] = v;
++        }
++    }
++    dpy_gfx_update(s->con, 0, 0, s->width, s->height);
++}
++
++static void panel_invalidate(void *opaque)
++{
++    MIPI_DBI_PANEL(opaque)->dirty = true;
++}
++
++static const GraphicHwOps panel_ops = {
++    .invalidate = panel_invalidate,
++    .gfx_update = panel_update,
++};
++
++/* SPI front end: bytes with D/C low are commands, high are data; reads shift out */
++static uint32_t panel_transfer(SSIPeripheral *dev, uint32_t val)
++{
++    MipiDbiPanelState *s = MIPI_DBI_PANEL(dev);
++    if (s->rd_len && s->rd_pos < s->rd_len && s->dc) {
++        return mipi_dbi_panel_read(s);
++    }
++    if (s->dc) {
++        mipi_dbi_panel_data(s, val);
++        return 0;
++    }
++    mipi_dbi_panel_command(s, val);
++    return 0;
++}
++
++static void panel_set_dc(void *opaque, int n, int level)
++{
++    MIPI_DBI_PANEL(opaque)->dc = level;
++}
++
++static void panel_set_reset(void *opaque, int n, int level)
++{
++    MipiDbiPanelState *s = MIPI_DBI_PANEL(opaque);
++    if (!level && !s->in_reset) {
++        controller_reset(s);
++    }
++    s->in_reset = !level;
++    s->dirty = true;
++}
++
++static void panel_set_backlight(void *opaque, int n, int level)
++{
++    MipiDbiPanelState *s = MIPI_DBI_PANEL(opaque);
++    s->backlight_wired = true;
++    s->backlight = level;
++    s->dirty = true;
++}
++
++static void panel_realize(SSIPeripheral *d, Error **errp)
++{
++    MipiDbiPanelState *s = MIPI_DBI_PANEL(d);
++    const char *type = object_get_typename(OBJECT(d));
++
++    for (size_t i = 0; i < ARRAY_SIZE(models); i++) {
++        if (!strcmp(models[i].name, type)) {
++            s->model = &models[i];
++        }
++    }
++    assert(s->model);
++    /* Unset properties (0, or left at the default) take the model's values */
++    if (!s->width) {
++        s->width = s->model->width;
++        s->x_off = s->x_off ? s->x_off : s->model->x_off;
++    }
++    if (!s->height) {
++        s->height = s->model->height;
++        s->y_off = s->y_off ? s->y_off : s->model->y_off;
++    }
++    if (s->width + s->x_off > s->model->ram_w || s->height + s->y_off > s->model->ram_h) {
++        /* The glass can be rotated in the frame memory (MV): allow its transpose */
++        if (s->width + s->x_off > s->model->ram_h || s->height + s->y_off > s->model->ram_w) {
++            error_setg(errp, "%ux%u at %u,%u is outside the %ux%u frame memory",
++                       s->width, s->height, s->x_off, s->y_off, s->model->ram_w, s->model->ram_h);
++            return;
++        }
++    }
++    s->ram = g_new0(uint32_t, (size_t)s->model->ram_w * s->model->ram_h);
++    qdev_init_gpio_in_named(DEVICE(d), panel_set_dc, "dc", 1);
++    qdev_init_gpio_in_named(DEVICE(d), panel_set_reset, "reset", 1);
++    qdev_init_gpio_in_named(DEVICE(d), panel_set_backlight, "backlight", 1);
++    s->con = graphic_console_init(DEVICE(d), 0, &panel_ops, s);
++    qemu_console_resize(s->con, s->width, s->height);
++    controller_reset(s);
++}
++
++static void panel_reset(DeviceState *dev)
++{
++    controller_reset(MIPI_DBI_PANEL(dev));
++}
++
++static Property panel_properties[] = {
++    DEFINE_PROP_UINT32("width", MipiDbiPanelState, width, 0),
++    DEFINE_PROP_UINT32("height", MipiDbiPanelState, height, 0),
++    DEFINE_PROP_UINT32("x-offset", MipiDbiPanelState, x_off, 0),
++    DEFINE_PROP_UINT32("y-offset", MipiDbiPanelState, y_off, 0),
++    DEFINE_PROP_BOOL("backlight-active-low", MipiDbiPanelState, backlight_active_low, false),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++/* Mounting properties default to the model's: set in instance_init, before -device's */
++static void panel_instance_init(Object *obj)
++{
++    MipiDbiPanelState *s = MIPI_DBI_PANEL(obj);
++    const char *type = object_get_typename(obj);
++    for (size_t i = 0; i < ARRAY_SIZE(models); i++) {
++        if (!strcmp(models[i].name, type)) {
++            s->mirror_x = models[i].mirror_x;
++            s->mirror_y = models[i].mirror_y;
++            s->bgr = models[i].bgr;
++            s->inverted = models[i].inverted;
++        }
++    }
++}
++
++static bool get_mx(Object *o, Error **e) { return MIPI_DBI_PANEL(o)->mirror_x; }
++static void set_mx(Object *o, bool v, Error **e) { MIPI_DBI_PANEL(o)->mirror_x = v; }
++static bool get_my(Object *o, Error **e) { return MIPI_DBI_PANEL(o)->mirror_y; }
++static void set_my(Object *o, bool v, Error **e) { MIPI_DBI_PANEL(o)->mirror_y = v; }
++static bool get_bgr(Object *o, Error **e) { return MIPI_DBI_PANEL(o)->bgr; }
++static void set_bgr(Object *o, bool v, Error **e) { MIPI_DBI_PANEL(o)->bgr = v; }
++static bool get_inv(Object *o, Error **e) { return MIPI_DBI_PANEL(o)->inverted; }
++static void set_inv(Object *o, bool v, Error **e) { MIPI_DBI_PANEL(o)->inverted = v; }
++
++static void panel_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
++
++    k->realize = panel_realize;
++    k->transfer = panel_transfer;
++    k->cs_polarity = SSI_CS_LOW;
++    device_class_set_legacy_reset(dc, panel_reset);
++    device_class_set_props(dc, panel_properties);
++    set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
++    object_class_property_add_bool(klass, "panel-mirror-x", get_mx, set_mx);
++    object_class_property_add_bool(klass, "panel-mirror-y", get_my, set_my);
++    object_class_property_add_bool(klass, "panel-bgr", get_bgr, set_bgr);
++    object_class_property_add_bool(klass, "panel-inverted", get_inv, set_inv);
++}
++
++static const TypeInfo panel_info = {
++    .name = TYPE_MIPI_DBI_PANEL,
++    .parent = TYPE_SSI_PERIPHERAL,
++    .instance_size = sizeof(MipiDbiPanelState),
++    .instance_init = panel_instance_init,
++    .class_init = panel_class_init,
++    .abstract = true,
++};
++
++static void panel_register_types(void)
++{
++    type_register_static(&panel_info);
++    for (size_t i = 0; i < ARRAY_SIZE(models); i++) {
++        TypeInfo ti = {
++            .name = models[i].name,
++            .parent = TYPE_MIPI_DBI_PANEL,
++        };
++        type_register_static(&ti);      /* Copies what it needs */
++    }
++}
++
++type_init(panel_register_types)
+diff --git a/hw/input/Kconfig b/hw/input/Kconfig
+index a116cb8..0a8c2bc 100644
+--- a/hw/input/Kconfig
++++ b/hw/input/Kconfig
+@@ -33,3 +33,7 @@ config VHOST_USER_INPUT
+ 
+ config LASIPS2
+     select PS2
++
++config XPT2046
++    bool
++    depends on SSI
+diff --git a/hw/input/meson.build b/hw/input/meson.build
+index 90a2149..1e7e0f2 100644
+--- a/hw/input/meson.build
++++ b/hw/input/meson.build
+@@ -10,3 +10,4 @@ system_ss.add(when: 'CONFIG_VIRTIO_INPUT', if_true: files('virtio-input-hid.c'))
+ system_ss.add(when: 'CONFIG_VIRTIO_INPUT_HOST', if_true: files('virtio-input-host.c'))
+ 
+ system_ss.add(when: 'CONFIG_LASIPS2', if_true: files('lasips2.c'))
++system_ss.add(when: 'CONFIG_XPT2046', if_true: files('xpt2046.c'))
+diff --git a/hw/input/xpt2046.c b/hw/input/xpt2046.c
+new file mode 100644
+index 0000000..8355577
+--- /dev/null
++++ b/hw/input/xpt2046.c
+@@ -0,0 +1,238 @@
++/*
++ * XPT2046 / ADS7843 / ADS7846 resistive touch screen controller (SPI)
++ *
++ * A control byte (start bit 7, channel A2-A0 in bits 6-4, MODE bit 3: 8-bit, PD1-PD0)
++ * starts a conversion; its result shifts out on the next 16 clocks: a busy bit, 12 bits
++ * (or 8), zeros. A control byte can come during the previous result, as drivers do to
++ * save clocks (16 clocks per conversion); its result follows that one.
++ *
++ * Touches come from the absolute pointer (a window's mouse) or, for tests, the QOM
++ * properties "x", "y" (raw 12-bit plate readings) and "pressed". PENIRQ ("penirq",
++ * unnamed GPIO out 0 also works) is low while pressed with PD = 00, else released (1):
++ * wire it with pin-link dir=out,open-drain=on,pull=up.
++ *
++ *   -device xpt2046,bus=spi2,id=touch
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/ssi/ssi.h"
++#include "ui/input.h"
++#include "qom/object.h"
++
++#define TYPE_XPT2046 "xpt2046"
++OBJECT_DECLARE_SIMPLE_TYPE(XPT2046State, XPT2046)
++
++#define CH_TEMP0    0
++#define CH_Y        1       /* "Y+" in the datasheet: the Y plate position */
++#define CH_VBAT     2
++#define CH_Z1       3
++#define CH_Z2       4
++#define CH_X        5
++#define CH_AUX      6
++#define CH_TEMP1    7
++
++struct XPT2046State {
++    SSIPeripheral parent_obj;
++
++    qemu_irq penirq;
++    QemuInputHandlerState *input;
++
++    /* The touch */
++    uint32_t x, y;              /* Raw plate readings, 0-4095 */
++    bool pressed;
++    uint32_t pressure;          /* 0-4095: how hard */
++
++    /* Calibration of the pointer onto the plates (a board's panel and its film) */
++    uint32_t x_min, x_max, y_min, y_max;
++    bool swap_xy;
++    uint32_t vbat_mv, aux_mv;
++
++    bool penirq_enabled;
++    uint8_t out[8];
++    uint8_t out_len, out_pos;
++};
++
++static void update_penirq(XPT2046State *s)
++{
++    qemu_set_irq(s->penirq, !(s->pressed && s->penirq_enabled));
++}
++
++static uint16_t convert(XPT2046State *s, int ch)
++{
++    switch (ch) {
++    case CH_X:      return s->pressed ? s->x : 0;
++    case CH_Y:      return s->pressed ? s->y : 0;
++    case CH_Z1:     return s->pressed ? MAX(1u, s->pressure * 3 / 4) : 0;
++    case CH_Z2:     return s->pressed ? 4095 - s->pressure / 4 : 4095;
++    case CH_VBAT:   return MIN(4095u, s->vbat_mv * 4096 / 4 / 2500);   /* Vbat / 4 against 2.5 V */
++    case CH_AUX:    return MIN(4095u, s->aux_mv * 4096 / 2500);
++    case CH_TEMP0:  return 0x2A0;       /* About 25 degrees C */
++    case CH_TEMP1:  return 0x340;
++    default:        return 0;
++    }
++}
++
++static void queue(XPT2046State *s, uint8_t b)
++{
++    if (s->out_pos > 0 && s->out_pos == s->out_len) {
++        s->out_len = s->out_pos = 0;
++    }
++    if (s->out_len < sizeof(s->out)) {
++        s->out[s->out_len++] = b;
++    }
++}
++
++static uint32_t xpt2046_transfer(SSIPeripheral *dev, uint32_t val)
++{
++    XPT2046State *s = XPT2046(dev);
++    uint8_t ret = s->out_pos < s->out_len ? s->out[s->out_pos++] : 0;
++
++    if (val & 0x80) {
++        int ch = (val >> 4) & 7;
++        bool eight_bit = val & 0x08;
++        uint16_t r = convert(s, ch);
++        /* Compact what's been read, then this result's bytes after anything pending */
++        memmove(s->out, s->out + s->out_pos, s->out_len - s->out_pos);
++        s->out_len -= s->out_pos;
++        s->out_pos = 0;
++        if (eight_bit) {
++            r >>= 4;
++            queue(s, r >> 1);
++            queue(s, (r & 1) << 7);
++        } else {
++            queue(s, r >> 5);
++            queue(s, (r << 3) & 0xF8);
++        }
++        s->penirq_enabled = (val & 0x03) == 0;
++        update_penirq(s);
++    }
++    return ret;
++}
++
++static void xpt2046_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
++{
++    XPT2046State *s = XPT2046(dev);
++    InputMoveEvent *move;
++    InputBtnEvent *btn;
++
++    switch (evt->type) {
++    case INPUT_EVENT_KIND_ABS:
++        move = evt->u.abs.data;
++        {
++            int64_t v = move->value;        /* 0 .. INPUT_EVENT_ABS_MAX */
++            bool is_x = (move->axis == INPUT_AXIS_X) != s->swap_xy;
++            uint32_t lo = is_x ? s->x_min : s->y_min, hi = is_x ? s->x_max : s->y_max;
++            uint32_t raw = lo + (int64_t)((int64_t)hi - lo) * v / INPUT_EVENT_ABS_MAX;
++            if (is_x) {
++                s->x = raw;
++            } else {
++                s->y = raw;
++            }
++        }
++        break;
++    case INPUT_EVENT_KIND_BTN:
++        btn = evt->u.btn.data;
++        if (btn->button == INPUT_BUTTON_LEFT) {
++            s->pressed = btn->down;
++            update_penirq(s);
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static const QemuInputHandler xpt2046_handler = {
++    .name = "xpt2046 touch screen",
++    .mask = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
++    .event = xpt2046_input_event,
++};
++
++static bool get_pressed(Object *obj, Error **errp)
++{
++    return XPT2046(obj)->pressed;
++}
++
++static void set_pressed(Object *obj, bool value, Error **errp)
++{
++    XPT2046State *s = XPT2046(obj);
++    s->pressed = value;
++    update_penirq(s);
++}
++
++/* Settable while running (qom-set), unlike qdev properties */
++static void xpt2046_instance_init(Object *obj)
++{
++    XPT2046State *s = XPT2046(obj);
++    s->x = s->y = 2048;
++    s->pressure = 2400;
++    object_property_add_uint32_ptr(obj, "x", &s->x, OBJ_PROP_FLAG_READWRITE);
++    object_property_add_uint32_ptr(obj, "y", &s->y, OBJ_PROP_FLAG_READWRITE);
++    object_property_add_uint32_ptr(obj, "pressure", &s->pressure, OBJ_PROP_FLAG_READWRITE);
++}
++
++static void xpt2046_realize(SSIPeripheral *d, Error **errp)
++{
++    XPT2046State *s = XPT2046(d);
++
++    qdev_init_gpio_out(DEVICE(d), &s->penirq, 1);
++    qdev_init_gpio_out_named(DEVICE(d), &s->penirq, "penirq", 1);
++    s->input = qemu_input_handler_register(DEVICE(d), &xpt2046_handler);
++    s->penirq_enabled = true;
++}
++
++static void xpt2046_reset(DeviceState *dev)
++{
++    XPT2046State *s = XPT2046(dev);
++    s->out_len = s->out_pos = 0;
++    s->penirq_enabled = true;           /* PD = 00 at power up */
++    update_penirq(s);
++}
++
++static Property xpt2046_properties[] = {
++    DEFINE_PROP_UINT32("x-min", XPT2046State, x_min, 200),
++    DEFINE_PROP_UINT32("x-max", XPT2046State, x_max, 3900),
++    DEFINE_PROP_UINT32("y-min", XPT2046State, y_min, 200),
++    DEFINE_PROP_UINT32("y-max", XPT2046State, y_max, 3900),
++    DEFINE_PROP_BOOL("swap-xy", XPT2046State, swap_xy, false),
++    DEFINE_PROP_UINT32("vbat-mv", XPT2046State, vbat_mv, 3700),
++    DEFINE_PROP_UINT32("aux-mv", XPT2046State, aux_mv, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void xpt2046_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
++
++    k->realize = xpt2046_realize;
++    k->transfer = xpt2046_transfer;
++    k->cs_polarity = SSI_CS_LOW;
++    device_class_set_legacy_reset(dc, xpt2046_reset);
++    device_class_set_props(dc, xpt2046_properties);
++    object_class_property_add_bool(klass, "pressed", get_pressed, set_pressed);
++    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static const TypeInfo xpt2046_info = {
++    .name = TYPE_XPT2046,
++    .parent = TYPE_SSI_PERIPHERAL,
++    .instance_size = sizeof(XPT2046State),
++    .instance_init = xpt2046_instance_init,
++    .class_init = xpt2046_class_init,
++};
++
++static void xpt2046_register_types(void)
++{
++    type_register_static(&xpt2046_info);
++}
++
++type_init(xpt2046_register_types)
+diff --git a/hw/sd/ssi-sd.c b/hw/sd/ssi-sd.c
+index 1594051..20b0caa 100644
+--- a/hw/sd/ssi-sd.c
++++ b/hw/sd/ssi-sd.c
+@@ -17,9 +17,11 @@
+ 
+ #include "qemu/osdep.h"
+ #include "sysemu/blockdev.h"
++#include "sysemu/block-backend.h"
+ #include "hw/ssi/ssi.h"
+ #include "migration/vmstate.h"
+ #include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
+ #include "hw/sd/sd.h"
+ #include "qapi/error.h"
+ #include "qemu/crc-ccitt.h"
+@@ -65,6 +67,7 @@ struct ssi_sd_state {
+     int32_t response_pos;
+     int32_t stopping;
+     SDBus sdbus;
++    BlockBackend *blk;          /* drive=: the card in the slot */
+ };
+ 
+ #define TYPE_SSI_SD "ssi-sd"
+@@ -371,8 +374,25 @@ static void ssi_sd_realize(SSIPeripheral *d, Error **errp)
+     ssi_sd_state *s = SSI_SD(d);
+ 
+     qbus_init(&s->sdbus, sizeof(s->sdbus), TYPE_SD_BUS, DEVICE(d), "sd-bus");
++
++    /* A card on this slot's own bus, so a board needs no bus path to put it there */
++    if (s->blk) {
++        DeviceState *card = qdev_new(TYPE_SD_CARD_SPI);
++        BlockBackend *blk = s->blk;
++        s->blk = NULL;
++        blk_detach_dev(blk, DEVICE(d));
++        if (!qdev_prop_set_drive_err(card, "drive", blk, errp) ||
++            !qdev_realize_and_unref(card, BUS(&s->sdbus), errp)) {
++            return;
++        }
++    }
+ }
+ 
++static Property ssi_sd_properties[] = {
++    DEFINE_PROP_DRIVE("drive", ssi_sd_state, blk),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
+ static void ssi_sd_reset(DeviceState *dev)
+ {
+     ssi_sd_state *s = SSI_SD(dev);
+@@ -399,8 +419,8 @@ static void ssi_sd_class_init(ObjectClass *klass, void *data)
+     k->cs_polarity = SSI_CS_LOW;
+     dc->vmsd = &vmstate_ssi_sd;
+     device_class_set_legacy_reset(dc, ssi_sd_reset);
+-    /* Reason: GPIO chip-select line should be wired up */
+-    dc->user_creatable = false;
++    /* Its chip-select line must be wired up: a board does it (esp32s3.pin-link) */
++    device_class_set_props(dc, ssi_sd_properties);
+ }
+ 
+ static const TypeInfo ssi_sd_types[] = {
+diff --git a/hw/xtensa/Kconfig b/hw/xtensa/Kconfig
+index 5866207..b95c644 100644
+--- a/hw/xtensa/Kconfig
++++ b/hw/xtensa/Kconfig
+@@ -32,6 +32,9 @@ config XTENSA_ESP32
+     select TMP105
+     select LED
+     select ESP_RGB
++    select MIPI_DBI_PANEL
++    select XPT2046
++    select SSI_SD
+ 
+ config XTENSA_ESP32S3
+     bool
+@@ -44,5 +47,8 @@ config XTENSA_ESP32S3
+     select DWC_SDMMC
+     select TMP105
+     select ESP_RGB
++    select MIPI_DBI_PANEL
++    select XPT2046
++    select SSI_SD
+ 
+ 
+diff --git a/include/hw/display/mipi_dbi_panel.h b/include/hw/display/mipi_dbi_panel.h
+new file mode 100644
+index 0000000..c014910
+--- /dev/null
++++ b/include/hw/display/mipi_dbi_panel.h
+@@ -0,0 +1,69 @@
++/*
++ * MIPI DBI display controllers (MIPI DCS command set): ILI9341, ILI9488, ST7735, ST7789,
++ * ST7796, GC9A01. The engine (frame memory, address window, MADCTL, pixel formats,
++ * sleep/display on, inversion, read commands) is shared by the bus front ends: SPI (an
++ * SSI peripheral with a D/C line) here, and 8080 parallel buses elsewhere.
++ *
++ *   -device ili9341,bus=spi2,id=lcd    then pin-links for its lines:
++ *     "ssi-gpio-cs" (active low), "dc" (0: command, 1: data), "reset" (active low),
++ *     "backlight" (on when high unless backlight-active-low; on if never connected)
++ *
++ * The panel is a graphic console: `screendump` captures what the glass shows.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++#pragma once
++
++#include "hw/ssi/ssi.h"
++#include "ui/console.h"
++
++#define TYPE_MIPI_DBI_PANEL "mipi-dbi-panel"
++OBJECT_DECLARE_SIMPLE_TYPE(MipiDbiPanelState, MIPI_DBI_PANEL)
++
++typedef struct MipiDbiPanelModel {
++    const char *name;
++    uint16_t ram_w, ram_h;              /* Frame memory */
++    uint16_t width, height;             /* The glass, at x/y offset in the frame memory */
++    uint16_t x_off, y_off;
++    uint8_t id[3];                      /* RDDID (0x04) */
++    bool mirror_x, mirror_y;            /* How the module mounts the glass */
++    bool bgr;                           /* MADCTL.BGR set gives the right colors */
++    bool inverted;                      /* INVON gives the right colors (IPS panels) */
++    bool rgb666_only;                   /* No 16-bit pixels on SPI (ILI9488) */
++} MipiDbiPanelModel;
++
++struct MipiDbiPanelState {
++    SSIPeripheral parent_obj;
++
++    const MipiDbiPanelModel *model;
++    QemuConsole *con;
++    uint32_t *ram;                      /* RGB888, ram_w x ram_h */
++
++    /* Properties: a module can override its model's geometry and mounting */
++    uint32_t width, height, x_off, y_off;
++    bool mirror_x, mirror_y, bgr, inverted, backlight_active_low;
++
++    /* Lines */
++    bool dc, in_reset, backlight, backlight_wired;
++
++    /* Controller state */
++    uint8_t cmd;
++    uint32_t nparam;
++    uint8_t param[16];
++    bool sleeping, display_on, inversion, idle;
++    uint8_t madctl, colmod;
++    uint16_t xs, xe, ys, ye;            /* CASET / RASET */
++    uint16_t col, row;                  /* The write pointer */
++    uint8_t pix[3];                     /* A pixel's bytes so far */
++    uint8_t npix;
++    uint8_t rd[8];                      /* A read command's reply */
++    uint8_t rd_len, rd_pos;
++    bool dirty;
++};
++
++/* For bus front ends: a command (D/C low) or a data byte, and a reply byte for reads */
++void mipi_dbi_panel_command(MipiDbiPanelState *s, uint8_t cmd);
++void mipi_dbi_panel_data(MipiDbiPanelState *s, uint8_t data);
++uint8_t mipi_dbi_panel_read(MipiDbiPanelState *s);
+diff --git a/tests/qtest/esp32s3-spi-devices-test.c b/tests/qtest/esp32s3-spi-devices-test.c
+new file mode 100644
+index 0000000..59e3922
+--- /dev/null
++++ b/tests/qtest/esp32s3-spi-devices-test.c
+@@ -0,0 +1,308 @@
++/*
++ * QTest for SPI devices on the ESP32-S3's GP-SPI2, wired as gbagate's carrier-touch board:
++ * an ILI9341 (CS GPIO10, D/C GPIO9), an XPT2046 (CS GPIO16, PENIRQ GPIO17) and a microSD
++ * card in SPI mode (CS GPIO15). Chip selects are GPIOs driven by hand here, as Arduino's
++ * TFT_eSPI and SD libraries do; the GP-SPI test covers the controller's own.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "qapi/qmp/qdict.h"
++#include "libqtest.h"
++
++#define SPI2            0x60024000
++#define SPI_CMD         (SPI2 + 0x00)
++#define SPI_CLOCK       (SPI2 + 0x0C)
++#define SPI_USER        (SPI2 + 0x10)
++#define SPI_MS_DLEN     (SPI2 + 0x1C)
++#define SPI_MISC        (SPI2 + 0x20)
++#define SPI_INT_CLR     (SPI2 + 0x38)
++#define SPI_INT_RAW     (SPI2 + 0x3C)
++#define SPI_W0          (SPI2 + 0x98)
++#define SPI_CLK_GATE    (SPI2 + 0xE8)
++
++#define GPIO            0x60004000
++#define OUT_W1TS        (GPIO + 0x08)
++#define OUT_W1TC        (GPIO + 0x0C)
++#define ENABLE_W1TS     (GPIO + 0x24)
++#define IN              (GPIO + 0x3C)
++
++#define PIN_DC          9
++#define PIN_LCD_CS      10
++#define PIN_SD_CS       15
++#define PIN_TOUCH_CS    16
++#define PIN_TOUCH_IRQ   17
++
++#define BOARD \
++    "-machine esp32s3 " \
++    "-device ili9341,bus=spi2,id=lcd " \
++    "-device esp32s3.pin-link,pin=10,dev=lcd,line=ssi-gpio-cs,pull=up " \
++    "-device esp32s3.pin-link,pin=9,dev=lcd,line=dc " \
++    "-device xpt2046,bus=spi2,cs=1,id=touch " \
++    "-device esp32s3.pin-link,pin=16,dev=touch,line=ssi-gpio-cs,pull=up " \
++    "-device esp32s3.pin-link,pin=17,dev=touch,line=penirq,dir=out,open-drain=on,pull=up "
++
++static void board_init(QTestState *qts)
++{
++    qtest_writel(qts, SPI_CLK_GATE, 0x7);
++    qtest_writel(qts, SPI_CLOCK, BIT(31));          /* 80 MHz */
++    qtest_writel(qts, SPI_MISC, 0x3F);              /* No hardware CS: GPIOs */
++    qtest_writel(qts, SPI_USER, BIT(0) | BIT(27) | BIT(28));   /* Full duplex */
++    uint32_t pins = BIT(PIN_DC) | BIT(PIN_LCD_CS) | BIT(PIN_SD_CS) | BIT(PIN_TOUCH_CS);
++    qtest_writel(qts, OUT_W1TS, pins & ~BIT(PIN_DC));
++    qtest_writel(qts, ENABLE_W1TS, pins);
++}
++
++static void pin(QTestState *qts, int n, int level)
++{
++    qtest_writel(qts, level ? OUT_W1TS : OUT_W1TC, BIT(n));
++}
++
++/* n bytes out and in, through the W buffer, 64 at a time */
++static void xfer(QTestState *qts, const uint8_t *tx, uint8_t *rx, size_t n)
++{
++    for (size_t off = 0; off < n; off += 64) {
++        size_t len = MIN(64, n - off);
++        uint32_t w[16] = { 0 };
++        memcpy(w, tx + off, len);
++        for (int i = 0; i < 16; i++) {
++            qtest_writel(qts, SPI_W0 + 4 * i, w[i]);
++        }
++        qtest_writel(qts, SPI_MS_DLEN, len * 8 - 1);
++        qtest_writel(qts, SPI_INT_CLR, BIT(12));
++        qtest_writel(qts, SPI_CMD, BIT(24));
++        qtest_clock_step(qts, 100000);
++        g_assert_cmphex(qtest_readl(qts, SPI_INT_RAW) & BIT(12), ==, BIT(12));
++        if (rx) {
++            for (int i = 0; i < 16; i++) {
++                w[i] = qtest_readl(qts, SPI_W0 + 4 * i);
++            }
++            memcpy(rx + off, w, len);
++        }
++    }
++}
++
++static void lcd_cmd(QTestState *qts, uint8_t cmd, const uint8_t *data, size_t n)
++{
++    pin(qts, PIN_LCD_CS, 0);
++    pin(qts, PIN_DC, 0);
++    xfer(qts, &cmd, NULL, 1);
++    pin(qts, PIN_DC, 1);
++    if (n) {
++        xfer(qts, data, NULL, n);
++    }
++    pin(qts, PIN_LCD_CS, 1);
++}
++
++/* The panel's glass, from QMP screendump (PPM, P6) */
++static uint8_t *screendump(QTestState *qts, int *w, int *h)
++{
++    g_autofree char *path = g_strdup_printf("%s/qtest-lcd-%d.ppm", g_get_tmp_dir(), getpid());
++    QDict *resp = qtest_qmp(qts, "{'execute': 'screendump', 'arguments': {'filename': %s, 'device': 'lcd'}}",
++                            path);
++    g_assert(qdict_haskey(resp, "return"));
++    qobject_unref(resp);
++    gchar *data;
++    gsize len;
++    g_assert(g_file_get_contents(path, &data, &len, NULL));
++    unlink(path);
++    int maxval, off;
++    g_assert_cmpint(sscanf(data, "P6 %d %d %d%n", w, h, &maxval, &off), ==, 3);
++    uint8_t *px = g_memdup2(data + off + 1, (size_t)*w * *h * 3);
++    g_free(data);
++    return px;
++}
++
++static void test_lcd(void)
++{
++    QTestState *qts = qtest_init(BOARD);
++    board_init(qts);
++
++    /* Read the ID: a dummy byte, then 00 93 41 */
++    uint8_t cmd = 0x04, rx[4], tx[4] = { 0 };
++    pin(qts, PIN_LCD_CS, 0);
++    pin(qts, PIN_DC, 0);
++    xfer(qts, &cmd, NULL, 1);
++    pin(qts, PIN_DC, 1);
++    xfer(qts, tx, rx, 4);
++    pin(qts, PIN_LCD_CS, 1);
++    g_assert_cmphex(rx[1], ==, 0x00);
++    g_assert_cmphex(rx[2], ==, 0x93);
++    g_assert_cmphex(rx[3], ==, 0x41);
++
++    /* TFT_eSPI's start for rotation 0: sleep out, 16 bits, MX|BGR, display on */
++    lcd_cmd(qts, 0x11, NULL, 0);
++    lcd_cmd(qts, 0x3A, (uint8_t[]){ 0x55 }, 1);
++    lcd_cmd(qts, 0x36, (uint8_t[]){ 0x48 }, 1);
++    lcd_cmd(qts, 0x29, NULL, 0);
++
++    /* A 2x2 block at (10, 20): red, green / blue, white */
++    lcd_cmd(qts, 0x2A, (uint8_t[]){ 0, 10, 0, 11 }, 4);
++    lcd_cmd(qts, 0x2B, (uint8_t[]){ 0, 20, 0, 21 }, 4);
++    lcd_cmd(qts, 0x2C, (uint8_t[]){ 0xF8, 0x00, 0x07, 0xE0, 0x00, 0x1F, 0xFF, 0xFF }, 8);
++
++    int w, h;
++    uint8_t *px = screendump(qts, &w, &h);
++    g_assert_cmpint(w, ==, 240);
++    g_assert_cmpint(h, ==, 320);
++#define PX(x, y) (px[((y) * w + (x)) * 3] << 16 | px[((y) * w + (x)) * 3 + 1] << 8 | px[((y) * w + (x)) * 3 + 2])
++    g_assert_cmphex(PX(10, 20), ==, 0xFF0000);
++    g_assert_cmphex(PX(11, 20), ==, 0x00FF00);
++    g_assert_cmphex(PX(10, 21), ==, 0x0000FF);
++    g_assert_cmphex(PX(11, 21), ==, 0xFFFFFF);
++    g_assert_cmphex(PX(12, 20), ==, 0x000000);
++    g_free(px);
++
++    /* Rotation 1 (landscape, MV|BGR): logical (0,0) is the glass's top right */
++    lcd_cmd(qts, 0x36, (uint8_t[]){ 0x28 }, 1);
++    lcd_cmd(qts, 0x2A, (uint8_t[]){ 0, 0, 0, 0 }, 4);
++    lcd_cmd(qts, 0x2B, (uint8_t[]){ 0, 0, 0, 0 }, 4);
++    lcd_cmd(qts, 0x2C, (uint8_t[]){ 0xF8, 0x00 }, 2);
++    px = screendump(qts, &w, &h);
++    g_assert_cmphex(PX(239, 0), ==, 0xFF0000);
++    g_free(px);
++
++    /* Display off: the glass goes dark */
++    lcd_cmd(qts, 0x28, NULL, 0);
++    px = screendump(qts, &w, &h);
++    g_assert_cmphex(PX(10, 20), ==, 0x000000);
++    g_free(px);
++    qtest_quit(qts);
++}
++
++static uint16_t touch_read(QTestState *qts, uint8_t ctrl)
++{
++    uint8_t tx[3] = { ctrl, 0, 0 }, rx[3];
++    pin(qts, PIN_TOUCH_CS, 0);
++    xfer(qts, tx, rx, 3);
++    pin(qts, PIN_TOUCH_CS, 1);
++    return ((rx[1] << 8) | rx[2]) >> 3;
++}
++
++static void test_touch(void)
++{
++    QTestState *qts = qtest_init(BOARD);
++    board_init(qts);
++
++    /* Not touched: PENIRQ high, Z1 0 */
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(PIN_TOUCH_IRQ), ==, BIT(PIN_TOUCH_IRQ));
++    g_assert_cmpint(touch_read(qts, 0xB0), ==, 0);
++
++    qtest_qom_set_bool(qts, "/machine/peripheral/touch", "pressed", true);
++    qobject_unref(qtest_qmp(qts, "{'execute': 'qom-set', 'arguments': {'path': '/machine/peripheral/touch', "
++                                 "'property': 'x', 'value': 1234}}"));
++    qobject_unref(qtest_qmp(qts, "{'execute': 'qom-set', 'arguments': {'path': '/machine/peripheral/touch', "
++                                 "'property': 'y', 'value': 3000}}"));
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(PIN_TOUCH_IRQ), ==, 0);
++    g_assert_cmpint(touch_read(qts, 0xD0), ==, 1234);       /* X */
++    g_assert_cmpint(touch_read(qts, 0x90), ==, 3000);       /* Y */
++    g_assert_cmpint(touch_read(qts, 0xB0), >, 0);           /* Z1 */
++
++    /* XPT2046_Touchscreen's overlapped reads: the next command during this result */
++    uint8_t tx[5] = { 0xD1, 0x91, 0x00, 0xD0, 0x00 }, rx[5];
++    pin(qts, PIN_TOUCH_CS, 0);
++    xfer(qts, tx, rx, 5);
++    pin(qts, PIN_TOUCH_CS, 1);
++    g_assert_cmpint(((rx[1] << 8) | rx[2]) >> 3, ==, 1234);
++    g_assert_cmpint(((rx[3] << 8) | rx[4]) >> 3, ==, 3000);
++
++    /* PD = 01 disables PENIRQ; released, it goes high */
++    touch_read(qts, 0x91);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(PIN_TOUCH_IRQ), ==, BIT(PIN_TOUCH_IRQ));
++    touch_read(qts, 0x90);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(PIN_TOUCH_IRQ), ==, 0);
++    qtest_qom_set_bool(qts, "/machine/peripheral/touch", "pressed", false);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(PIN_TOUCH_IRQ), ==, BIT(PIN_TOUCH_IRQ));
++    qtest_quit(qts);
++}
++
++/* An SD command in SPI mode, and its R1 (the first byte that isn't 0xFF) */
++static uint8_t sd_cmd(QTestState *qts, uint8_t cmd, uint32_t arg, uint8_t crc, uint8_t *extra, int nextra)
++{
++    uint8_t tx[24], rx[24];
++    memset(tx, 0xFF, sizeof(tx));
++    tx[0] = 0x40 | cmd;
++    tx[1] = arg >> 24;
++    tx[2] = arg >> 16;
++    tx[3] = arg >> 8;
++    tx[4] = arg;
++    tx[5] = crc;
++    xfer(qts, tx, rx, sizeof(tx));
++    for (int i = 6; i < (int)sizeof(tx); i++) {
++        if (rx[i] != 0xFF) {
++            for (int j = 0; j < nextra; j++) {
++                extra[j] = i + 1 + j < (int)sizeof(rx) ? rx[i + 1 + j] : 0xFF;
++            }
++            return rx[i];
++        }
++    }
++    return 0xFF;
++}
++
++static void test_sd(void)
++{
++    g_autofree char *img = g_strdup_printf("%s/qtest-sd-%d.img", g_get_tmp_dir(), getpid());
++    g_autofree uint8_t *data = g_malloc0(1024 * 1024);
++    for (int i = 0; i < 512; i++) {
++        data[512 + i] = i * 7;          /* Block 1 */
++    }
++    g_assert(g_file_set_contents(img, (char *)data, 1024 * 1024, NULL));
++
++    g_autofree char *args = g_strdup_printf(BOARD
++        "-drive id=spisd,if=none,format=raw,file=%s "
++        "-device ssi-sd,bus=spi2,cs=2,id=sd,drive=spisd "
++        "-device esp32s3.pin-link,pin=15,dev=sd,line=ssi-gpio-cs,pull=up", img);
++    QTestState *qts = qtest_init(args);
++    board_init(qts);
++
++    /* 74+ clocks with CS high, then the SD library's start */
++    uint8_t ff[10];
++    memset(ff, 0xFF, sizeof(ff));
++    xfer(qts, ff, NULL, sizeof(ff));
++    pin(qts, PIN_SD_CS, 0);
++    g_assert_cmphex(sd_cmd(qts, 0, 0, 0x95, NULL, 0), ==, 0x01);           /* GO_IDLE */
++    uint8_t r7[4];
++    g_assert_cmphex(sd_cmd(qts, 8, 0x1AA, 0x87, r7, 4), ==, 0x01);         /* SEND_IF_COND */
++    g_assert_cmphex(r7[3], ==, 0xAA);
++    uint8_t r1 = 0x01;
++    for (int i = 0; i < 20 && r1 == 0x01; i++) {
++        sd_cmd(qts, 55, 0, 0x65, NULL, 0);
++        r1 = sd_cmd(qts, 41, 0x40000000, 0x77, NULL, 0);                    /* SD_SEND_OP_COND */
++    }
++    g_assert_cmphex(r1, ==, 0x00);
++
++    /* READ_SINGLE_BLOCK 1 (a byte address on a standard capacity card): R1, then the data
++     * token and the block, possibly starting in the command's own transfer */
++    uint8_t blk[700], tx[600];
++    int got = 16;
++    g_assert_cmphex(sd_cmd(qts, 17, 512, 0xFF, blk, got), ==, 0x00);
++    memset(tx, 0xFF, sizeof(tx));
++    xfer(qts, tx, blk + got, sizeof(tx));
++    int start = -1;
++    for (int i = 0; i < 80; i++) {
++        if (blk[i] == 0xFE) {           /* The data token */
++            start = i + 1;
++            break;
++        }
++    }
++    g_assert_cmpint(start, >=, 0);
++    for (int i = 0; i < 512; i++) {
++        g_assert_cmphex(blk[start + i], ==, (uint8_t)(i * 7));
++    }
++    pin(qts, PIN_SD_CS, 1);
++    qtest_quit(qts);
++    unlink(img);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/spi-devices/ili9341", test_lcd);
++    qtest_add_func("/esp32s3/spi-devices/xpt2046", test_touch);
++    qtest_add_func("/esp32s3/spi-devices/sd", test_sd);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 171393e..9e308e2 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+

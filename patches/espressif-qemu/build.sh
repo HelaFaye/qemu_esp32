@@ -17,5 +17,5 @@ git -C "$DIR" -c user.name=build -c user.email=build@localhost am -q "$HERE"/*.p
 mkdir -p "$DIR/build"
 cd "$DIR/build"
 [ -f build.ninja ] || ../configure --target-list=xtensa-softmmu --disable-werror \
-    --without-default-features --disable-docs --enable-gcrypt --enable-slirp
+    --without-default-features --disable-docs --enable-gcrypt --enable-slirp --enable-pixman
 ninja qemu-system-xtensa
