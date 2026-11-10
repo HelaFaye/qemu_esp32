@@ -1,0 +1,30 @@
+#!/bin/sh
+# HelaFaye/gbagate at the pinned commit (COMMIT): its gate image for the touch carrier
+# and for the devkit, as its own tools/build_hw.sh builds them (ESP-IDF 5.5; source
+# $IDF_PATH/export.sh first, or run in the espressif/idf:v5.5.6 container).
+#   OUTDIR/src                  the checkout (check.sh runs its qemu/accurate_boot.py)
+#   OUTDIR/<board>/flash.bin    bootloader, partitions and app, padded to 4 MB
+#   OUTDIR/<board>/gbagate.elf  for addr2line
+# Usage: build.sh OUTDIR
+set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
+OUT=$(mkdir -p "$1" && cd "$1" && pwd)
+URL=https://github.com/HelaFaye/gbagate
+COMMIT=$(cat "$HERE/COMMIT")
+SRC="$OUT/src"
+
+if [ ! -d "$SRC/.git" ]; then
+    git init -q "$SRC"
+    git -C "$SRC" remote add origin "$URL"
+fi
+git -C "$SRC" fetch -q --depth 1 origin "$COMMIT"
+git -C "$SRC" checkout -q -f "$COMMIT"
+
+for board in carrier-touch devkit; do
+    (cd "$SRC" && BOARD=$board tools/build_hw.sh gate)
+    dir="$SRC/build/hw-gate-$board"
+    mkdir -p "$OUT/$board"
+    (cd "$dir" && python3 -m esptool --chip esp32s3 merge-bin --pad-to-size 4MB \
+        -o "$OUT/$board/flash.bin" @flash_args)
+    cp "$dir/gbagate.elf" "$OUT/$board/"
+done

@@ -13,6 +13,7 @@ in `BASE`; `build.sh [dir]` fetches it, applies them and builds `qemu-system-xte
 | 0004 | I2C0/I2C1 masters (`i2c0`, `i2c1` buses): command lists, FIFOs, ACK checks, interrupts, SCL timing |
 | 0006 | `sx1262` `sx1261` `sx1268` LoRa radios: the SX126x command set, BUSY/DIO1/NRESET, time on air; packets between QEMUs over a chardev (`radio/airhub.py` for meshes) |
 | 0007 | USB Serial/JTAG (S3, C3): the serial side, the host as the -serial after the UARTs (S3: 4th), SOF frames while plugged in |
+| 0008 | SD cards in SPI mode: CMD9/CMD10 (CSD, CID) answer from the transfer state ACMD41 leaves the card in, and CMD13 answers SPI's R2 (R1 and a status byte), not the SD bus's 16-byte one, so hosts that read the CID to mount a card (ESP-IDF's sdspi) can |
 | 0005 | I2C board devices: `ssd1306`/`sh1106` OLEDs (screens), `gt911` `cst816` `ft6336` touch, `tdeck-keyboard`, `mcp23017`; `gpio-button` (buttons and rotary encoders on pins or expander lines) |
 
 ## Wiring a board

@@ -48,8 +48,40 @@ def meshcore_bare(air=None, **_):
     return "esp32s3", sx1262(nss=7, reset=8, busy=15, dio1=16, air=air)
 
 
+def gbagate_carrier_touch(card=None, **_):
+    """HelaFaye/gbagate's touch carrier (its doc/CARRIER.md): an ESP32-S3 Supermini, an
+    ILI9341 320x240 with an XPT2046 on GP-SPI2 (SCK 12, MOSI 11, MISO 13; LCD CS 10,
+    D/C 9; touch CS 16, PENIRQ 17), a micro SD (CS 15; card: a raw image), and the
+    Battle Chip board's two MCP23017s on I2C0 (SDA 1, SCL 2). Pins: its
+    port/esp32s3/board.h at firmware/gbagate/COMMIT. Its own check, which also presses
+    the touch and reads the glass, is firmware/gbagate/check.sh."""
+    args = ["-device", "ili9341,bus=spi2,id=lcd"]
+    args += link(10, "lcd", "ssi-gpio-cs", pull="up") + link(9, "lcd", "dc")
+    args += ["-device", "xpt2046,bus=spi2,cs=1,id=touch"]
+    args += link(16, "touch", "ssi-gpio-cs", pull="up")
+    args += link(17, "touch", "penirq", out=True, open_drain=True, pull="up")
+    if card:
+        args += ["-drive", "id=card,if=none,format=raw,file=%s" % card,
+                 "-device", "ssi-sd,bus=spi2,cs=2,id=sd,drive=card"]
+        args += link(15, "sd", "ssi-gpio-cs", pull="up")
+    args += ["-device", "mcp23017,bus=i2c0,address=0x20,id=exp0",
+             "-device", "mcp23017,bus=i2c0,address=0x21,id=exp1"]
+    return "esp32s3", args
+
+
+def gbagate_devkit(**_):
+    """HelaFaye/gbagate on an ESP32-S3 DevKitC with a 128x128 ST7735 (a BGR module) on
+    GP-SPI2: CS 14, D/C 21."""
+    args = ["-device", "st7735,bus=spi2,id=lcd,width=128,height=128,x-offset=2,y-offset=3,"
+                       "panel-bgr=on"]
+    args += link(14, "lcd", "ssi-gpio-cs", pull="up") + link(21, "lcd", "dc")
+    return "esp32s3", args
+
+
 BOARDS = {
     "meshcore-bare": meshcore_bare,
+    "gbagate-carrier-touch": gbagate_carrier_touch,
+    "gbagate-devkit": gbagate_devkit,
 }
 
 

@@ -7,6 +7,7 @@ was made for (`boards.py`), and checks what it prints. CI: `.github/workflows/fi
 | Firmware | Board | Scenario |
 |---|---|---|
 | [meshcore-bare-esp32s3](https://github.com/mytechnotalent/meshcore-bare-esp32s3) | ESP32-S3 + SX1262 | `meshcore-bare/two_nodes.py`: two nodes on one air (`radio/airhub.py`) bring their radios up, advertise, hear each other and store each other as contacts |
+| [gbagate](https://github.com/HelaFaye/gbagate) | its touch carrier (ESP32-S3 Supermini, ILI9341 + XPT2046, micro SD, MCP23017s) and its devkit (ST7735) | `gbagate/check.sh`, gbagate's own `qemu/accurate_boot.py`: the panel, touch, card and link PHYs come up; the picture is read back from the glass (the UI at 15/8, the touch keys, the theme's colours); a touch lights its key and moves the menu; touch alone reaches Send Program, which lists the program on the card |
 
 ## Emulator builds
 
