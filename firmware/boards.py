@@ -58,11 +58,15 @@ class Node:
         self.name, self.proc, self.log_path = name, proc, log_path
 
     def log(self):
-        try:
-            with open(self.log_path, errors="replace") as f:
-                return f.read()
-        except OSError:
-            return ""
+        """UART0 and the USB serial (the console is on one or the other)."""
+        out = ""
+        for p in (self.log_path, self.log_path[:-4] + "-usb.log"):
+            try:
+                with open(p, errors="replace") as f:
+                    out += f.read()
+            except OSError:
+                pass
+        return out
 
     def wait_for(self, pattern, timeout=60):
         """The first match of a regex in the serial log, or None after timeout."""
@@ -87,8 +91,9 @@ class Node:
 
 
 def boot(board, flash, workdir, name="node", hci=None, **opts):
-    """Boot flash (a merged image) on a board. UART0 goes to <workdir>/<name>.log;
-    hci: a TCP port for UART1 (a virtual Bluetooth controller), else nothing on it."""
+    """Boot flash (a merged image) on a board. UART0 goes to <workdir>/<name>.log, the
+    USB serial (plugged in) to <name>-usb.log; hci: a TCP port for UART1 (a virtual
+    Bluetooth controller), else nothing on it."""
     machine, devices = BOARDS[board](**opts)
     log = os.path.join(workdir, name + ".log")
     img = os.path.join(workdir, name + "-flash.bin")
@@ -97,7 +102,9 @@ def boot(board, flash, workdir, name="node", hci=None, **opts):
     args = [QEMU, "-machine", machine, "-nographic", "-monitor", "none", "-nic", "none",
             "-drive", "file=%s,if=mtd,format=raw" % img,
             "-serial", "file:" + log,
-            "-serial", "tcp:127.0.0.1:%d" % hci if hci else "null"]
+            "-serial", "tcp:127.0.0.1:%d" % hci if hci else "null",
+            "-serial", "null",
+            "-serial", "file:" + log[:-4] + "-usb.log"]
     if QEMU_BIOS:
         args += ["-L", QEMU_BIOS]
     args += devices

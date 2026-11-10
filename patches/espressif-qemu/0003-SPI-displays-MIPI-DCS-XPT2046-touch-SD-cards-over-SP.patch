@@ -1,7 +1,7 @@
 From b968893b7d1215f5fc0ee4eb113e0d2e2db95ace Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Tue, 10 Nov 2026 10:23:31 +0000
-Subject: [PATCH 3/6] SPI displays (MIPI DCS), XPT2046 touch, SD cards over SPI
+Subject: [PATCH 3/7] SPI displays (MIPI DCS), XPT2046 touch, SD cards over SPI
 
 mipi-dbi-panel: ILI9341, ILI9488, ST7735, ST7789, ST7796 and GC9A01 on
 an SSI bus, with D/C, reset and backlight lines. Frame memory,

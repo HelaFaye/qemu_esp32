@@ -1,0 +1,477 @@
+From 2747083b8a96c0c7c624c55b808a8f05c6b3f90f Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Tue, 10 Nov 2026 11:00:10 +0000
+Subject: [PATCH 7/7] esp32c3/esp32s3: USB Serial/JTAG serial side
+
+The USB Serial/JTAG was an empty stub, so firmware whose console or
+Arduino Serial is HWCDC (most ESP32-S3 boards: T-Deck, T-Display-S3,
+...) printed nothing. Now endpoint 1 works both ways with the USB host
+a chardev (the -serial after the UARTs: the 4th on the S3, 3rd on the
+C3): a 64-byte IN FIFO sent on WR_DONE or when full, a 64-byte OUT
+FIFO from the host, EP1_CONF room/data flags, SOF every millisecond
+while a host is attached (HWCDC counts them to know it's plugged in),
+SERIAL_OUT_RECV_PKT and SERIAL_IN_EMPTY, the interrupt to the matrix.
+Without a host the IN FIFO fills and stays full, as unplugged.
+---
+ hw/misc/esp32c3_jtag.c                     | 179 +++++++++++++++++++--
+ hw/riscv/esp32c3.c                         |   4 +
+ hw/xtensa/esp32s3.c                        |   4 +
+ include/hw/misc/esp32c3_jtag.h             |  23 ++-
+ tests/qtest/esp32s3-usb-serial-jtag-test.c | 114 +++++++++++++
+ tests/qtest/meson.build                    |   2 +-
+ 6 files changed, 312 insertions(+), 14 deletions(-)
+ create mode 100644 tests/qtest/esp32s3-usb-serial-jtag-test.c
+
+diff --git a/hw/misc/esp32c3_jtag.c b/hw/misc/esp32c3_jtag.c
+index 82ee697..85d09fa 100644
+--- a/hw/misc/esp32c3_jtag.c
++++ b/hw/misc/esp32c3_jtag.c
+@@ -1,5 +1,13 @@
+ /*
+- * ESP32-C3 USB Serial JTAG emulation
++ * ESP32-C3 / ESP32-S3 USB Serial/JTAG: the CDC-ACM serial side
++ *
++ * Endpoint 1: EP1 writes fill a 64-byte IN FIFO, sent to the host on WR_DONE (or when
++ * full); host bytes fill the 64-byte OUT FIFO, read from EP1. EP1_CONF tells whether
++ * there's room (SERIAL_IN_EP_DATA_FREE) and data (SERIAL_OUT_EP_DATA_AVAIL). Interrupts:
++ * SOF every millisecond with a host, SERIAL_OUT_RECV_PKT on data from it,
++ * SERIAL_IN_EMPTY once a packet has gone. ESP-IDF's console and usb_serial_jtag driver
++ * and Arduino's HWCDC (which counts SOFs to know a host is there) work on it.
++ * Register layout: ESP-IDF's soc/esp32s3/include/soc/usb_serial_jtag_struct.h.
+  *
+  * Copyright (c) 2023 Espressif Systems (Shanghai) Co. Ltd.
+  *
+@@ -7,26 +15,141 @@
+  * it under the terms of the GNU General Public License version 2 or
+  * (at your option) any later version.
+  */
++
+ #include "qemu/osdep.h"
+ #include "qemu/log.h"
+-#include "qemu/module.h"
+-#include "qemu/error-report.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
+ #include "hw/hw.h"
++#include "hw/irq.h"
+ #include "hw/sysbus.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
+ #include "hw/misc/esp32c3_jtag.h"
+ 
++#define A_EP1           0x00
++#define A_EP1_CONF      0x04
++#define A_INT_RAW       0x08
++#define A_INT_ST        0x0C
++#define A_INT_ENA       0x10
++#define A_INT_CLR       0x14
++#define A_CONF0         0x18
++#define A_TEST          0x1C
++#define A_JFIFO_ST      0x20
++#define A_FRAM_NUM      0x24
++#define A_IN_EP1_ST     0x2C
++#define A_OUT_EP1_ST    0x3C
++#define A_MISC_CONF     0x44
++#define A_MEM_CONF      0x48
++#define A_DATE          0x80
++
++#define EP1_CONF_WR_DONE        BIT(0)
++#define EP1_CONF_IN_FREE        BIT(1)
++#define EP1_CONF_OUT_AVAIL      BIT(2)
++
++#define INT_SOF                 BIT(1)
++#define INT_SERIAL_OUT_RECV     BIT(2)
++#define INT_SERIAL_IN_EMPTY     BIT(3)
++#define INT_MASK                0x7FFF
++
++#define DATE_VALUE              0x2101200
++
++static bool host_attached(ESP32C3UsbJtagState *s)
++{
++    return qemu_chr_fe_backend_connected(&s->chr);
++}
++
++static void update_irq(ESP32C3UsbJtagState *s)
++{
++    qemu_set_irq(s->irq, (s->int_raw & s->int_ena) != 0);
++}
++
++static void flush_in(ESP32C3UsbJtagState *s)
++{
++    if (!host_attached(s) || !s->in_len) {
++        return;
++    }
++    qemu_chr_fe_write_all(&s->chr, s->in_fifo, s->in_len);
++    s->in_len = 0;
++    s->int_raw |= INT_SERIAL_IN_EMPTY;
++    update_irq(s);
++}
++
++static void sof_tick(void *opaque)
++{
++    ESP32C3UsbJtagState *s = opaque;
++    if (!host_attached(s)) {
++        return;
++    }
++    s->frame = (s->frame + 1) & 0x7FF;
++    s->int_raw |= INT_SOF;
++    /* The host polls IN every frame: a full packet left waiting goes now */
++    if (s->in_len == ESP32C3_JTAG_EP1_SIZE) {
++        flush_in(s);
++    }
++    update_irq(s);
++    timer_mod(s->sof_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCALE_MS);
++}
+ 
+ static uint64_t esp32c3_jtag_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+     ESP32C3UsbJtagState *s = ESP32C3_JTAG(opaque);
+-    (void) s;
+-    return 0;
++
++    switch (addr) {
++    case A_EP1: {
++        if (!s->out_len) {
++            return 0;
++        }
++        uint8_t b = s->out_fifo[s->out_head];
++        s->out_head = (s->out_head + 1) % ESP32C3_JTAG_EP1_SIZE;
++        s->out_len--;
++        if (!s->out_len) {
++            qemu_chr_fe_accept_input(&s->chr);
++        }
++        return b;
++    }
++    case A_EP1_CONF:
++        return (s->in_len < ESP32C3_JTAG_EP1_SIZE ? EP1_CONF_IN_FREE : 0) |
++               (s->out_len ? EP1_CONF_OUT_AVAIL : 0);
++    case A_INT_RAW:     return s->int_raw;
++    case A_INT_ST:      return s->int_raw & s->int_ena;
++    case A_INT_ENA:     return s->int_ena;
++    case A_CONF0:       return s->conf0;
++    case A_TEST:        return s->test;
++    case A_JFIFO_ST:    return BIT(2) | BIT(6);     /* The JTAG FIFOs: empty */
++    case A_FRAM_NUM:    return s->frame;
++    case A_IN_EP1_ST:   return (s->in_len & 0x7F) << 2;
++    case A_OUT_EP1_ST:  return (s->out_len & 0x7F) << 16;
++    case A_MISC_CONF:   return s->misc_conf;
++    case A_MEM_CONF:    return s->mem_conf;
++    case A_DATE:        return DATE_VALUE;
++    default:            return 0;
++    }
+ }
+ 
+ static void esp32c3_jtag_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
+ {
+     ESP32C3UsbJtagState *s = ESP32C3_JTAG(opaque);
+-    (void) s;
++
++    switch (addr) {
++    case A_EP1:
++        if (s->in_len < ESP32C3_JTAG_EP1_SIZE) {
++            s->in_fifo[s->in_len++] = value;
++        }
++        break;
++    case A_EP1_CONF:
++        if (value & EP1_CONF_WR_DONE) {
++            flush_in(s);
++        }
++        break;
++    case A_INT_ENA:     s->int_ena = value & INT_MASK; update_irq(s); break;
++    case A_INT_CLR:     s->int_raw &= ~value; update_irq(s); break;
++    case A_CONF0:       s->conf0 = value; break;
++    case A_TEST:        s->test = value; break;
++    case A_MISC_CONF:   s->misc_conf = value; break;
++    case A_MEM_CONF:    s->mem_conf = value; break;
++    default:            break;
++    }
+ }
+ 
+ static const MemoryRegionOps esp32c3_jtag_ops = {
+@@ -35,16 +158,45 @@ static const MemoryRegionOps esp32c3_jtag_ops = {
+     .endianness = DEVICE_LITTLE_ENDIAN,
+ };
+ 
++static int esp32c3_jtag_can_receive(void *opaque)
++{
++    ESP32C3UsbJtagState *s = opaque;
++    return ESP32C3_JTAG_EP1_SIZE - s->out_len;
++}
++
++static void esp32c3_jtag_receive(void *opaque, const uint8_t *buf, int size)
++{
++    ESP32C3UsbJtagState *s = opaque;
++    for (int i = 0; i < size && s->out_len < ESP32C3_JTAG_EP1_SIZE; i++) {
++        s->out_fifo[(s->out_head + s->out_len++) % ESP32C3_JTAG_EP1_SIZE] = buf[i];
++    }
++    s->int_raw |= INT_SERIAL_OUT_RECV;
++    update_irq(s);
++}
++
+ static void esp32c3_jtag_reset_hold(Object *obj, ResetType type)
+ {
+-    (void) obj;
+-    (void) type;
++    ESP32C3UsbJtagState *s = ESP32C3_JTAG(obj);
++    s->in_len = s->out_head = s->out_len = 0;
++    s->int_raw = 0;
++    s->int_ena = 0;
++    s->conf0 = 0x4200;          /* Pad enabled, D+ pull-up */
++    s->test = 0;
++    s->misc_conf = 0;
++    s->mem_conf = 0x2;
++    s->frame = 0;
++    update_irq(s);
++    if (host_attached(s)) {
++        timer_mod(s->sof_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCALE_MS);
++    }
+ }
+ 
+ static void esp32c3_jtag_realize(DeviceState *dev, Error **errp)
+ {
+-    (void) dev;
+-    (void) errp;
++    ESP32C3UsbJtagState *s = ESP32C3_JTAG(dev);
++    s->sof_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sof_tick, s);
++    qemu_chr_fe_set_handlers(&s->chr, esp32c3_jtag_can_receive, esp32c3_jtag_receive,
++                             NULL, NULL, s, NULL, true);
+ }
+ 
+ static void esp32c3_jtag_init(Object *obj)
+@@ -55,8 +207,14 @@ static void esp32c3_jtag_init(Object *obj)
+     memory_region_init_io(&s->iomem, obj, &esp32c3_jtag_ops, s,
+                           TYPE_ESP32C3_JTAG, ESP32C3_JTAG_REGS_SIZE);
+     sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
+ }
+ 
++static Property esp32c3_jtag_properties[] = {
++    DEFINE_PROP_CHR("chardev", ESP32C3UsbJtagState, chr),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
+ static void esp32c3_jtag_class_init(ObjectClass *klass, void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -64,6 +222,7 @@ static void esp32c3_jtag_class_init(ObjectClass *klass, void *data)
+ 
+     rc->phases.hold = esp32c3_jtag_reset_hold;
+     dc->realize = esp32c3_jtag_realize;
++    device_class_set_props(dc, esp32c3_jtag_properties);
+ }
+ 
+ static const TypeInfo esp32c3_jtag_info = {
+diff --git a/hw/riscv/esp32c3.c b/hw/riscv/esp32c3.c
+index f3a824c..5e225ff 100644
+--- a/hw/riscv/esp32c3.c
++++ b/hw/riscv/esp32c3.c
+@@ -453,7 +453,11 @@ static void esp32c3_machine_init(MachineState *machine)
+ 
+     /* USB Serial JTAG realization */
+     {
++        /* The USB host: the -serial after the UARTs */
++        qdev_prop_set_chr(DEVICE(&ms->jtag), "chardev", serial_hd(ESP32C3_UART_COUNT));
+         sysbus_realize(SYS_BUS_DEVICE(&ms->jtag), &error_fatal);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ms->jtag), 0,
++                           qdev_get_gpio_in(intmatrix_dev, ETS_USB_SERIAL_JTAG_INTR_SOURCE));
+         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ms->jtag), 0);
+         memory_region_add_subregion_overlap(sys_mem, DR_REG_USB_SERIAL_JTAG_BASE, mr, 0);
+     }
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index 275bb8a..fc8cd9a 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -794,7 +794,11 @@ static void esp32s3_machine_init(MachineState *machine)
+ 
+     /* USB Serial JTAG realization */
+     {
++        /* The USB host: the -serial after the UARTs */
++        qdev_prop_set_chr(DEVICE(&ss->jtag), "chardev", serial_hd(ESP32S3_UART_COUNT));
+         sysbus_realize(SYS_BUS_DEVICE(&ss->jtag), &error_fatal);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->jtag), 0,
++                           qdev_get_gpio_in(intmatrix_dev, ETS_USB_SERIAL_JTAG_INTR_SOURCE));
+         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->jtag), 0);
+         memory_region_add_subregion_overlap(sys_mem, DR_REG_USB_SERIAL_JTAG_BASE, mr, 0);
+     }
+diff --git a/include/hw/misc/esp32c3_jtag.h b/include/hw/misc/esp32c3_jtag.h
+index 8ac6ebb..d37cd49 100644
+--- a/include/hw/misc/esp32c3_jtag.h
++++ b/include/hw/misc/esp32c3_jtag.h
+@@ -1,5 +1,11 @@
+ /*
+- * ESP32-C3 USB Serial JTAG emulation
++ * ESP32-C3 / ESP32-S3 USB Serial/JTAG: the CDC-ACM serial side
++ *
++ * The USB host is a chardev ("chardev" property; the machines give it the -serial after
++ * their UARTs: the 4th on the S3, the 3rd on the C3). With a host attached the
++ * controller sees start-of-frame packets every millisecond, as when plugged into a
++ * computer, and what the firmware writes to endpoint 1 goes out; without one, the
++ * IN FIFO fills and stays full, as on a board with no USB cable.
+  *
+  * Copyright (c) 2023 Espressif Systems (Shanghai) Co. Ltd.
+  *
+@@ -12,15 +18,26 @@
+ #include "hw/hw.h"
+ #include "hw/sysbus.h"
+ #include "hw/registerfields.h"
++#include "chardev/char-fe.h"
+ 
+ #define TYPE_ESP32C3_JTAG "misc.esp32c3.usb_serial_jtag"
+ #define ESP32C3_JTAG(obj) OBJECT_CHECK(ESP32C3UsbJtagState, (obj), TYPE_ESP32C3_JTAG)
+ 
+ #define ESP32C3_JTAG_REGS_SIZE (0x84)
+-
++#define ESP32C3_JTAG_EP1_SIZE  64
+ 
+ typedef struct ESP32C3UsbJtagState {
+     SysBusDevice parent_object;
+     MemoryRegion iomem;
+-} ESP32C3UsbJtagState;
++    CharBackend chr;
++    qemu_irq irq;
++    QEMUTimer *sof_timer;
+ 
++    uint8_t in_fifo[ESP32C3_JTAG_EP1_SIZE];     /* To the host */
++    uint32_t in_len;
++    uint8_t out_fifo[ESP32C3_JTAG_EP1_SIZE];    /* From the host */
++    uint32_t out_head, out_len;
++    uint32_t int_raw, int_ena;
++    uint32_t conf0, misc_conf, mem_conf, test;
++    uint32_t frame;
++} ESP32C3UsbJtagState;
+diff --git a/tests/qtest/esp32s3-usb-serial-jtag-test.c b/tests/qtest/esp32s3-usb-serial-jtag-test.c
+new file mode 100644
+index 0000000..2c2a8ec
+--- /dev/null
++++ b/tests/qtest/esp32s3-usb-serial-jtag-test.c
+@@ -0,0 +1,114 @@
++/*
++ * QTest for the ESP32-S3 USB Serial/JTAG's serial side: with a host (the 4th -serial)
++ * frames come every millisecond and endpoint 1 carries bytes both ways; without one
++ * the IN FIFO fills and stays full.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "qemu/sockets.h"
++#include "libqtest.h"
++#include <sys/un.h>
++
++#define USJ             0x60038000
++#define EP1             (USJ + 0x00)
++#define EP1_CONF        (USJ + 0x04)
++#define INT_RAW         (USJ + 0x08)
++#define INT_ENA         (USJ + 0x10)
++#define INT_CLR         (USJ + 0x14)
++#define FRAM_NUM        (USJ + 0x24)
++
++#define WR_DONE         BIT(0)
++#define IN_FREE         BIT(1)
++#define OUT_AVAIL       BIT(2)
++#define INT_SOF         BIT(1)
++#define INT_OUT_RECV    BIT(2)
++#define INT_IN_EMPTY    BIT(3)
++
++#define INTMATRIX_STATUS3   0x600C2198      /* Sources 96-127 */
++#define USJ_SOURCE          96
++
++static int host_connect(const char *path)
++{
++    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    struct sockaddr_un a = { .sun_family = AF_UNIX };
++    g_strlcpy(a.sun_path, path, sizeof(a.sun_path));
++    g_assert_cmpint(connect(fd, (struct sockaddr *)&a, sizeof(a)), ==, 0);
++    return fd;
++}
++
++static void test_with_host(void)
++{
++    g_autofree char *sock = g_strdup_printf("%s/qtest-usj-%d.sock", g_get_tmp_dir(), getpid());
++    g_autofree char *args = g_strdup_printf("-machine esp32s3 -chardev socket,id=usj,path=%s,server=on,wait=off "
++                                            "-serial null -serial null -serial null -serial chardev:usj", sock);
++    QTestState *qts = qtest_init(args);
++    int host = host_connect(sock);
++
++    /* Frames: every millisecond */
++    uint32_t f0 = qtest_readl(qts, FRAM_NUM);
++    qtest_writel(qts, INT_CLR, ~0u);
++    qtest_clock_step(qts, 3 * 1000 * 1000 + 1000);
++    g_assert_cmpint((qtest_readl(qts, FRAM_NUM) - f0) & 0x7FF, ==, 3);
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & INT_SOF, ==, INT_SOF);
++
++    /* To the host: bytes, then WR_DONE */
++    g_assert_cmphex(qtest_readl(qts, EP1_CONF) & IN_FREE, ==, IN_FREE);
++    const char *msg = "I (312) main_task: Calling app_main()\n";
++    for (const char *p = msg; *p; p++) {
++        qtest_writel(qts, EP1, *p);
++    }
++    qtest_writel(qts, INT_CLR, INT_IN_EMPTY);
++    qtest_writel(qts, EP1_CONF, WR_DONE);
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & INT_IN_EMPTY, ==, INT_IN_EMPTY);
++    char buf[128] = { 0 };
++    size_t got = 0;
++    while (got < strlen(msg)) {
++        ssize_t r = read(host, buf + got, sizeof(buf) - 1 - got);
++        g_assert_cmpint(r, >, 0);
++        got += r;
++    }
++    g_assert_cmpstr(buf, ==, msg);
++
++    /* From the host: an interrupt, then the bytes */
++    qtest_writel(qts, INT_ENA, INT_OUT_RECV);
++    g_assert_cmpint(write(host, "ok", 2), ==, 2);
++    for (int i = 0; i < 100 && !(qtest_readl(qts, EP1_CONF) & OUT_AVAIL); i++) {
++        g_usleep(1000);
++    }
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & INT_OUT_RECV, ==, INT_OUT_RECV);
++    g_assert_true(qtest_readl(qts, INTMATRIX_STATUS3) & BIT(USJ_SOURCE - 96));
++    g_assert_cmphex(qtest_readl(qts, EP1), ==, 'o');
++    g_assert_cmphex(qtest_readl(qts, EP1), ==, 'k');
++    g_assert_cmphex(qtest_readl(qts, EP1_CONF) & OUT_AVAIL, ==, 0);
++
++    close(host);
++    qtest_quit(qts);
++    unlink(sock);
++}
++
++static void test_unplugged(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++    qtest_writel(qts, INT_CLR, ~0u);
++    qtest_clock_step(qts, 5 * 1000 * 1000);
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & INT_SOF, ==, 0);   /* No frames */
++    for (int i = 0; i < 64; i++) {
++        qtest_writel(qts, EP1, 'x');
++    }
++    qtest_writel(qts, EP1_CONF, WR_DONE);
++    g_assert_cmphex(qtest_readl(qts, EP1_CONF) & IN_FREE, ==, 0);  /* Stays full */
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/usb-serial-jtag/with_host", test_with_host);
++    qtest_add_func("/esp32s3/usb-serial-jtag/unplugged", test_unplugged);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 41f290a..05d2af8 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+
