@@ -75,6 +75,7 @@ jobs:
           n = boot("meshcore-bare", os.path.join(os.environ["RUNNER_TEMP"], "mcb", "stock", "flash.bin"), work)
           time.sleep(40)
           n.stop()
+          print(n.qemu_output()[-2000:])
           print("\n".join(n.log().splitlines()[-80:]))
           EOF
       - name: Decode any backtrace

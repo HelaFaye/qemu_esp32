@@ -62,6 +62,8 @@ def main():
         bad = __import__("re").search(FATAL, log)
         if bad:
             ok = False
+        if n.proc.returncode not in (None, 0, -9):
+            print("\n===== %s: QEMU exited %s =====\n%s" % (n.name, n.proc.returncode, n.qemu_output()[-3000:]))
         print("\n===== %s serial (last 120 lines)%s =====" % (n.name, " FATAL" if bad else ""))
         print("\n".join(log.splitlines()[-120:]))
     print("\n===== air hub =====")

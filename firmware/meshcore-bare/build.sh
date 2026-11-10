@@ -20,7 +20,7 @@ git -C "$SRC" fetch -q --depth 1 origin "$COMMIT"
 git -C "$SRC" checkout -q -f "$COMMIT"
 
 merge() {   # build dir, output image
-    python3 -m esptool --chip esp32s3 merge_bin --flash_mode dio --flash_size 16MB -o "$2" \
+    python3 -m esptool --chip esp32s3 merge-bin --flash-mode dio --flash-size 16MB --pad-to-size 16MB -o "$2" \
         0x0 "$1/bootloader.bin" 0x8000 "$1/partitions.bin" 0x10000 "$1/firmware.bin"
 }
 

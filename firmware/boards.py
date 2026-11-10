@@ -84,6 +84,14 @@ class Node:
     def count(self, pattern):
         return len(re.findall(pattern, self.log()))
 
+    def qemu_output(self):
+        """What QEMU itself printed (errors when it wouldn't start)."""
+        try:
+            with open(self.log_path[:-4] + "-qemu.log", errors="replace") as f:
+                return f.read()
+        except OSError:
+            return ""
+
     def stop(self):
         if self.proc.poll() is None:
             self.proc.kill()
@@ -98,7 +106,11 @@ def boot(board, flash, workdir, name="node", hci=None, **opts):
     log = os.path.join(workdir, name + ".log")
     img = os.path.join(workdir, name + "-flash.bin")
     with open(flash, "rb") as src, open(img, "wb") as dst:
-        dst.write(src.read())                  # Each node its own flash (NVS: its identity)
+        data = src.read()                      # Each node its own flash (NVS: its identity)
+        size = 4 << 20
+        while size < len(data):
+            size *= 2                          # QEMU wants the whole chip: 4, 8 or 16 MB
+        dst.write(data + b"\xff" * (size - len(data)))
     args = [QEMU, "-machine", machine, "-nographic", "-monitor", "none", "-nic", "none",
             "-drive", "file=%s,if=mtd,format=raw" % img,
             "-serial", "file:" + log,
