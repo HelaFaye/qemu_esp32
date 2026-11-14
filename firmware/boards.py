@@ -139,6 +139,25 @@ def gbagate_devkit(**_):
     return "esp32s3", args
 
 
+def from_kicad(path, sd=None, **_):
+    """A board read from a KiCad design (.kicad_pcb or netlist): kicad/kiboard.py. sd: a
+    raw image for the design's SD socket, if it has one."""
+    import sys
+    sys.path.insert(0, os.path.join(HERE, "..", "kicad"))
+    import kiboard
+    b = kiboard.board_from(path)
+    if not b.machine:
+        raise ValueError("%s: nothing to emulate:\n%s" % (path, b.report()))
+    args = list(b.args)
+    if sd:
+        for i, a in enumerate(args):
+            if a.startswith("ssi-sd,"):
+                args[i] = a + ",drive=kicad_sd"
+                args += ["-drive", "id=kicad_sd,if=none,format=raw,file=" + sd]
+                break
+    return b.machine, args
+
+
 BOARDS = {
     "esp32s3-devkitc": esp32s3_devkitc,
     "meshcore-bare": meshcore_bare,
@@ -274,7 +293,10 @@ def boot(board, flash, workdir, name="node", hci=None, extra=(), **opts):
     """Boot flash (a merged image) on a board. UART0 goes to <workdir>/<name>.log, the
     USB serial (plugged in) to <name>-usb.log; hci: a TCP port for UART1 (a virtual
     Bluetooth controller), else nothing on it."""
-    machine, devices = BOARDS[board](**opts)
+    if board.startswith("kicad:"):
+        machine, devices = from_kicad(board[len("kicad:"):], **opts)
+    else:
+        machine, devices = BOARDS[board](**opts)
     log = os.path.join(workdir, name + ".log")
     img = os.path.join(workdir, name + "-flash.bin")
     with open(flash, "rb") as src, open(img, "wb") as dst:

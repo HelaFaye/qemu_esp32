@@ -26,6 +26,7 @@ design: [docs/STRESS-TESTING.md](docs/STRESS-TESTING.md).
 | [`radio/`](radio) | The air between LoRa radios in different QEMUs (`airhub.py`): per-link signal strength, loss and corruption, or positions, path loss, noise and interferers (`environment.py`) |
 | [`faults/`](faults) | Fault injection: skipped instructions, corrupted registers and memory, aimed at any instruction of any firmware; glitch campaigns over whole functions (`campaign.py`); power cuts and brown-outs (`Node.set_vdd`); parts on their own supply; bit errors, lost ACKs and pin glitches on board wires (`bus_noise`, `pin_glitch`) |
 | [`bluetooth/`](bluetooth) | Virtual Bluetooth: your firmware's own host stack (Bluedroid, NimBLE) over HCI to a virtual controller, with virtual phones and controllers as peers |
+| [`kicad/`](kicad) | Boards from KiCad designs: `kiboard.py` reads a `.kicad_pcb` or netlist and writes the QEMU board (`boot("kicad:design.kicad_pcb", ...)`) |
 | [`firmware/`](firmware) | Test cases: real firmware built from its repository and checked on its board |
 
 ## Quick start

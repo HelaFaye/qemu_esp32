@@ -113,11 +113,14 @@ today a memory fault can already be aimed at one SRAM region or peripheral regis
 ## 5. Boards from KiCad
 
 Today a board is written by hand in `firmware/boards.py`. Planned, in two steps:
-- **From the schematic.** `kicad-cli sch export netlist` gives every part and every net.
-  A tool reads it, recognizes parts by their symbol and footprint (an ILI9341 module, an
-  SX1262, an MCP23017, a button, a pull-up resistor), and writes the QEMU board: each
-  part on its bus, each line linked to the ESP32 pin its net reaches, the pull-ups and
-  open drains the board has. Parts it doesn't know are listed, not guessed.
+- **From the schematic or the board file (exists: `kicad/kiboard.py`).** A netlist
+  (`kicad-cli sch export netlist`) or a `.kicad_pcb` gives every part and every net;
+  kiboard recognizes parts by their value, symbol and footprint (an ILI9341 module, an
+  SX1262, an MCP23017, a button, a pull-up resistor), matches their pins by name (or
+  datasheet pinout, or net name), and writes the QEMU board: each part on its bus, each
+  line linked to the ESP32 pin its net reaches, I2C addresses from the address pins, the
+  pull-ups and open drains the board has. Parts it doesn't know are listed, not guessed.
+  `boot("kicad:board.kicad_pcb", ...)` runs firmware on it directly.
 - **From the routed board.** The PCB file adds what the schematic doesn't have: trace
   lengths, which nets run side by side and for how long, distances to the radio's
   antenna and feed, ground pour. These set the EMI model's rates per net (2) and the
@@ -135,4 +138,5 @@ Today a board is written by hand in `firmware/boards.py`. Planned, in two steps:
 3. Brown-out, power cuts and parts on their own supply (done).
 4. Bus and pin errors (done for SPI, I2C and GPIO inputs); next UART, SD CRC, stuck
    lines, and noise tied to events (the radio transmitting).
-5. KiCad netlist to board; then the PCB file's routing to EMI rates; then the plugin.
+5. KiCad design to board (done); then the PCB file's routing to EMI rates; then the
+   plugin.

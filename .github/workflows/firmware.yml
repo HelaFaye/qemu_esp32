@@ -4,7 +4,7 @@ name: Firmware in QEMU
 # boards (firmware/boards.py) with the patched QEMU, and checked by its serial output.
 on:
   push:
-    paths: ["patches/espressif-qemu/**", "firmware/**", "radio/**", "faults/**", ".github/workflows/firmware.yml"]
+    paths: ["patches/espressif-qemu/**", "firmware/**", "radio/**", "faults/**", "kicad/**", ".github/workflows/firmware.yml"]
   workflow_dispatch:
 
 jobs:
@@ -181,6 +181,14 @@ jobs:
         with:
           name: qemu-xtensa
           path: ${{ runner.temp }}/qemu
+      - name: Boards from KiCad designs, booted
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: |
+          chmod +x "$QEMU_XTENSA"
+          pip install -q pytest
+          python3 -m pytest -q kicad/
       - name: Build the fault target (a PIN check, plain and hardened)
         run: faults/target/build.sh "$RUNNER_TEMP/faults"
       - name: Glitch campaigns on both (skips, zeroed results)
