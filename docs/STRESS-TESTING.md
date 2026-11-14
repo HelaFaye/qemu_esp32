@@ -89,8 +89,13 @@ A supply that dips or glitches does three things to a chip, all modeled as effec
   run in CI) shows a plain PIN check bypassed by 4 different single skips and a hardened
   one bypassed by none. Next: faults by time window and probability, and multi-fault
   (pairs of instructions).
-- **Peripheral effects.** A dip that resets a part but not the chip (the display or radio
-  on its own regulator): the part loses its state, and the firmware has to notice.
+- **Parts on their own supply (exists: patch 0011, `boards.power_domain`,
+  `Node.part_power`).** A display or radio on its own regulator or load switch, switched
+  by a test or by the firmware through a pin (the T-Deck's peripherals are, on GPIO10).
+  Off, its parts leave their buses (an I2C part stops ACKing, an SPI part drives
+  nothing); on again, each starts from its power-on state, and the firmware has to
+  notice (a display that's asleep and dark, a radio that forgot its configuration).
+  Next: a part's output pins (INT, BUSY, DIO1) going low while it's off.
 
 ## 4. Electromagnetic fault injection (EMFI)
 
@@ -123,7 +128,6 @@ Today a board is written by hand in `firmware/boards.py`. Planned, in two steps:
    nodes, interferers as packets, recording and replay.
 2. Fault injector (done: instruction skip, register and memory faults, resets, campaigns,
    through the GDB stub); next, faults by time and probability, and multiple faults.
-3. Brown-out and power cuts (done: the S3's supply and brown-out detector); next, part
-   power domains (a display or radio on its own regulator).
+3. Brown-out, power cuts and parts on their own supply (done).
 4. Bus and pin error models (SPI, I2C, UART, SD, GPIO).
 5. KiCad netlist to board; then the PCB file's routing to EMI rates; then the plugin.

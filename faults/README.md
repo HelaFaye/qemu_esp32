@@ -36,6 +36,11 @@ node.power_cut(0.1)           # No supply for 100 ms, then a power-on reset
 inj.run_to(esp_flash_write_addr); node.set_vdd(0); inj.cont()   # A cut as a flash write starts
 ```
 
+Parts on their own supply (patch 0011): `boards.power_domain("lcd_pwr", "lcd", "touch",
+pin=None)` in a board, then `node.part_power("lcd_pwr", False)`; off, the parts leave
+their buses, and on again they're as at power-on. With `pin=N` the firmware switches it
+(the T-Deck's GPIO10 does).
+
 `power_demo.py` with `power-target/` (a counter in NVS, committed every 10 ms) runs
 random cuts, cuts as a flash write starts, and brown-outs, and checks each comes back
 with the right reset reason, NVS opening, and nothing it reported committed lost:

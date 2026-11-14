@@ -53,6 +53,17 @@ def esp32s3_devkitc(**_):
     return "esp32s3", []
 
 
+def power_domain(name, *devices, pin=None):
+    """Parts on their own supply (patch 0011), after them on the command line: switched
+    by the firmware through pin (a regulator's enable) if given, and by a test with
+    Node.part_power(name, on)."""
+    args = ["-device", "power-domain,id=%s,devices=%s%s" % (name, ":".join(devices),
+                                                          ",switched=on" if pin is not None else "")]
+    if pin is not None:
+        args += link(pin, name, "enable")
+    return args
+
+
 def button(name, pin, key=None):
     return ["-device", "gpio-button,pin=%d,id=%s%s" % (pin, name, ",key=" + key if key else "")]
 
@@ -78,6 +89,8 @@ def t_deck(air=None, sd=None, **_):
     for name, pin, key in [("ball_up", 3, "up"), ("ball_down", 15, "down"), ("ball_left", 1, "left"),
                            ("ball_right", 2, "right"), ("ball_click", 0, "ret")]:
         args += button(name, pin, key)
+    # BOARD_POWERON (GPIO10) switches the peripherals' supply; the firmware raises it first
+    args += power_domain("periph_pwr", "lcd", "lora", "kbd", "touch", *(["sd"] if sd else []), pin=10)
     return "esp32s3", args
 
 
@@ -212,6 +225,11 @@ class Node:
         """The supply gone (a pulled cable, a dead battery), then back: a power-on reset.
         Flash keeps what was written before the cut."""
         self.brownout(0, seconds, nominal)
+
+    def part_power(self, domain, on=True):
+        """Switch a power domain (boards.power_domain): off, its parts leave their buses;
+        on again, they start from their power-on state."""
+        self.qmp("qom-set", path="/machine/peripheral/" + domain, property="on", value=bool(on))
 
     def stop(self):
         if self.proc.poll() is None:

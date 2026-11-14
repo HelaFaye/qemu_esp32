@@ -1,7 +1,7 @@
 From 15becfde60baa40c7cfc9885092bdd7a7fa23267 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Sat, 14 Nov 2026 01:08:34 +0000
-Subject: [PATCH 09/10] GT911 INT until the report is taken; S3 PHY peak
+Subject: [PATCH 09/11] GT911 INT until the report is taken; S3 PHY peak
  detector done
 
 GT911: in its edge modes (0x804D) INT now signals each report until

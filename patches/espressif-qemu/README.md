@@ -17,6 +17,7 @@ in `BASE`; `build.sh [dir]` fetches it, applies them and builds `qemu-system-xte
 | 0008 | SD cards in SPI mode: CMD9/CMD10 (CSD, CID) answer from the transfer state ACMD41 leaves the card in, and CMD13 answers SPI's R2 (R1 and a status byte), not the SD bus's 16-byte one, so hosts that read the CID to mount a card (ESP-IDF's sdspi) can |
 | 0009 | GT911 INT held until the host takes the report (or while touched, in its level modes), as drivers that poll INT expect; the S3 PHY's peak-detector calibration completes, so Wi-Fi/Bluetooth start-up gets past it |
 | 0010 | The S3's supply and brown-out detector: `vdd-mv` on `/machine/soc/rtc_cntl`, set at run time (`qom-set`); RTC_CNTL's interrupts (on RTC_CORE) and BROWN_OUT register: below `bod-mv` (2440) the detector trips (DET, its interrupt, a brown-out reset with RST_ENA); below `por-mv` (1800) the chip is off, and the supply's return is a power-on reset |
+| 0011 | `power-domain`: board parts on a switched supply (`devices=lcd:touch`), by `qom-set ... on` or by a pin (`switched=on` and a `pin-link` to its `enable` line: a regulator's enable, T-Deck's BOARD_POWERON). Off, its SPI and I2C parts leave their buses (no ACK, nothing on MISO); on again, each is cold-reset |
 
 ## Wiring a board
 

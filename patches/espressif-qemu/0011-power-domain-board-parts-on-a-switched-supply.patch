@@ -1,0 +1,378 @@
+From 856128cb4c19feb629986a9c738d509e558bbafb Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Sat, 14 Nov 2026 14:06:33 +0000
+Subject: [PATCH 11/11] power-domain: board parts on a switched supply
+
+A power-domain lists parts by id (devices=lcd:touch) and is switched by its
+'on' property (qom-set at run time) or, with switched=on, by its 'enable'
+line through a pin-link (a regulator's enable driven by the firmware, as the
+T-Deck's BOARD_POWERON). Off, its SSI and I2C parts drop off their buses (an
+unpowered flag the SSI and I2C cores skip: no ACK, nothing on MISO); on again,
+each is cold-reset, as a part coming up from no supply. Tests: an MCP23017
+that NACKs and comes back with its reset values, one switched by GPIO10, and
+an ILI9341 that reads no ID and comes back asleep.
+---
+ hw/i2c/core.c                          |   3 +
+ hw/misc/meson.build                    |   1 +
+ hw/misc/power_domain.c                 | 161 +++++++++++++++++++++++++
+ hw/ssi/ssi.c                           |   3 +
+ include/hw/i2c/i2c.h                   |   3 +
+ include/hw/ssi/ssi.h                   |   3 +
+ tests/qtest/esp32s3-i2c-devices-test.c |  40 ++++++
+ tests/qtest/esp32s3-spi-devices-test.c |  44 +++++++
+ 8 files changed, 258 insertions(+)
+ create mode 100644 hw/misc/power_domain.c
+
+diff --git a/hw/i2c/core.c b/hw/i2c/core.c
+index 4cf30b2..6e17b4a 100644
+--- a/hw/i2c/core.c
++++ b/hw/i2c/core.c
+@@ -89,6 +89,9 @@ bool i2c_scan_bus(I2CBus *bus, uint8_t address, bool broadcast,
+         I2CSlave *candidate = I2C_SLAVE(qdev);
+         I2CSlaveClass *sc = I2C_SLAVE_GET_CLASS(candidate);
+ 
++        if (candidate->unpowered) {
++            continue;           /* No supply: no ACK */
++        }
+         if (sc->match_and_add(candidate, address, broadcast, current_devs)) {
+             if (!broadcast) {
+                 return true;
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index fd4ff58..cdca259 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -350,3 +350,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ # HPPA devices
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
+ system_ss.add(when: 'CONFIG_SX126X', if_true: files('sx126x.c'))
++system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('power_domain.c'))
+diff --git a/hw/misc/power_domain.c b/hw/misc/power_domain.c
+new file mode 100644
+index 0000000..e0fa428
+--- /dev/null
++++ b/hw/misc/power_domain.c
+@@ -0,0 +1,161 @@
++/*
++ * A power domain: board parts on their own supply (a regulator, a load switch, a GPIO
++ * that powers a module), switched at run time.
++ *
++ *   -device power-domain,id=lcd_pwr,devices=lcd:touch
++ *   qom-set /machine/peripheral/lcd_pwr on false
++ *
++ * Or switched by the firmware, through a pin (a regulator's enable, a load switch):
++ *   -device power-domain,id=periph_pwr,devices=lcd:lora,switched=on
++ *   -device esp32s3.pin-link,pin=10,dev=periph_pwr,line=enable
++ * then it's on while the pin is high (and 'on' is true).
++ *
++ * Off, its SPI and I2C parts drop off their buses (an I2C part doesn't ACK its address,
++ * an SPI part drives nothing and hears nothing). On again, each starts from its power-on
++ * state (a cold reset), as a real part does: a display forgets its setup, a radio its
++ * configuration, and the firmware has to notice.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qom/object.h"
++#include "hw/qdev-core.h"
++#include "hw/qdev-properties.h"
++#include "hw/ssi/ssi.h"
++#include "hw/i2c/i2c.h"
++#include "hw/irq.h"
++
++#define TYPE_POWER_DOMAIN "power-domain"
++OBJECT_DECLARE_SIMPLE_TYPE(PowerDomainState, POWER_DOMAIN)
++
++struct PowerDomainState {
++    DeviceState parent_obj;
++    char *devices;              /* ids, separated by ':' */
++    bool on;                    /* Powered now */
++    bool want;                  /* The 'on' property */
++    bool initially_on;
++    bool switched;              /* Also needs its enable line high */
++    bool enable;
++};
++
++static DeviceState *find(const char *id, Error **errp)
++{
++    g_autofree char *path = g_strdup_printf("/machine/peripheral/%s", id);
++    Object *o = object_resolve_path(path, NULL);
++    if (!o || !object_dynamic_cast(o, TYPE_DEVICE)) {
++        error_setg(errp, "power-domain: no device with id '%s'", id);
++        return NULL;
++    }
++    return DEVICE(o);
++}
++
++static void set_supply(DeviceState *d, bool on)
++{
++    SSIPeripheral *ssi = (SSIPeripheral *)object_dynamic_cast(OBJECT(d), TYPE_SSI_PERIPHERAL);
++    I2CSlave *i2c = (I2CSlave *)object_dynamic_cast(OBJECT(d), TYPE_I2C_SLAVE);
++
++    if (ssi) {
++        ssi->unpowered = !on;
++    }
++    if (i2c) {
++        i2c->unpowered = !on;
++    }
++}
++
++static void apply(PowerDomainState *s, bool on, Error **errp)
++{
++    g_auto(GStrv) ids = g_strsplit(s->devices ? s->devices : "", ":", -1);
++
++    for (int i = 0; ids[i]; i++) {
++        if (!*ids[i]) {
++            continue;
++        }
++        DeviceState *d = find(ids[i], errp);
++        if (!d) {
++            return;
++        }
++        if (on && !s->on) {
++            device_cold_reset(d);          /* Power-on state */
++        }
++        set_supply(d, on);
++    }
++    s->on = on;
++}
++
++static void update(PowerDomainState *s, Error **errp)
++{
++    apply(s, s->want && (!s->switched || s->enable), errp);
++}
++
++static bool get_on(Object *obj, Error **errp)
++{
++    return POWER_DOMAIN(obj)->on;
++}
++
++static void set_on(Object *obj, bool on, Error **errp)
++{
++    PowerDomainState *s = POWER_DOMAIN(obj);
++    s->want = on;
++    update(s, errp);
++}
++
++static void enable_in(void *opaque, int n, int level)
++{
++    PowerDomainState *s = POWER_DOMAIN(opaque);
++    s->enable = level;
++    if (DEVICE(s)->realized) {
++        update(s, &error_warn);
++    }
++}
++
++static void power_domain_realize(DeviceState *dev, Error **errp)
++{
++    PowerDomainState *s = POWER_DOMAIN(dev);
++
++    /* Check the ids now (the parts come first on the command line) */
++    s->on = true;
++    s->want = s->initially_on;
++    update(s, errp);
++}
++
++static void power_domain_init(Object *obj)
++{
++    object_property_add_bool(obj, "on", get_on, set_on);
++    qdev_init_gpio_in_named(DEVICE(obj), enable_in, "enable", 1);
++}
++
++static Property power_domain_properties[] = {
++    DEFINE_PROP_STRING("devices", PowerDomainState, devices),
++    DEFINE_PROP_BOOL("initially-on", PowerDomainState, initially_on, true),
++    DEFINE_PROP_BOOL("switched", PowerDomainState, switched, false),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void power_domain_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = power_domain_realize;
++    dc->user_creatable = true;
++    dc->desc = "Board parts on a switched supply";
++    device_class_set_props(dc, power_domain_properties);
++}
++
++static const TypeInfo power_domain_info = {
++    .name = TYPE_POWER_DOMAIN,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(PowerDomainState),
++    .instance_init = power_domain_init,
++    .class_init = power_domain_class_init,
++};
++
++static void power_domain_register_types(void)
++{
++    type_register_static(&power_domain_info);
++}
++
++type_init(power_domain_register_types)
+diff --git a/hw/ssi/ssi.c b/hw/ssi/ssi.c
+index 3f357e8..9169d49 100644
+--- a/hw/ssi/ssi.c
++++ b/hw/ssi/ssi.c
+@@ -162,6 +162,9 @@ uint32_t ssi_transfer(SSIBus *bus, uint32_t val)
+ 
+     QTAILQ_FOREACH(kid, &b->children, sibling) {
+         SSIPeripheral *p = SSI_PERIPHERAL(kid->child);
++        if (p->unpowered) {
++            continue;           /* Drives nothing on MISO, hears nothing */
++        }
+         r |= p->spc->transfer_raw(p, val);
+     }
+ 
+diff --git a/include/hw/i2c/i2c.h b/include/hw/i2c/i2c.h
+index 2a3abac..3c0e6e0 100644
+--- a/include/hw/i2c/i2c.h
++++ b/include/hw/i2c/i2c.h
+@@ -61,6 +61,9 @@ struct I2CSlave {
+ 
+     /* Remaining fields for internal use by the I2C code.  */
+     uint8_t address;
++
++    /* Its supply is off (a power-domain): it doesn't answer its address */
++    bool unpowered;
+ };
+ 
+ #define TYPE_I2C_BUS "i2c-bus"
+diff --git a/include/hw/ssi/ssi.h b/include/hw/ssi/ssi.h
+index 3cdcbd5..4fce064 100644
+--- a/include/hw/ssi/ssi.h
++++ b/include/hw/ssi/ssi.h
+@@ -67,6 +67,9 @@ struct SSIPeripheral {
+ 
+     /* Chip select index */
+     uint8_t cs_index;
++
++    /* Its supply is off (a power-domain): it takes no part in transfers */
++    bool unpowered;
+ };
+ 
+ extern const VMStateDescription vmstate_ssi_peripheral;
+diff --git a/tests/qtest/esp32s3-i2c-devices-test.c b/tests/qtest/esp32s3-i2c-devices-test.c
+index 45c1981..f298270 100644
+--- a/tests/qtest/esp32s3-i2c-devices-test.c
++++ b/tests/qtest/esp32s3-i2c-devices-test.c
+@@ -239,6 +239,44 @@ static void test_expander(void)
+     qtest_quit(qts);
+ }
+ 
++/* A part on a switched supply: off, it doesn't answer; on again, it's as at power-on */
++static void test_power_domain(void)
++{
++    QTestState *qts = board("-device mcp23017,bus=i2c0,address=0x20,id=exp "
++                            "-device mcp23017,bus=i2c0,address=0x21,id=other "
++                            "-device power-domain,id=pwr,devices=exp");
++    uint8_t r[1];
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00, 0x55 }, 2, NULL, 0));     /* IODIRA */
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00 }, 1, r, 1));
++    g_assert_cmphex(r[0], ==, 0x55);
++
++    qom_set(qts, "/machine/peripheral/pwr", "on", "false");
++    g_assert_false(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00 }, 1, r, 1));             /* NACK */
++    g_assert_true(i2c_xfer(qts, 0x21, (uint8_t[]){ 0x00 }, 1, r, 1));              /* Not its */
++
++    qom_set(qts, "/machine/peripheral/pwr", "on", "true");
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00 }, 1, r, 1));
++    g_assert_cmphex(r[0], ==, 0xFF);                                               /* Reset value */
++    qtest_quit(qts);
++}
++
++/* Switched by the firmware: on while GPIO10 is high (T-Deck's BOARD_POWERON) */
++static void test_power_domain_pin(void)
++{
++    QTestState *qts = board("-device mcp23017,bus=i2c0,address=0x20,id=exp "
++                            "-device power-domain,id=pwr,devices=exp,switched=on "
++                            "-device esp32s3.pin-link,pin=10,dev=pwr,line=enable");
++    uint8_t r[1];
++    g_assert_false(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00 }, 1, r, 1));        /* Pin low: off */
++    qtest_writel(qts, GPIO + 0x24, BIT(10));                                  /* ENABLE_W1TS */
++    qtest_writel(qts, GPIO + 0x08, BIT(10));                                  /* OUT_W1TS */
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00 }, 1, r, 1));
++    g_assert_cmphex(r[0], ==, 0xFF);
++    qtest_writel(qts, GPIO + 0x0C, BIT(10));                                  /* OUT_W1TC */
++    g_assert_false(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00 }, 1, r, 1));
++    qtest_quit(qts);
++}
++
+ static void test_buttons_and_encoder(void)
+ {
+     QTestState *qts = board("-device gpio-button,pin=0,id=boot "
+@@ -275,5 +313,7 @@ int main(int argc, char **argv)
+     qtest_add_func("/esp32s3/i2c-devices/keyboard", test_keyboard);
+     qtest_add_func("/esp32s3/i2c-devices/expander", test_expander);
+     qtest_add_func("/esp32s3/i2c-devices/buttons_and_encoder", test_buttons_and_encoder);
++    qtest_add_func("/esp32s3/i2c-devices/power_domain", test_power_domain);
++    qtest_add_func("/esp32s3/i2c-devices/power_domain_pin", test_power_domain_pin);
+     return g_test_run();
+ }
+diff --git a/tests/qtest/esp32s3-spi-devices-test.c b/tests/qtest/esp32s3-spi-devices-test.c
+index 1cd2661..7ebbbb8 100644
+--- a/tests/qtest/esp32s3-spi-devices-test.c
++++ b/tests/qtest/esp32s3-spi-devices-test.c
+@@ -174,6 +174,49 @@ static void test_lcd(void)
+     qtest_quit(qts);
+ }
+ 
++static void read_id(QTestState *qts, uint8_t *rx)
++{
++    uint8_t cmd = 0x04, tx[4] = { 0 };
++    pin(qts, PIN_LCD_CS, 0);
++    pin(qts, PIN_DC, 0);
++    xfer(qts, &cmd, NULL, 1);
++    pin(qts, PIN_DC, 1);
++    xfer(qts, tx, rx, 4);
++    pin(qts, PIN_LCD_CS, 1);
++}
++
++/* The display on its own supply (power-domain): off, it doesn't answer; on again, it's
++ * asleep and dark until the firmware sets it up again */
++static void test_lcd_power(void)
++{
++    QTestState *qts = qtest_init(BOARD "-device power-domain,id=lcd_pwr,devices=lcd");
++    uint8_t rx[4];
++    int w, h;
++    board_init(qts);
++    lcd_cmd(qts, 0x11, NULL, 0);
++    lcd_cmd(qts, 0x3A, (uint8_t[]){ 0x55 }, 1);
++    lcd_cmd(qts, 0x36, (uint8_t[]){ 0x48 }, 1);
++    lcd_cmd(qts, 0x29, NULL, 0);
++    lcd_cmd(qts, 0x2A, (uint8_t[]){ 0, 10, 0, 10 }, 4);
++    lcd_cmd(qts, 0x2B, (uint8_t[]){ 0, 20, 0, 20 }, 4);
++    lcd_cmd(qts, 0x2C, (uint8_t[]){ 0xFF, 0xFF }, 2);
++    uint8_t *px = screendump(qts, &w, &h);
++    g_assert_cmphex(PX(10, 20), ==, 0xFFFFFF);
++    g_free(px);
++
++    qtest_qom_set_bool(qts, "/machine/peripheral/lcd_pwr", "on", false);
++    read_id(qts, rx);
++    g_assert_cmphex(rx[1] | rx[2] | rx[3], ==, 0);          /* Nothing on MISO */
++
++    qtest_qom_set_bool(qts, "/machine/peripheral/lcd_pwr", "on", true);
++    read_id(qts, rx);
++    g_assert_cmphex(rx[2], ==, 0x93);
++    px = screendump(qts, &w, &h);
++    g_assert_cmphex(PX(10, 20), ==, 0x000000);               /* Asleep, display off */
++    g_free(px);
++    qtest_quit(qts);
++}
++
+ static uint16_t touch_read(QTestState *qts, uint8_t ctrl)
+ {
+     uint8_t tx[3] = { ctrl, 0, 0 }, rx[3];
+@@ -336,5 +379,6 @@ int main(int argc, char **argv)
+     qtest_add_func("/esp32s3/spi-devices/ili9341", test_lcd);
+     qtest_add_func("/esp32s3/spi-devices/xpt2046", test_touch);
+     qtest_add_func("/esp32s3/spi-devices/sd", test_sd);
++    qtest_add_func("/esp32s3/spi-devices/lcd_power", test_lcd_power);
+     return g_test_run();
+ }
+-- 
+2.43.0
+

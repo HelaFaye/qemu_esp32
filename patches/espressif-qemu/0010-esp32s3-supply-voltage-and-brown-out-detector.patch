@@ -1,7 +1,7 @@
 From c629a1cbe727316d694a92de829d67b9a8e023e1 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Sat, 14 Nov 2026 13:51:51 +0000
-Subject: [PATCH 10/10] esp32s3: supply voltage and brown-out detector
+Subject: [PATCH 10/11] esp32s3: supply voltage and brown-out detector
 
 RTC_CNTL gets its interrupt registers (INT_ENA/RAW/ST/CLR, W1TS/W1TC) on
 ETS_RTC_CORE_INTR_SOURCE and the BROWN_OUT register. The supply is a run-time

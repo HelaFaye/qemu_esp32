@@ -1,7 +1,7 @@
 From 2747083b8a96c0c7c624c55b808a8f05c6b3f90f Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Tue, 10 Nov 2026 11:00:10 +0000
-Subject: [PATCH 07/10] esp32c3/esp32s3: USB Serial/JTAG serial side
+Subject: [PATCH 07/11] esp32c3/esp32s3: USB Serial/JTAG serial side
 
 The USB Serial/JTAG was an empty stub, so firmware whose console or
 Arduino Serial is HWCDC (most ESP32-S3 boards: T-Deck, T-Display-S3,
