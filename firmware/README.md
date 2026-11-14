@@ -8,7 +8,8 @@ emulation is wrong or missing something, and the failure says where. These proje
 maintained here; they were picked because they use the peripherals the emulation covers.
 CI: `.github/workflows/firmware.yml`.
 
-`boards.py` is also for your own boards: see the README at the top of the repository.
+`boards.py` is also for your own boards: see [docs/boards.md](../docs/boards.md); the device
+tests and CI: [docs/testing.md](../docs/testing.md).
 
 | Firmware | Board | Scenario |
 |---|---|---|

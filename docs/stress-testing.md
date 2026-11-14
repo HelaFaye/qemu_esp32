@@ -5,8 +5,10 @@ The aim: put a design's firmware and its hardware choices under realistic bad co
 buying parts or wiring a breadboard. Every condition is optional: a board runs clean by
 default, and a test adds the stress it wants.
 
-This is a design and a roadmap. What exists today is marked **(exists)**; the rest is
-planned, in roughly the order below.
+Each section says what exists (marked **exists**, with where it is) and what's next.
+The [summary](#status) at the end lists both. How to use what exists:
+[`faults/`](../faults/README.md) (glitches, power, bus errors), [`radio/`](../radio/README.md)
+(radio environments), [`kicad/`](../kicad/README.md) (boards from KiCad).
 
 ## What an emulator can and can't tell you
 
@@ -112,7 +114,7 @@ today a memory fault can already be aimed at one SRAM region or peripheral regis
 
 ## 5. Boards from KiCad
 
-Today a board is written by hand in `firmware/boards.py`. Planned, in two steps:
+A board can be written by hand in `firmware/boards.py`, or read from the design:
 - **From the schematic or the board file (exists: `kicad/kiboard.py`).** A netlist
   (`kicad-cli sch export netlist`) or a `.kicad_pcb` gives every part and every net;
   kiboard recognizes parts by their value, symbol and footprint (an ILI9341 module, an
@@ -129,14 +131,12 @@ Today a board is written by hand in `firmware/boards.py`. Planned, in two steps:
   the emulation with a chosen firmware image and stress profile, and shows the results
   (serial output, screens, failures) without leaving KiCad.
 
-## Order of work
+## Status
 
-1. Radio: positions, path loss, SNR limits and noise-raising interferers (done); moving
-   nodes, interferers as packets, recording and replay.
-2. Fault injector (done: instruction skip, register and memory faults, resets, campaigns,
-   through the GDB stub); next, faults by time and probability, and multiple faults.
-3. Brown-out, power cuts and parts on their own supply (done).
-4. Bus and pin errors (done for SPI, I2C and GPIO inputs); next UART, SD CRC, stuck
-   lines, and noise tied to events (the radio transmitting).
-5. KiCad design to board (done); then the PCB file's routing to EMI rates; then the
-   plugin.
+| | Exists | Next |
+|---|---|---|
+| Radio | Shared air, hand-set links, positions, path loss, noise, interferers, SNR limits | Moving nodes, interferers as packets, Bluetooth on the same model, record and replay |
+| Bus and pin errors | Bit flips (SPI, I2C), lost ACKs, pin glitches | Stuck lines, UART errors, SD CRC errors, noise tied to events |
+| Supply | Brown-out detector, power cuts, parts on their own supply | Flash power-down in a dip, cuts mid-program/erase, outputs of unpowered parts |
+| Glitches | Skips, register and memory faults at an instruction; campaigns | Faults by time and probability, multiple faults |
+| KiCad | Boards from a `.kicad_pcb` or netlist | Error rates from the routing; a KiCad action plugin |

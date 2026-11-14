@@ -90,5 +90,6 @@ qemu-system-xtensa -machine esp32s3 ... \
 
 ## Tests
 
-`tests/qtest/esp32s3-gpio-test.c`, `esp32s3-gpspi-test.c`, `esp32s3-spi-devices-test.c`, `esp32s3-i2c-test.c`, `esp32s3-i2c-devices-test.c` `esp32s3-sx1262-test.c` (two QEMUs on one air) `esp32s3-usb-serial-jtag-test.c` and `esp32s3-brownout-test.c`; `radio/test_airhub.py` for the hub; CI runs them with
-Espressif's own ESP qtests (`.github/workflows/espressif-qemu.yml`).
+Each patch's qtests are listed, with how to run them, in
+[docs/testing.md](../../docs/testing.md); CI runs them with Espressif's own ESP qtests
+(`.github/workflows/espressif-qemu.yml`).

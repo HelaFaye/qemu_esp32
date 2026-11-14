@@ -13,7 +13,7 @@ access make the fault. Nothing here needs a debugger or a patched QEMU.
     inj.flip_memory(0x3fc90000, bit=7)       # Now
     inj.close()
 
-Fault models (docs/STRESS-TESTING.md, 3 and 4):
+Fault models (docs/stress-testing.md, 3 and 4):
 - skip: an instruction not executed (the classic glitch result: a branch not taken, a
   store not done, a call not made).
 - flip_register_after: an instruction executes and its result (or any register) comes out

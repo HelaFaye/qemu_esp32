@@ -256,7 +256,7 @@ A bit annoying but for hight level c functions it is nice to have a gdb gui.
 
 [[https://raw.githubusercontent.com/Ebiroll/qemu_esp32/master/img/vscode.png]]
 
-![debugger](img/vscode.png)
+![debugger](../../img/vscode.png)
 
 
 

@@ -2,7 +2,7 @@
 
 What a voltage glitch or an EM pulse does to firmware, injected exactly where it's aimed
 in an emulated ESP32: an instruction that doesn't run, a register or a byte of memory
-that comes out wrong, a reset. The plan this is part of: [docs/STRESS-TESTING.md](../docs/STRESS-TESTING.md).
+that comes out wrong, a reset. The plan this is part of: [docs/stress-testing.md](../docs/stress-testing.md).
 
 It works through QEMU's GDB stub (`-gdb tcp::PORT`), so any board in
 `firmware/boards.py` and any firmware can be glitched, with no change to either.

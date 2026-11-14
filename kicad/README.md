@@ -36,5 +36,5 @@ What it does:
 touch carrier, with and without pin names); `test_kiboard.py` checks kiboard reads it
 back to the hand-written board in `firmware/boards.py`, and that QEMU starts with it.
 
-Next (docs/STRESS-TESTING.md, 5): the routing (trace lengths, nets running side by side,
+Next (docs/stress-testing.md, 5): the routing (trace lengths, nets running side by side,
 distance to the antenna) into bus-noise rates per net, and a KiCad action plugin.
