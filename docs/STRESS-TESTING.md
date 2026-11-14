@@ -52,13 +52,17 @@ Next:
 
 ## 2. Electromagnetic interference (EMI)
 
-What noise does to a digital design shows up as errors on its wires. Planned, as
-optional properties on the bus and pin models:
-- **Bus errors.** Bit flips on SPI and I2C transfers at a rate (per bit, or in bursts),
-  I2C NACKs and stuck-low SDA, UART framing and parity errors, SD CRC errors. Drivers'
-  retry and recovery paths run.
-- **Pin glitches.** Short pulses on inputs (a button bouncing, a long wire picking up
-  noise): spurious edge interrupts, wrong reads.
+What noise does to a digital design shows up as errors on its wires:
+- **Bus errors (exists: patch 0012, `boards.bus_noise`, `Node.noise`).** Bit flips on
+  SPI and I2C transfers at a rate per bit (or in bursts), and lost I2C ACKs, on the
+  parts you name, changed at run time and counted. `faults/bus_demo.py` runs ESP-IDF's
+  I2C master driver through it (in CI): every lost ACK comes back as an error, the
+  driver keeps going and is clean again when the noise stops, and wrong data comes back
+  as success (I2C has no CRC: only a check in the firmware catches it). Next: stuck-low
+  SDA (bus recovery), UART framing and parity errors, SD CRC errors.
+- **Pin glitches (exists: patch 0012, `boards.pin_glitch`, `Node.glitch`).** Short
+  pulses pulling an input low (a button bouncing, a long wire picking up noise), at
+  random or on demand: spurious edge interrupts, wrong reads.
 - **Sources with timing.** Noise tied to events: a motor starting, the radio transmitting
   (the S3's own LoRa TX coupling into its SPI bus), a switching regulator's frequency.
 - With a board from KiCad (5), the rates can follow the routing: a long, unshielded line
@@ -129,5 +133,6 @@ Today a board is written by hand in `firmware/boards.py`. Planned, in two steps:
 2. Fault injector (done: instruction skip, register and memory faults, resets, campaigns,
    through the GDB stub); next, faults by time and probability, and multiple faults.
 3. Brown-out, power cuts and parts on their own supply (done).
-4. Bus and pin error models (SPI, I2C, UART, SD, GPIO).
+4. Bus and pin errors (done for SPI, I2C and GPIO inputs); next UART, SD CRC, stuck
+   lines, and noise tied to events (the radio transmitting).
 5. KiCad netlist to board; then the PCB file's routing to EMI rates; then the plugin.

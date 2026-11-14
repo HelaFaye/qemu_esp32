@@ -197,6 +197,13 @@ jobs:
           QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
           QEMU_BIOS: ${{ runner.temp }}/qemu/bios
         run: python3 faults/power_demo.py "$RUNNER_TEMP/power/flash.bin" "$RUNNER_TEMP/power/firmware.elf" "$RUNNER_TEMP/faults/run/power" 12
+      - name: Build the bus-error target (an MCP23017 over ESP-IDF's I2C master)
+        run: faults/bus-target/build.sh "$RUNNER_TEMP/bus"
+      - name: Lost ACKs and bit errors, then clean again
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: python3 faults/bus_demo.py "$RUNNER_TEMP/bus/flash.bin" "$RUNNER_TEMP/faults/run/bus"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

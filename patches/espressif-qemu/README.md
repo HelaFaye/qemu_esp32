@@ -18,6 +18,7 @@ in `BASE`; `build.sh [dir]` fetches it, applies them and builds `qemu-system-xte
 | 0009 | GT911 INT held until the host takes the report (or while touched, in its level modes), as drivers that poll INT expect; the S3 PHY's peak-detector calibration completes, so Wi-Fi/Bluetooth start-up gets past it |
 | 0010 | The S3's supply and brown-out detector: `vdd-mv` on `/machine/soc/rtc_cntl`, set at run time (`qom-set`); RTC_CNTL's interrupts (on RTC_CORE) and BROWN_OUT register: below `bod-mv` (2440) the detector trips (DET, its interrupt, a brown-out reset with RST_ENA); below `por-mv` (1800) the chip is off, and the supply's return is a power-on reset |
 | 0011 | `power-domain`: board parts on a switched supply (`devices=lcd:touch`), by `qom-set ... on` or by a pin (`switched=on` and a `pin-link` to its `enable` line: a regulator's enable, T-Deck's BOARD_POWERON). Off, its SPI and I2C parts leave their buses (no ACK, nothing on MISO); on again, each is cold-reset |
+| 0012 | `bus-noise`: errors on parts' wires (`devices=touch:exp`): bit flips on SPI (MOSI and MISO, while selected) and I2C (both ways) at `ber` per bit, `burst` bits at a time, and lost I2C ACKs at `nack`; rates set at run time, `flips`/`nacks` count what was injected, `seed` repeats it. `pin-glitch`: pulses pulling a pin low (open-drain through a `pin-link`), at random (`rate` a second) or on demand (`pulse`) |
 
 ## Wiring a board
 

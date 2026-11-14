@@ -1,0 +1,630 @@
+From 181d0792ec29583e967356787308be5088ba0151 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Sat, 14 Nov 2026 14:19:39 +0000
+Subject: [PATCH 12/12] bus-noise and pin-glitch: errors on board wires
+
+bus-noise names parts by id and flips bits in their SPI transfers (MOSI and
+MISO, while selected) and I2C bytes (both ways) at a rate per bit, in bursts,
+and loses I2C ACKs at a rate per addressing; rates change at run time (qom-set
+ber/nack), counters (flips, nacks) count what was injected, and a seed makes
+it repeatable. The SSI and I2C cores apply it through a pointer on the part.
+
+pin-glitch pulls a pin low for width-us, wired open-drain through a pin-link:
+at random (rate a second, Poisson) or on demand (pulse), counted.
+
+Tests: an MCP23017 NACKing and returning wrong data at the rate set, clean
+when it's off; ILI9341 ID reads through noise; a glitch that is a falling
+edge interrupt, and about the right number of them at random.
+---
+ hw/i2c/core.c                          |   8 +-
+ hw/misc/bus_noise.c                    | 140 ++++++++++++++++++++++
+ hw/misc/meson.build                    |   2 +-
+ hw/misc/pin_glitch.c                   | 153 +++++++++++++++++++++++++
+ hw/ssi/ssi.c                           |  12 ++
+ include/hw/i2c/i2c.h                   |   3 +
+ include/hw/misc/bus_noise.h            |  48 ++++++++
+ include/hw/ssi/ssi.h                   |   3 +
+ tests/qtest/esp32s3-i2c-devices-test.c |  69 +++++++++++
+ tests/qtest/esp32s3-spi-devices-test.c |  24 ++++
+ 10 files changed, 459 insertions(+), 3 deletions(-)
+ create mode 100644 hw/misc/bus_noise.c
+ create mode 100644 hw/misc/pin_glitch.c
+ create mode 100644 include/hw/misc/bus_noise.h
+
+diff --git a/hw/i2c/core.c b/hw/i2c/core.c
+index 6e17b4a..0753f6e 100644
+--- a/hw/i2c/core.c
++++ b/hw/i2c/core.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "hw/misc/bus_noise.h"
+ #include "hw/i2c/i2c.h"
+ #include "hw/qdev-properties.h"
+ #include "migration/vmstate.h"
+@@ -92,6 +93,9 @@ bool i2c_scan_bus(I2CBus *bus, uint8_t address, bool broadcast,
+         if (candidate->unpowered) {
+             continue;           /* No supply: no ACK */
+         }
++        if (address == candidate->address && bus_noise_nack(candidate->noise)) {
++            continue;           /* Noise: the ACK is lost */
++        }
+         if (sc->match_and_add(candidate, address, broadcast, current_devs)) {
+             if (!broadcast) {
+                 return true;
+@@ -268,7 +272,7 @@ int i2c_send(I2CBus *bus, uint8_t data)
+         sc = I2C_SLAVE_GET_CLASS(s);
+         if (sc->send) {
+             trace_i2c_send(s->address, data);
+-            ret = ret || sc->send(s, data);
++            ret = ret || sc->send(s, bus_noise_bits(s->noise, data, 8));
+         } else {
+             ret = -1;
+         }
+@@ -304,7 +308,7 @@ uint8_t i2c_recv(I2CBus *bus)
+         sc = I2C_SLAVE_GET_CLASS(QLIST_FIRST(&bus->current_devs)->elt);
+         if (sc->recv) {
+             s = QLIST_FIRST(&bus->current_devs)->elt;
+-            data = sc->recv(s);
++            data = bus_noise_bits(s->noise, sc->recv(s), 8);
+             trace_i2c_recv(s->address, data);
+         }
+     }
+diff --git a/hw/misc/bus_noise.c b/hw/misc/bus_noise.c
+new file mode 100644
+index 0000000..70125e4
+--- /dev/null
++++ b/hw/misc/bus_noise.c
+@@ -0,0 +1,140 @@
++/*
++ * Bus noise: errors on the wires of board parts, so drivers' error paths run.
++ *
++ *   -device bus-noise,id=n0,devices=touch:exp,ber=1e-4,nack=0.01,burst=1,seed=7
++ *   qom-set /machine/peripheral/n0 ber 1e-3        (at run time; 0 turns it off)
++ *   qom-get /machine/peripheral/n0 flips           (errors injected so far)
++ *
++ * SPI parts: each bit to the part (MOSI) and from it (MISO) flips with probability ber,
++ * while it's selected. I2C parts: each bit written to it and read from it likewise, and
++ * each time it's addressed, its ACK is lost with probability nack (the host sees a
++ * NACK). burst: bits flipped per error, consecutive (a noise burst). seed: the same
++ * seed, the same errors at the same transfers.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qom/object.h"
++#include "hw/qdev-core.h"
++#include "hw/qdev-properties.h"
++#include "hw/ssi/ssi.h"
++#include "hw/i2c/i2c.h"
++#include "hw/misc/bus_noise.h"
++
++#define TYPE_BUS_NOISE "bus-noise"
++OBJECT_DECLARE_SIMPLE_TYPE(BusNoiseState, BUS_NOISE)
++
++struct BusNoiseState {
++    DeviceState parent_obj;
++    char *devices;
++    uint32_t seed;
++    BusNoise noise;
++};
++
++static char *get_rate(double v)
++{
++    return g_strdup_printf("%g", v);
++}
++
++static bool parse_rate(const char *str, double *out, Error **errp)
++{
++    char *end;
++    double v = g_ascii_strtod(str, &end);
++    if (end == str || *end || v < 0 || v > 1) {
++        error_setg(errp, "bus-noise: a probability from 0 to 1, not '%s'", str);
++        return false;
++    }
++    *out = v;
++    return true;
++}
++
++static char *get_ber(Object *obj, Error **errp)
++{
++    return get_rate(BUS_NOISE(obj)->noise.ber);
++}
++
++static void set_ber(Object *obj, const char *str, Error **errp)
++{
++    parse_rate(str, &BUS_NOISE(obj)->noise.ber, errp);
++}
++
++static char *get_nack(Object *obj, Error **errp)
++{
++    return get_rate(BUS_NOISE(obj)->noise.nack);
++}
++
++static void set_nack(Object *obj, const char *str, Error **errp)
++{
++    parse_rate(str, &BUS_NOISE(obj)->noise.nack, errp);
++}
++
++static void bus_noise_realize(DeviceState *dev, Error **errp)
++{
++    BusNoiseState *s = BUS_NOISE(dev);
++    g_auto(GStrv) ids = g_strsplit(s->devices ? s->devices : "", ":", -1);
++
++    s->noise.rng = g_rand_new_with_seed(s->seed);
++    for (int i = 0; ids[i]; i++) {
++        if (!*ids[i]) {
++            continue;
++        }
++        g_autofree char *path = g_strdup_printf("/machine/peripheral/%s", ids[i]);
++        Object *o = object_resolve_path(path, NULL);
++        SSIPeripheral *ssi = o ? (SSIPeripheral *)object_dynamic_cast(o, TYPE_SSI_PERIPHERAL) : NULL;
++        I2CSlave *i2c = o ? (I2CSlave *)object_dynamic_cast(o, TYPE_I2C_SLAVE) : NULL;
++        if (ssi) {
++            ssi->noise = &s->noise;
++        } else if (i2c) {
++            i2c->noise = &s->noise;
++        } else {
++            error_setg(errp, "bus-noise: '%s' isn't an SPI or I2C part with that id", ids[i]);
++            return;
++        }
++    }
++}
++
++static void bus_noise_init(Object *obj)
++{
++    BusNoiseState *s = BUS_NOISE(obj);
++
++    object_property_add_str(obj, "ber", get_ber, set_ber);
++    object_property_add_str(obj, "nack", get_nack, set_nack);
++    object_property_add_uint64_ptr(obj, "flips", &s->noise.flips, OBJ_PROP_FLAG_READ);
++    object_property_add_uint64_ptr(obj, "nacks", &s->noise.nacks, OBJ_PROP_FLAG_READ);
++}
++
++static Property bus_noise_properties[] = {
++    DEFINE_PROP_STRING("devices", BusNoiseState, devices),
++    DEFINE_PROP_UINT32("burst", BusNoiseState, noise.burst, 1),
++    DEFINE_PROP_UINT32("seed", BusNoiseState, seed, 1),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void bus_noise_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = bus_noise_realize;
++    dc->user_creatable = true;
++    dc->desc = "Bit errors and lost ACKs on board parts' wires";
++    device_class_set_props(dc, bus_noise_properties);
++}
++
++static const TypeInfo bus_noise_info = {
++    .name = TYPE_BUS_NOISE,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(BusNoiseState),
++    .instance_init = bus_noise_init,
++    .class_init = bus_noise_class_init,
++};
++
++static void bus_noise_register_types(void)
++{
++    type_register_static(&bus_noise_info);
++}
++
++type_init(bus_noise_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index cdca259..0e94322 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -350,4 +350,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ # HPPA devices
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
+ system_ss.add(when: 'CONFIG_SX126X', if_true: files('sx126x.c'))
+-system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('power_domain.c'))
++system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('power_domain.c', 'bus_noise.c', 'pin_glitch.c'))
+diff --git a/hw/misc/pin_glitch.c b/hw/misc/pin_glitch.c
+new file mode 100644
+index 0000000..3f989e1
+--- /dev/null
++++ b/hw/misc/pin_glitch.c
+@@ -0,0 +1,153 @@
++/*
++ * Glitches on a pin: short pulses that pull an input low, as noise on a long wire, a
++ * bouncing contact or ESD would, to exercise spurious edge interrupts and wrong reads.
++ *
++ *   -device pin-glitch,id=g0,rate=5,width-us=2,seed=3
++ *   -device esp32s3.pin-link,pin=16,dev=g0,line=out,dir=out,open-drain=on,pull=up
++ *   qom-set /machine/peripheral/g0 rate 50          (pulses a second, at random; 0: none)
++ *   qom-set /machine/peripheral/g0 pulse true       (one, now)
++ *   qom-get /machine/peripheral/g0 count
++ *
++ * Wired open-drain, a pulse pulls the line low over whatever else drives it (a pull-up,
++ * a button, a part's INT) and lets it go after width-us.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include <math.h>
++#include "qapi/error.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++#include "hw/qdev-core.h"
++#include "hw/qdev-properties.h"
++#include "hw/irq.h"
++
++#define TYPE_PIN_GLITCH "pin-glitch"
++OBJECT_DECLARE_SIMPLE_TYPE(PinGlitchState, PIN_GLITCH)
++
++struct PinGlitchState {
++    DeviceState parent_obj;
++    qemu_irq out;
++    QEMUTimer *next;
++    QEMUTimer *release;
++    GRand *rng;
++    double rate;
++    uint32_t width_us;
++    uint32_t seed;
++    uint64_t count;
++};
++
++static void schedule(PinGlitchState *s)
++{
++    timer_del(s->next);
++    if (s->rate > 0) {
++        /* Poisson arrivals: exponential gaps */
++        double gap = -log(1.0 - g_rand_double(s->rng)) / s->rate;
++        timer_mod(s->next, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + (int64_t)(gap * 1e9));
++    }
++}
++
++static void pulse(PinGlitchState *s)
++{
++    qemu_set_irq(s->out, 0);
++    s->count++;
++    timer_mod(s->release, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + (int64_t)s->width_us * 1000);
++}
++
++static void on_next(void *opaque)
++{
++    PinGlitchState *s = opaque;
++    pulse(s);
++    schedule(s);
++}
++
++static void on_release(void *opaque)
++{
++    qemu_set_irq(((PinGlitchState *)opaque)->out, 1);
++}
++
++static char *get_rate(Object *obj, Error **errp)
++{
++    return g_strdup_printf("%g", PIN_GLITCH(obj)->rate);
++}
++
++static void set_rate(Object *obj, const char *str, Error **errp)
++{
++    PinGlitchState *s = PIN_GLITCH(obj);
++    char *end;
++    double v = g_ascii_strtod(str, &end);
++    if (end == str || *end || v < 0) {
++        error_setg(errp, "pin-glitch: pulses a second (0 or more), not '%s'", str);
++        return;
++    }
++    s->rate = v;
++    if (DEVICE(s)->realized) {
++        schedule(s);
++    }
++}
++
++static bool get_pulse(Object *obj, Error **errp)
++{
++    return false;
++}
++
++static void set_pulse(Object *obj, bool v, Error **errp)
++{
++    if (v) {
++        pulse(PIN_GLITCH(obj));
++    }
++}
++
++static void pin_glitch_realize(DeviceState *dev, Error **errp)
++{
++    PinGlitchState *s = PIN_GLITCH(dev);
++    s->rng = g_rand_new_with_seed(s->seed);
++    qemu_set_irq(s->out, 1);                /* Released */
++    schedule(s);
++}
++
++static void pin_glitch_init(Object *obj)
++{
++    PinGlitchState *s = PIN_GLITCH(obj);
++
++    qdev_init_gpio_out_named(DEVICE(obj), &s->out, "out", 1);
++    s->next = timer_new_ns(QEMU_CLOCK_VIRTUAL, on_next, s);
++    s->release = timer_new_ns(QEMU_CLOCK_VIRTUAL, on_release, s);
++    object_property_add_str(obj, "rate", get_rate, set_rate);
++    object_property_add_bool(obj, "pulse", get_pulse, set_pulse);
++    object_property_add_uint64_ptr(obj, "count", &s->count, OBJ_PROP_FLAG_READ);
++}
++
++static Property pin_glitch_properties[] = {
++    DEFINE_PROP_UINT32("width-us", PinGlitchState, width_us, 1),
++    DEFINE_PROP_UINT32("seed", PinGlitchState, seed, 1),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void pin_glitch_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = pin_glitch_realize;
++    dc->user_creatable = true;
++    dc->desc = "Short pulses pulling a pin low (noise, bounce)";
++    device_class_set_props(dc, pin_glitch_properties);
++}
++
++static const TypeInfo pin_glitch_info = {
++    .name = TYPE_PIN_GLITCH,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(PinGlitchState),
++    .instance_init = pin_glitch_init,
++    .class_init = pin_glitch_class_init,
++};
++
++static void pin_glitch_register_types(void)
++{
++    type_register_static(&pin_glitch_info);
++}
++
++type_init(pin_glitch_register_types)
+diff --git a/hw/ssi/ssi.c b/hw/ssi/ssi.c
+index 9169d49..ab50912 100644
+--- a/hw/ssi/ssi.c
++++ b/hw/ssi/ssi.c
+@@ -13,6 +13,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "hw/misc/bus_noise.h"
+ #include "hw/qdev-properties.h"
+ #include "hw/ssi/ssi.h"
+ #include "migration/vmstate.h"
+@@ -165,6 +166,17 @@ uint32_t ssi_transfer(SSIBus *bus, uint32_t val)
+         if (p->unpowered) {
+             continue;           /* Drives nothing on MISO, hears nothing */
+         }
++        if (p->noise) {
++            SSIPeripheralClass *ssc = p->spc;
++            bool selected = ssc->transfer_raw != ssi_transfer_raw_default ||
++                            ssc->cs_polarity == SSI_CS_NONE ||
++                            (p->cs == (ssc->cs_polarity == SSI_CS_HIGH));
++            if (selected) {
++                /* Errors on MOSI going in, on MISO coming out (a byte a word) */
++                r |= bus_noise_bits(p->noise, p->spc->transfer_raw(p, bus_noise_bits(p->noise, val, 8)), 8);
++                continue;
++            }
++        }
+         r |= p->spc->transfer_raw(p, val);
+     }
+ 
+diff --git a/include/hw/i2c/i2c.h b/include/hw/i2c/i2c.h
+index 3c0e6e0..f8bdaa7 100644
+--- a/include/hw/i2c/i2c.h
++++ b/include/hw/i2c/i2c.h
+@@ -64,6 +64,9 @@ struct I2CSlave {
+ 
+     /* Its supply is off (a power-domain): it doesn't answer its address */
+     bool unpowered;
++
++    /* Errors on its wires (a bus-noise), or NULL */
++    struct BusNoise *noise;
+ };
+ 
+ #define TYPE_I2C_BUS "i2c-bus"
+diff --git a/include/hw/misc/bus_noise.h b/include/hw/misc/bus_noise.h
+new file mode 100644
+index 0000000..d035dda
+--- /dev/null
++++ b/include/hw/misc/bus_noise.h
+@@ -0,0 +1,48 @@
++/*
++ * Bus noise: errors on a board part's wires (bit flips on SPI and I2C transfers, I2C
++ * NACKs), set by a bus-noise device (hw/misc/bus_noise.c) and applied by the SSI and
++ * I2C cores to the parts it names.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++#ifndef HW_MISC_BUS_NOISE_H
++#define HW_MISC_BUS_NOISE_H
++
++typedef struct BusNoise {
++    double ber;             /* Per bit, each direction */
++    double nack;            /* Per I2C address phase */
++    uint32_t burst;         /* Bits flipped per error (consecutive) */
++    GRand *rng;
++    uint64_t flips;         /* Errors injected (events, not bits) */
++    uint64_t nacks;
++} BusNoise;
++
++/* bits of val (LSB first) through the noise */
++static inline uint32_t bus_noise_bits(BusNoise *n, uint32_t val, int bits)
++{
++    if (!n || n->ber <= 0) {
++        return val;
++    }
++    for (int i = 0; i < bits; i++) {
++        if (g_rand_double(n->rng) < n->ber) {
++            for (uint32_t k = 0; k < MAX(n->burst, 1) && i < bits; k++, i++) {
++                val ^= 1u << i;
++            }
++            n->flips++;
++        }
++    }
++    return val;
++}
++
++static inline bool bus_noise_nack(BusNoise *n)
++{
++    if (n && n->nack > 0 && g_rand_double(n->rng) < n->nack) {
++        n->nacks++;
++        return true;
++    }
++    return false;
++}
++
++#endif
+diff --git a/include/hw/ssi/ssi.h b/include/hw/ssi/ssi.h
+index 4fce064..b902983 100644
+--- a/include/hw/ssi/ssi.h
++++ b/include/hw/ssi/ssi.h
+@@ -70,6 +70,9 @@ struct SSIPeripheral {
+ 
+     /* Its supply is off (a power-domain): it takes no part in transfers */
+     bool unpowered;
++
++    /* Errors on its wires (a bus-noise), or NULL */
++    struct BusNoise *noise;
+ };
+ 
+ extern const VMStateDescription vmstate_ssi_peripheral;
+diff --git a/tests/qtest/esp32s3-i2c-devices-test.c b/tests/qtest/esp32s3-i2c-devices-test.c
+index f298270..7d839be 100644
+--- a/tests/qtest/esp32s3-i2c-devices-test.c
++++ b/tests/qtest/esp32s3-i2c-devices-test.c
+@@ -277,6 +277,73 @@ static void test_power_domain_pin(void)
+     qtest_quit(qts);
+ }
+ 
++static uint64_t qom_get_u64(QTestState *qts, const char *path, const char *prop)
++{
++    QDict *r = qtest_qmp(qts, "{'execute': 'qom-get', 'arguments': {'path': %s, 'property': %s}}",
++                         path, prop);
++    uint64_t v = qdict_get_int(r, "return");
++    qobject_unref(r);
++    return v;
++}
++
++/* Noise on a part's wires: lost ACKs, then bit errors at a rate; off again, all clean */
++static void test_bus_noise(void)
++{
++    QTestState *qts = board("-device mcp23017,bus=i2c0,address=0x20,id=exp "
++                            "-device bus-noise,id=noise,devices=exp,nack=1");
++    uint8_t r[1];
++    g_assert_false(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00 }, 1, r, 1));
++    g_assert_cmpint(qom_get_u64(qts, "/machine/peripheral/noise", "nacks"), ==, 1);
++    qom_set(qts, "/machine/peripheral/noise", "nack", "\"0\"");
++    g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00 }, 1, r, 1));
++    g_assert_cmphex(r[0], ==, 0xFF);                                   /* IODIRA */
++
++    qom_set(qts, "/machine/peripheral/noise", "ber", "\"0.02\"");
++    int wrong = 0;
++    for (int i = 0; i < 100; i++) {
++        i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00 }, 1, r, 1);
++        wrong += r[0] != 0xFF;
++    }
++    /* 16 bits a read at 2%: about 27 of 100 reads hit */
++    g_assert_cmpint(wrong, >, 5);
++    g_assert_cmpint(wrong, <, 60);
++    g_assert_cmpint(qom_get_u64(qts, "/machine/peripheral/noise", "flips"), >=, wrong);
++
++    qom_set(qts, "/machine/peripheral/noise", "ber", "\"0\"");
++    for (int i = 0; i < 20; i++) {
++        g_assert_true(i2c_xfer(qts, 0x20, (uint8_t[]){ 0x00 }, 1, r, 1));
++        g_assert_cmphex(r[0], ==, 0xFF);
++    }
++    qtest_quit(qts);
++}
++
++/* Glitches on an input with a pull-up: each is a falling edge, an interrupt */
++static void test_pin_glitch(void)
++{
++    QTestState *qts = board("-device pin-glitch,id=g,width-us=2 "
++                            "-device esp32s3.pin-link,pin=16,dev=g,line=out,dir=out,open-drain=on,pull=up");
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(16), ==, BIT(16));
++    qtest_writel(qts, PIN(16), (2 << 7) | BIT(13));                  /* Falling edge, to the CPU */
++    qtest_writel(qts, STATUS_W1TC, BIT(16));
++
++    qom_set(qts, "/machine/peripheral/g", "pulse", "true");
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(16), ==, 0);          /* Low now */
++    qtest_clock_step(qts, 3000);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(16), ==, BIT(16));    /* Released */
++    g_assert_cmphex(qtest_readl(qts, STATUS) & BIT(16), ==, BIT(16));
++    qtest_writel(qts, STATUS_W1TC, BIT(16));
++
++    /* At random: 1000 a second for 100 ms, about 100 of them */
++    qom_set(qts, "/machine/peripheral/g", "rate", "\"1000\"");
++    qtest_clock_step(qts, 100 * 1000 * 1000);
++    qom_set(qts, "/machine/peripheral/g", "rate", "\"0\"");
++    uint64_t n = qom_get_u64(qts, "/machine/peripheral/g", "count");
++    g_assert_cmpint(n, >, 60);
++    g_assert_cmpint(n, <, 150);
++    g_assert_cmphex(qtest_readl(qts, STATUS) & BIT(16), ==, BIT(16));
++    qtest_quit(qts);
++}
++
+ static void test_buttons_and_encoder(void)
+ {
+     QTestState *qts = board("-device gpio-button,pin=0,id=boot "
+@@ -315,5 +382,7 @@ int main(int argc, char **argv)
+     qtest_add_func("/esp32s3/i2c-devices/buttons_and_encoder", test_buttons_and_encoder);
+     qtest_add_func("/esp32s3/i2c-devices/power_domain", test_power_domain);
+     qtest_add_func("/esp32s3/i2c-devices/power_domain_pin", test_power_domain_pin);
++    qtest_add_func("/esp32s3/i2c-devices/bus_noise", test_bus_noise);
++    qtest_add_func("/esp32s3/i2c-devices/pin_glitch", test_pin_glitch);
+     return g_test_run();
+ }
+diff --git a/tests/qtest/esp32s3-spi-devices-test.c b/tests/qtest/esp32s3-spi-devices-test.c
+index 7ebbbb8..9a43203 100644
+--- a/tests/qtest/esp32s3-spi-devices-test.c
++++ b/tests/qtest/esp32s3-spi-devices-test.c
+@@ -217,6 +217,29 @@ static void test_lcd_power(void)
+     qtest_quit(qts);
+ }
+ 
++/* Noise on the display's wires: ID reads come back wrong at a rate, the touch (not
++ * named) is untouched; off, every read is right */
++static void test_lcd_noise(void)
++{
++    QTestState *qts = qtest_init(BOARD "-device bus-noise,id=noise,devices=lcd,ber=0.02,seed=5");
++    uint8_t rx[4];
++    int wrong = 0;
++    board_init(qts);
++    for (int i = 0; i < 100; i++) {
++        read_id(qts, rx);
++        wrong += rx[1] != 0x00 || rx[2] != 0x93 || rx[3] != 0x41;
++    }
++    g_assert_cmpint(wrong, >, 10);
++    g_assert_cmpint(wrong, <, 100);
++    qobject_unref(qtest_qmp(qts, "{'execute': 'qom-set', 'arguments': {'path': "
++                                 "'/machine/peripheral/noise', 'property': 'ber', 'value': '0'}}"));
++    for (int i = 0; i < 20; i++) {
++        read_id(qts, rx);
++        g_assert_cmphex(rx[2], ==, 0x93);
++    }
++    qtest_quit(qts);
++}
++
+ static uint16_t touch_read(QTestState *qts, uint8_t ctrl)
+ {
+     uint8_t tx[3] = { ctrl, 0, 0 }, rx[3];
+@@ -380,5 +403,6 @@ int main(int argc, char **argv)
+     qtest_add_func("/esp32s3/spi-devices/xpt2046", test_touch);
+     qtest_add_func("/esp32s3/spi-devices/sd", test_sd);
+     qtest_add_func("/esp32s3/spi-devices/lcd_power", test_lcd_power);
++    qtest_add_func("/esp32s3/spi-devices/lcd_noise", test_lcd_noise);
+     return g_test_run();
+ }
+-- 
+2.43.0
+

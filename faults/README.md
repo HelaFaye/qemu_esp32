@@ -49,6 +49,30 @@ with the right reset reason, NVS opening, and nothing it reported committed lost
 faults/power-target/build.sh out && faults/power_demo.py out/flash.bin out/firmware.elf out/run 12
 ```
 
+## Bus errors and pin glitches (`boards`, patch 0012)
+
+```python
+extra = ["-device", "mcp23017,bus=i2c0,address=0x20,id=exp"] + \
+        bus_noise("noise", "exp", ber=1e-3, nack=0.01, seed=3) + \
+        pin_glitch("g", pin=16, rate=5)                    # On an input with a pull-up
+node = boot("esp32s3-devkitc", "flash.bin", "run", extra=extra)
+node.noise("noise", ber=0, nack=0.05)    # Change the rates; returns {flips, nacks} so far
+node.glitch("g", pulse=True)             # One pulse now
+```
+
+`bus_demo.py` with `bus-target/` (an MCP23017 written and read back with ESP-IDF's I2C
+master driver) runs clean, noisy (5% lost ACKs, 0.2% bit errors) and clean again, and
+checks the driver reports every error, keeps going, and recovers:
+
+```
+clean:      ops 7000, ok 7000
+noisy:      ops 9400, ok 7980, nack 921, mismatch 499   (941 lost ACKs, 548 bit errors injected)
+recovered:  ops 6800, ok 6800
+```
+
+ESP-IDF 5's `i2c_master` reports a lost ACK as `ESP_ERR_INVALID_STATE`; a flipped data
+bit comes back as `ESP_OK` with the wrong value.
+
 ## Campaigns (`campaign.py`)
 
 Every instruction of the functions you name, one fault at a time, each outcome taken from

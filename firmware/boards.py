@@ -64,6 +64,21 @@ def power_domain(name, *devices, pin=None):
     return args
 
 
+def bus_noise(name, *devices, ber=0.0, nack=0.0, burst=1, seed=1):
+    """Errors on parts' wires (patch 0012), after them on the command line: bit flips on
+    SPI and I2C at ber (per bit, each way), lost I2C ACKs at nack (per addressing),
+    burst bits per error. Change at run time with Node.noise(name, ber=, nack=)."""
+    return ["-device", "bus-noise,id=%s,devices=%s,ber=%g,nack=%g,burst=%d,seed=%d" %
+            (name, ":".join(devices), ber, nack, burst, seed)]
+
+
+def pin_glitch(name, pin, rate=0.0, width_us=1, seed=1):
+    """Short pulses pulling an input low (patch 0012): noise, bounce. rate: a second, at
+    random; Node.glitch(name, rate=) to change it, Node.glitch(name, pulse=True) for one."""
+    return ["-device", "pin-glitch,id=%s,rate=%g,width-us=%d,seed=%d" % (name, rate, width_us, seed)] + \
+        link(pin, name, "out", out=True, open_drain=True, pull="up")
+
+
 def button(name, pin, key=None):
     return ["-device", "gpio-button,pin=%d,id=%s%s" % (pin, name, ",key=" + key if key else "")]
 
@@ -230,6 +245,24 @@ class Node:
         """Switch a power domain (boards.power_domain): off, its parts leave their buses;
         on again, they start from their power-on state."""
         self.qmp("qom-set", path="/machine/peripheral/" + domain, property="on", value=bool(on))
+
+    def noise(self, name, ber=None, nack=None):
+        """Set a bus_noise's rates; returns its counters (errors injected so far)."""
+        path = "/machine/peripheral/" + name
+        if ber is not None:
+            self.qmp("qom-set", path=path, property="ber", value="%g" % ber)
+        if nack is not None:
+            self.qmp("qom-set", path=path, property="nack", value="%g" % nack)
+        return {k: self.qmp("qom-get", path=path, property=k) for k in ("flips", "nacks")}
+
+    def glitch(self, name, rate=None, pulse=False):
+        """Set a pin_glitch's rate, or fire one pulse now; returns how many so far."""
+        path = "/machine/peripheral/" + name
+        if rate is not None:
+            self.qmp("qom-set", path=path, property="rate", value="%g" % rate)
+        if pulse:
+            self.qmp("qom-set", path=path, property="pulse", value=True)
+        return self.qmp("qom-get", path=path, property="count")
 
     def stop(self):
         if self.proc.poll() is None:

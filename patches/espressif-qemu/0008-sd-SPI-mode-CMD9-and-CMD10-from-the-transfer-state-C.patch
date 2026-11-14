@@ -1,7 +1,7 @@
 From f8b1b84bf13327a4d710bb290e63ab9c598f06b6 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 10 Nov 2026 11:18:29 +0000
-Subject: [PATCH 08/11] sd: SPI mode: CMD9 and CMD10 from the transfer state;
+Subject: [PATCH 08/12] sd: SPI mode: CMD9 and CMD10 from the transfer state;
  CMD13 answers R2
 
 In SPI mode ACMD41 (and CMD1) leave the card in the transfer state, as
