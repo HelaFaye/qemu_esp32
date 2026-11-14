@@ -1,7 +1,7 @@
 From 2514bb12ce870c76188b851ff30ff9709ad50c75 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Tue, 10 Nov 2026 10:36:43 +0000
-Subject: [PATCH 5/8] Board devices: OLEDs, touch, T-Deck keyboard, MCP23017,
+Subject: [PATCH 5/9] Board devices: OLEDs, touch, T-Deck keyboard, MCP23017,
  buttons
 
 ssd1306/sh1106: I2C OLEDs (128x64, 128x32) as screens: control

@@ -92,6 +92,39 @@ jobs:
           name: meshcore-bare-logs
           path: ${{ runner.temp }}/mcb/*run*
 
+  gbagate:
+    needs: qemu
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v5.5.6          # the ESP-IDF gbagate's own CI builds with
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq libglib2.0-0 libpixman-1-0 libgcrypt20 libslirp0 mtools >/dev/null
+      - uses: actions/download-artifact@v4
+        with:
+          name: qemu-xtensa
+          path: ${{ runner.temp }}/qemu
+      - name: Build the firmware (touch carrier and devkit)
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh" >/dev/null
+          firmware/gbagate/build.sh "$RUNNER_TEMP/gbagate"
+      - name: gbagate's checks of its boards
+        shell: bash
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: |
+          chmod +x "$QEMU_XTENSA"
+          firmware/gbagate/check.sh "$RUNNER_TEMP/gbagate"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gbagate-run
+          path: ${{ runner.temp }}/gbagate/run
+
   t-deck:
     needs: qemu
     runs-on: ubuntu-24.04
