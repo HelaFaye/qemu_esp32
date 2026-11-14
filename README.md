@@ -1,68 +1,108 @@
-# qemu_esp32 (HelaFaye's fork)
+# qemu_esp32: ESP32 boards in QEMU, for firmware developers
 
-Emulated ESP32 boards accurate enough to test real firmware on: the chip's peripherals
-modeled from Espressif's register definitions and drivers, the parts boards wire to them
-(displays, touch, SD cards, LoRa radios, buttons, I/O expanders, keyboards), and the radio
-links between boards (Bluetooth, LoRa). Each model has QTest coverage against the way
-ESP-IDF and Arduino drive it, and real firmware is built and booted in CI.
+Run your ESP32 firmware, unmodified, on an emulated board: the chip's peripherals, the
+parts you wire to them (displays, touch, SD cards, LoRa radios, buttons, I/O expanders,
+keyboards, OLEDs) and the radio links between boards (Bluetooth, LoRa). Test drivers,
+UIs and protocols before you have hardware; script what a person would do (press a
+button, touch the screen, type, carry a node out of range) and check what the firmware
+does (its serial output, what's on its screen, what it sent over the air); and run it
+all in CI.
 
-This fork adds four things to Ebiroll's tools and examples (kept below):
+Everything is modeled from the chip's register definitions and the drivers that use
+them (ESP-IDF, Arduino), and each model has tests that drive it the way those drivers
+do. Real projects' firmware runs on it as test cases, each confirming the features it
+exercises (see [Test cases](#test-cases-real-firmware)).
+
+Where this is going: stress-testing a design before it exists as hardware, with radio
+environments, interference and fault injection, and boards taken from your KiCad
+design: [docs/STRESS-TESTING.md](docs/STRESS-TESTING.md).
+
+## What's here
 
 | Where | What |
 |---|---|
-| [`patches/espressif-qemu/`](patches/espressif-qemu) | A patch series for [Espressif's QEMU](https://github.com/espressif/qemu) (pinned in `BASE`; `build.sh` fetches, applies, builds): ESP32-S3 GPIO, GP-SPI2/3, I2C, USB Serial/JTAG; SPI displays, touch, SD; I2C OLEDs, touch, keyboards, expanders; buttons and encoders; SX126x LoRa |
-| [`radio/`](radio) | `airhub.py`: the air between LoRa radios in different QEMUs, with per-link RSSI, SNR, loss and corruption |
-| [`bluetooth/`](bluetooth) | Virtual Bluetooth: the firmware's own host stack over HCI to a virtual controller (Bumble) on a modeled radio link |
-| [`firmware/`](firmware) | Real firmware on emulated boards: `boards.py` (boards as QEMU command lines), per-project builds at pinned commits and scenarios checked by serial output |
+| [`patches/espressif-qemu/`](patches/espressif-qemu) | The emulation: a patch series for [Espressif's QEMU](https://github.com/espressif/qemu) (pinned in `BASE`; `build.sh` fetches, applies and builds). Its README documents every device, its properties and wiring |
+| [`firmware/boards.py`](firmware/boards.py) | Boards as Python: a function per board returns its QEMU devices and wiring; `boot()` starts one and gives you its serial log, its screens (`screendump`) and its inputs (`qmp`) |
+| [`radio/`](radio) | The air between LoRa radios in different QEMUs (`airhub.py`): per-link signal strength, loss and corruption |
+| [`bluetooth/`](bluetooth) | Virtual Bluetooth: your firmware's own host stack (Bluedroid, NimBLE) over HCI to a virtual controller, with virtual phones and controllers as peers |
+| [`firmware/`](firmware) | Test cases: real firmware built from its repository and checked on its board |
 
 ## Quick start
 
 ```sh
 patches/espressif-qemu/build.sh ~/esp-qemu        # Espressif's QEMU + these patches
-~/esp-qemu/build/qemu-system-xtensa -machine esp32s3 -nographic \
-  -drive file=flash.bin,if=mtd,format=raw \
+export QEMU_XTENSA=~/esp-qemu/build/qemu-system-xtensa
+```
+
+Run your image (merged, padded to the flash size: `esptool merge-bin --pad-to-size 16MB`)
+on a board described in `firmware/boards.py`:
+
+```python
+from boards import boot
+node = boot("t-deck", "flash.bin", "/tmp/run")
+node.wait_for(r"Start Radio success", 60)              # Serial (UART0 and USB)
+node.qmp("qom-set", path="/machine/peripheral/kbd", property="keys", value="hello")
+w, h, rgb = node.screendump("/tmp/run/screen.ppm")     # What the display shows
+```
+
+Or straight from the command line, wiring parts to pins yourself:
+
+```sh
+$QEMU_XTENSA -machine esp32s3 -display none -drive file=flash.bin,if=mtd,format=raw \
+  -serial stdio \
   -device ili9341,bus=spi2,id=lcd \
   -device esp32s3.pin-link,pin=10,dev=lcd,line=ssi-gpio-cs,pull=up \
   -device esp32s3.pin-link,pin=9,dev=lcd,line=dc
 ```
 
-A flash image is the whole chip (4, 8 or 16 MB; `esptool merge-bin --pad-to-size`).
-Serial ports in order: `-serial` UART0, UART1, UART2, then (S3) the USB Serial/JTAG, which
-is plugged in when given. `-device help` lists the models; their properties and wiring are
-in [`patches/espressif-qemu/README.md`](patches/espressif-qemu/README.md).
+Serial ports in order: `-serial` UART0, UART1, UART2, then (S3) the USB Serial/JTAG, plugged
+in when given. A device on an SPI bus is selected by its chip-select pin, so hardware and
+software chip selects both work.
+
+## Your own board
+
+Describe it as a function in `firmware/boards.py`, from your schematic: each part on its
+bus (`bus=spi2`, `bus=i2c0` and its address), each of its lines to the pin it's on
+(`link(pin, dev, line)`), pull-ups the board has (`pull="up"`), open-drain lines, buttons.
+The devices and their lines are listed in
+[`patches/espressif-qemu/README.md`](patches/espressif-qemu/README.md); the T-Deck,
+gbagate and meshcore-bare boards there are worked examples.
 
 ## What's emulated
 
 | ESP32-S3 | |
 |---|---|
 | GPIO, GPIO matrix, IO_MUX | Pin levels from outputs, peripheral signals, external drives and pulls; edge and level interrupts |
-| GP-SPI2, GP-SPI3 | Master transactions, W buffer and GDMA, chip selects through the matrix or IO_MUX, timing |
+| GP-SPI2, GP-SPI3 | Master transactions, W buffer and GDMA, chip selects through the matrix or IO_MUX, timing at the configured clock |
 | I2C0, I2C1 | Command lists, FIFOs, ACK checks, interrupts, SCL timing |
-| USB Serial/JTAG | The CDC serial side, SOF frames while plugged in |
-| (Espressif's) | CPUs, flash, PSRAM, UART, GDMA, crypto, timers, SDMMC, TWAI, RGB framebuffer |
+| USB Serial/JTAG | The CDC serial side; start-of-frame packets while plugged in (what HWCDC checks) |
+| (Espressif's) | CPUs, flash, PSRAM (`-m`), UART, GDMA, crypto, timers, SDMMC, TWAI, RGB framebuffer |
 
-| Board devices | |
+| Parts | |
 |---|---|
-| Displays (SPI) | `ili9341` `ili9488` `st7735` `st7789` `st7796` `gc9a01`, each a screen `screendump` captures |
+| Displays (SPI) | `ili9341` `ili9488` `st7735` `st7789` `st7796` `gc9a01`: MIPI DCS, each a screen you can capture |
 | Displays (I2C) | `ssd1306` `sh1106` |
 | Touch | `xpt2046` (SPI); `gt911` `cst816` `ft6336` (I2C) |
-| Storage | `ssi-sd` (SD over SPI, `drive=`), `at24c-eeprom` |
+| Storage | `ssi-sd` (SD cards over SPI from a disk image), `at24c-eeprom` |
 | Input | `gpio-button` (buttons, rotary encoders), `tdeck-keyboard`, `mcp23017` |
-| Radio | `sx1262` `sx1261` `sx1268` (LoRa over `radio/airhub.py`) |
-| Wiring | `esp32s3.pin-link` (any device line to any pin, open drain, board pulls) |
+| Radio | `sx1262` `sx1261` `sx1268` (LoRa, between QEMUs over `radio/airhub.py`); Bluetooth through `bluetooth/` |
 
-Not yet: the S3's LCD_CAM (8080 parallel displays), ADC, LEDC/PWM, RMT, Wi-Fi and the S3's
-Bluetooth controller (firmware runs its host stack over HCI instead, see `bluetooth/`), SX127x
-radios, and the classic ESP32's peripherals beyond Espressif's (Marauder's boards).
+Not yet: the S3's LCD_CAM (8080 parallel displays), ADC, LEDC/PWM, RMT, Wi-Fi (start-up
+gets as far as the PHY's calibration), the S3's Bluetooth controller (firmware runs its own
+host stack over HCI instead, see `bluetooth/`), SX127x radios, and the classic ESP32's
+peripherals beyond Espressif's.
 
-## Firmware tested in CI
+## Test cases: real firmware
 
-| Firmware | Board | Checked |
+Each emulated feature is confirmed by real firmware, built from its repository at a
+pinned commit and checked on its board in CI (`.github/workflows/firmware.yml`). They are
+test cases for the emulation, not projects this repository maintains.
+
+| Firmware | Board | What it confirms |
 |---|---|---|
-| [meshcore-bare-esp32s3](https://github.com/mytechnotalent/meshcore-bare-esp32s3) | ESP32-S3 + SX1262 | Two nodes on one air: radios up, adverts sent, heard, stored as contacts |
-
-Planned: LilyGO T-Deck and T-Display-S3, MeshCore, Bruce, ESP32 Marauder, gbagate's boards,
-SlimeVR. See `firmware/README.md`.
+| [meshcore-bare-esp32s3](https://github.com/mytechnotalent/meshcore-bare-esp32s3) | ESP32-S3 + SX1262 | GP-SPI2, GPIO interrupts (DIO1, BUSY), the SX1262 and time on air, the air hub; NimBLE over virtual Bluetooth with a phone pairing (passkey) and the companion protocol. Two nodes advertise over LoRa, hear each other and store each other as contacts |
+| [LilyGO T-Deck](https://github.com/Xinyuan-LilyGO/T-Deck) (factory firmware) | T-Deck | The ST7789 under TFT_eSPI and LVGL, the GT911 and keyboard on I2C, RadioLib on the SX1262, PSRAM, USB Serial/JTAG |
+| [gbagate](https://github.com/HelaFaye/gbagate) | its touch carrier and devkit | ILI9341, XPT2046, SD over SPI with ESP-IDF's sdspi, MCP23017s, ST7735; the picture read back from the glass, touches reaching the UI |
 
 ## Tests
 
@@ -75,7 +115,7 @@ done
 ```
 
 CI: `.github/workflows/espressif-qemu.yml` (the patches and their tests),
-`.github/workflows/firmware.yml` (real firmware).
+`.github/workflows/firmware.yml` (the test cases).
 
 ---
 

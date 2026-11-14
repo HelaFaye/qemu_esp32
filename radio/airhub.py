@@ -8,6 +8,10 @@ SNR from the link between them, lost when the link is out of range or by chance,
 corrupted (a CRC error) by chance. Collisions happen in the radios, which see the packets'
 times and strengths.
 
+Positions and physics (path loss, noise, interferers, demodulation limits): an
+"environment" section in the same file, see environment.py; pairs without a hand-set link
+use it.
+
 Links (--links FILE, JSON) are by node name; a node is named by its connection order
 ("0", "1", ...) unless the QEMU sends a hello first (not needed):
     {"default": {"rssi": -70, "snr": 8, "loss": 0.0, "corrupt": 0.0},
@@ -22,6 +26,8 @@ import json
 import random
 import struct
 import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 MAGIC = 0x41524F4C
 AIR_TX, AIR_RX = 1, 2
@@ -40,6 +46,7 @@ class Hub:
         self.default = Link()
         self.links = {}
         self.rng = random.Random(seed)
+        self.env = None             # environment.Environment: positions, path loss, noise
         self.log = log
         self.count = 0
         if links:
@@ -47,6 +54,9 @@ class Hub:
                 self.default = Link(**links["default"])
             for k, v in links.get("links", {}).items():
                 self.links[k] = None if v is None else Link(**{**vars(self.default), **v})
+            if "environment" in links:
+                from environment import Environment
+                self.env = Environment(links["environment"], self.rng)
 
     def link(self, a, b):
         for key in ("%s-%s" % (a, b), "%s-%s" % (b, a)):
@@ -62,13 +72,22 @@ class Hub:
         for name, _ in self.nodes:
             if name == src:
                 continue
-            link = self.link(src, name)
-            if link is None or self.rng.random() < link.loss:
-                continue
+            explicit = any(k in self.links for k in ("%s-%s" % (src, name), "%s-%s" % (name, src)))
+            if self.env is not None and not explicit and self.env.knows(src, name):
+                # Positions and physics: path loss, noise, interference, the SF's SNR limit
+                r = self.env.reception(src, name, h[9], h[4], h[5], h[3])
+                if r.lost:
+                    continue
+                rssi, snr, corrupt = r.rssi, r.snr, self.rng.random() < r.corrupt_p
+            else:
+                link = self.link(src, name)
+                if link is None or self.rng.random() < link.loss:
+                    continue
+                rssi, snr, corrupt = link.rssi, link.snr, self.rng.random() < link.corrupt
             h[2] = AIR_RX
-            h[10] = max(-128, min(127, int(round(link.rssi))))
-            h[11] = max(-128, min(127, int(round(link.snr * 4))))
-            h[12] = 1 if self.rng.random() < link.corrupt else 0
+            h[10] = max(-128, min(127, int(round(rssi))))
+            h[11] = max(-128, min(127, int(round(snr * 4))))
+            h[12] = 1 if corrupt else 0
             out.append((name, HEADER.pack(*h) + payload))
         return out
 
