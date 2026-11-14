@@ -100,6 +100,15 @@ def main():
                 await p.connect(addr)
                 ok = await p.set_time()
                 done.append((str(addr), p.connection.is_encrypted, ok))
+                if i == 0:
+                    # A node adverts about a second after its phone sets its clock; two
+                    # adverts on the air at once collide (each radio, transmitting, hears
+                    # nothing). Pair the second once the first's advert is out, as two
+                    # people setting up their nodes one after the other would.
+                    for _ in range(300):
+                        if "tx_done at" in nodes[0].log():
+                            break
+                        await asyncio.sleep(0.1)
             return done
         try:
             for (addr, enc, ok), n in zip(radio.run(phones(), timeout=240), nodes):
