@@ -128,7 +128,13 @@ class ModeledLink(LocalLink):
     def send_acl_data(self, sender_controller, destination_address, transport, data):
         if transport == core.PhysicalTransport.LE:
             destination = self.find_le_controller(destination_address)
+            # The address the receiver knows this link by: a peripheral advertising with its
+            # public address (own_addr_type 0, as NimBLE on an ESP32 does) connects with it,
+            # not with a random one
             source = sender_controller.random_address
+            if destination is not None and source not in destination.le_connections and \
+                    sender_controller.public_address in destination.le_connections:
+                source = sender_controller.public_address
         elif transport == core.PhysicalTransport.BR_EDR:
             destination = self.find_classic_controller(destination_address)
             source = sender_controller.public_address

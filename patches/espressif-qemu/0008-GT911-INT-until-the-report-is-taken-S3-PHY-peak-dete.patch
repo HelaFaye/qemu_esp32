@@ -1,0 +1,123 @@
+From ca5b95de2ecec8acd532303f381ae93117407cf1 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Sat, 14 Nov 2026 01:08:34 +0000
+Subject: [PATCH 8/8] GT911 INT until the report is taken; S3 PHY peak detector
+ done
+
+GT911: in its edge modes (0x804D) INT now signals each report until
+the host takes it (writes 0 to 0x814E), and in its level modes stays
+active while touched, so drivers that poll INT's level (SensorLib's
+isPressed, LilyGO's T-Deck firmware) see touches as on the chip.
+
+ESP32-S3: the PHY's calibration in ROM (rom_pkdet_vol_start) waits for
+the analog peak detector's state machine (0x6000E050, bits 24-26) to
+reach 7; it now reads done, as BBPLL calibration already did, so Wi-Fi
+and Bluetooth start-up gets past it.
+---
+ hw/input/i2c_touch.c | 36 +++++++++++++++++++++++++++++++-----
+ hw/xtensa/esp32s3.c  |  7 +++++++
+ 2 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/hw/input/i2c_touch.c b/hw/input/i2c_touch.c
+index 2e026ad..4407278 100644
+--- a/hw/input/i2c_touch.c
++++ b/hw/input/i2c_touch.c
+@@ -4,10 +4,13 @@
+  *
+  * The touch comes from the absolute pointer (a window's mouse) or, for tests, the QOM
+  * properties "x", "y" (in the controller's coordinates) and "pressed". While touched
+- * the controller makes a new report every 10 ms, and once on release; each report pulses
+- * INT low for 100 us (the "int" GPIO out), except the FT6336 in its default polling mode,
+- * which holds INT low while touched. Wire INT with pin-link dir=out (open-drain=on for an
+- * open drain line).
++ * the controller makes a new report every 10 ms, and once on release. INT (the "int"
++ * GPIO out): the GT911 in its edge modes (0x804D bits 0-1: 0 rising, 1 falling) signals
++ * each report until the host takes it (writes 0 to 0x814E), so a driver that polls INT's
++ * level (SensorLib's isPressed) sees it as on the chip; in its level modes (2 low, 3 high)
++ * INT is active while touched. The CST816 pulses INT low for 100 us per report; the FT6336
++ * in its default polling mode holds INT low while touched. Wire INT with pin-link dir=out
++ * (open-drain=on for an open drain line).
+  *
+  * GT911: 16-bit register addresses; product ID "911" at 0x8140, resolution at 0x8146,
+  * status 0x814E (bit 7: a report is ready, bits 0-3: points; written 0 to take it),
+@@ -66,6 +69,19 @@ struct I2CTouchState {
+     uint8_t gesture;
+ };
+ 
++/* The GT911's INT trigger (configuration 0x804D, bits 0-1) */
++static int gt_int_mode(I2CTouchState *s)
++{
++    return s->gt_config[0x804D - 0x8047] & 3;
++}
++
++static void gt_set_int(I2CTouchState *s, bool active)
++{
++    int mode = gt_int_mode(s);
++    bool active_high = mode == 0 || mode == 3;
++    qemu_set_irq(s->irq, active == active_high);
++}
++
+ static void pulse_end(void *opaque)
+ {
+     I2CTouchState *s = I2C_TOUCH(opaque);
+@@ -81,6 +97,9 @@ static void report(I2CTouchState *s)
+         s->gt_status = 0x80 | (s->pressed ? 1 : 0);
+         uint8_t p[8] = { 0, x & 0xFF, x >> 8, y & 0xFF, y >> 8, 0x20, 0, 0 };
+         memcpy(s->gt_points, p, sizeof(p));
++        /* Edge modes: signalled until taken; level modes: while touched */
++        gt_set_int(s, gt_int_mode(s) >= 2 ? s->pressed : true);
++        return;
+     }
+     if (s->kind == KIND_FT6336 && s->ft_mode == 0) {
+         qemu_set_irq(s->irq, !s->pressed);      /* Polling mode: low while touched */
+@@ -180,6 +199,9 @@ static void write_reg(I2CTouchState *s, uint16_t r, uint8_t v)
+             }
+         } else if (r == 0x814E) {
+             s->gt_status = v;
++            if (!(v & 0x80) && gt_int_mode(s) < 2) {
++                gt_set_int(s, false);       /* The report is taken */
++            }
+         }
+     } else if (s->kind == KIND_FT6336 && r == 0xA4) {
+         s->ft_mode = v & 1;
+@@ -291,7 +313,11 @@ static void touch_reset(DeviceState *dev)
+     I2CTouchState *s = I2C_TOUCH(dev);
+     s->gt_status = 0;
+     s->ft_mode = 0;
+-    qemu_set_irq(s->irq, 1);
++    if (s->kind == KIND_GT911) {
++        gt_set_int(s, false);
++    } else {
++        qemu_set_irq(s->irq, 1);
++    }
+ }
+ 
+ static Property touch_properties[] = {
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index fc8cd9a..61325ad 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -573,6 +573,10 @@ static void esp32s3_soc_realize(DeviceState *dev, Error **errp)
+ /* I2C_MST_ANA_CONF0_REG and its BBPLL_CAL_DONE bit */
+ #define ESP32S3_I2C_MST_ANA_CONF0_REG  0x6000E040
+ #define ESP32S3_I2C_MST_BBPLL_CAL_DONE BIT(24)
++/* The analog peak detector's state machine (bits 24-26), which the PHY's calibration in
++ * ROM (rom_pkdet_vol_start) waits to reach 7, done, when Wi-Fi or Bluetooth starts */
++#define ESP32S3_I2C_MST_ANA_STATUS_REG 0x6000E050
++#define ESP32S3_I2C_MST_PKDET_DONE     (7u << 24)
+ 
+ static uint64_t esp32s3_io_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+@@ -580,6 +584,9 @@ static uint64_t esp32s3_io_read(void *opaque, hwaddr addr, unsigned int size)
+     if (ESP32S3_IO_START_ADDR + addr == ESP32S3_I2C_MST_ANA_CONF0_REG) {
+         return ESP32S3_I2C_MST_BBPLL_CAL_DONE;
+     }
++    if (ESP32S3_IO_START_ADDR + addr == ESP32S3_I2C_MST_ANA_STATUS_REG) {
++        return ESP32S3_I2C_MST_PKDET_DONE;
++    }
+ #if ESP32S3_IO_WARNING
+     warn_report("[ESP32-S3] Unsupported read to $%08lx, size = %i\n", ESP32S3_IO_START_ADDR + addr, size);
+ #endif
+-- 
+2.43.0
+

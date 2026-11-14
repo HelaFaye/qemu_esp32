@@ -1,7 +1,7 @@
 From 309bbce5030e9ed8c0427c7a42d9b7e488f1538d Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Tue, 10 Nov 2026 10:43:26 +0000
-Subject: [PATCH 6/7] SX1262/SX1261/SX1268 LoRa radios with a shared air
+Subject: [PATCH 6/8] SX1262/SX1261/SX1268 LoRa radios with a shared air
 
 The SX126x command interface on SPI: run on NSS rising, the status
 byte shifted out during opcodes and status positions, BUSY while a

@@ -60,6 +60,7 @@ ACCEPTED = {
 ACCEPTED_WITH_HANDLE = {
     "HCI_WRITE_LINK_POLICY_SETTINGS_COMMAND", "HCI_WRITE_LINK_SUPERVISION_TIMEOUT_COMMAND",
     "HCI_WRITE_AUTOMATIC_FLUSH_TIMEOUT_COMMAND", "HCI_SNIFF_SUBRATING_COMMAND",
+    "HCI_LE_SET_DATA_LENGTH_COMMAND",
 }
 
 
@@ -119,7 +120,37 @@ class ChipController(Controller):
         self.unsupported.append(name)
         return super().on_hci_command(command)
 
+    def on_hci_read_remote_version_information_command(self, command):
+        """Bumble has no handler for it (an async command: none means no answer at all, and
+        NimBLE waits 20 s for one when an LE link comes up). Status, then the peer's version."""
+        connection = self.find_connection_by_handle(command.connection_handle)
+        status = hci.HCI_ErrorCode.SUCCESS if connection else hci.HCI_ErrorCode.UNKNOWN_CONNECTION_IDENTIFIER_ERROR
+        self.send_hci_packet(hci.HCI_Command_Status_Event(
+            status=status, num_hci_command_packets=1, command_opcode=command.op_code))
+        if connection is None:
+            return None
+        peer = None
+        if self.link is not None:
+            find = (self.link.find_le_controller if connection.transport == connection.transport.LE
+                    else self.link.find_classic_controller)
+            peer = find(connection.peer_address)
+        profile = getattr(peer, "profile", self.profile)
+        self.send_hci_packet(hci.HCI_Read_Remote_Version_Information_Complete_Event(
+            status=hci.HCI_ErrorCode.SUCCESS, connection_handle=connection.handle,
+            version=profile.lmp_version, manufacturer_name=profile.manufacturer,
+            subversion=getattr(profile, "lmp_subversion", 0)))
+        return None
+
     def on_hci_command_packet(self, command):
+        if (isinstance(command, hci.HCI_AsyncCommand) and
+                not hasattr(self, "on_" + command.name.lower()) and command.name not in ACCEPTED_WITH_HANDLE):
+            # An async command Bumble doesn't know: a controller answers Command Status with
+            # "unknown command" (Bumble would send nothing, and the host would wait)
+            self.unsupported.append(command.name)
+            self.send_hci_packet(hci.HCI_Command_Status_Event(
+                status=hci.HCI_ErrorCode.UNKNOWN_HCI_COMMAND_ERROR, num_hci_command_packets=1,
+                command_opcode=command.op_code))
+            return
         if command.name in ACCEPTED_WITH_HANDLE:
             self.on_hci_command(command)             # Its own Command Complete
             return

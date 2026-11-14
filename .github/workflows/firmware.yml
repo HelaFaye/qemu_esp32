@@ -91,3 +91,38 @@ jobs:
         with:
           name: meshcore-bare-logs
           path: ${{ runner.temp }}/mcb/*run*
+
+  t-deck:
+    needs: qemu
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-arduino-${{ hashFiles('firmware/t-deck/COMMIT') }}
+      - name: Tools
+        run: |
+          pip install -q platformio esptool pillow
+          sudo apt-get update && sudo apt-get install -y libglib2.0-0 libpixman-1-0 libgcrypt20 libslirp0
+      - uses: actions/download-artifact@v4
+        with:
+          name: qemu-xtensa
+          path: ${{ runner.temp }}/qemu
+      - name: Build LilyGO's T-Deck factory firmware
+        run: firmware/t-deck/build.sh "$RUNNER_TEMP/tdeck"
+      - name: Boot it on the emulated T-Deck
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: |
+          chmod +x "$QEMU_XTENSA"
+          python3 firmware/t-deck/boot.py "$RUNNER_TEMP/tdeck/flash.bin" "$RUNNER_TEMP/tdeck/run"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t-deck-screens-and-logs
+          path: ${{ runner.temp }}/tdeck/run

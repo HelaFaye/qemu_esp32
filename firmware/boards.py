@@ -48,8 +48,37 @@ def meshcore_bare(air=None, **_):
     return "esp32s3", sx1262(nss=7, reset=8, busy=15, dio1=16, air=air)
 
 
+def button(name, pin, key=None):
+    return ["-device", "gpio-button,pin=%d,id=%s%s" % (pin, name, ",key=" + key if key else "")]
+
+
+def t_deck(air=None, sd=None, **_):
+    """LilyGO T-Deck (ESP32-S3, 16 MB flash, 8 MB PSRAM): a 320x240 ST7789 on SPI (CS 12,
+    DC 11, backlight 42), an SX1262 (CS 9, RST 17, BUSY 13, DIO1 45) and a microSD (CS 39) on
+    the same SPI2 pins (SCK 40, MOSI 41, MISO 38); I2C (SDA 18, SCL 8): the keyboard's
+    ESP32-C3 (0x55) and a GT911 (0x5D, INT 16); the trackball (up 3, down 15, left 1,
+    right 2, click 0); BOOT is GPIO0 too. examples/UnitTest/utilities.h."""
+    args = ["-m", "8M", "-device", "st7789,bus=spi2,cs=0,id=lcd"]
+    args += link(12, "lcd", "ssi-gpio-cs", pull="up") + link(11, "lcd", "dc") + link(42, "lcd", "backlight")
+    args += sx1262(nss=9, reset=17, busy=13, dio1=45, cs=1, air=air)
+    if sd:
+        args += ["-drive", "id=sdcard,if=none,format=raw,file=" + sd,
+                 "-device", "ssi-sd,bus=spi2,cs=2,id=sd,drive=sdcard"]
+        args += link(39, "sd", "ssi-gpio-cs", pull="up")
+    else:
+        args += ["-device", "esp32s3.pin-link,pin=39,pull=up"]          # The card slot, empty
+    args += ["-device", "tdeck-keyboard,bus=i2c0,address=0x55,id=kbd",
+             "-device", "gt911,bus=i2c0,address=0x5d,id=touch,width=320,height=240"]
+    args += link(16, "touch", "int", out=True)
+    for name, pin, key in [("ball_up", 3, "up"), ("ball_down", 15, "down"), ("ball_left", 1, "left"),
+                           ("ball_right", 2, "right"), ("ball_click", 0, "ret")]:
+        args += button(name, pin, key)
+    return "esp32s3", args
+
+
 BOARDS = {
     "meshcore-bare": meshcore_bare,
+    "t-deck": t_deck,
 }
 
 
@@ -92,13 +121,41 @@ class Node:
         except OSError:
             return ""
 
+    def qmp(self, command, **arguments):
+        """One QMP command on the node's monitor socket; its "return"."""
+        import json
+        import socket
+        sock = socket.socket(socket.AF_UNIX)
+        sock.connect(self.log_path[:-4] + "-qmp.sock")
+        f = sock.makefile("rw")
+        f.readline()                                    # Greeting
+        for msg in ({"execute": "qmp_capabilities"}, {"execute": command, "arguments": arguments}):
+            f.write(json.dumps(msg) + "\n")
+            f.flush()
+            while True:
+                r = json.loads(f.readline())
+                if "return" in r or "error" in r:
+                    break
+        sock.close()
+        if "error" in r:
+            raise RuntimeError(r["error"])
+        return r["return"]
+
+    def screendump(self, path, device="lcd"):
+        """A display's glass as a PPM file; (width, height, rgb bytes)."""
+        self.qmp("screendump", filename=path, device=device)
+        data = open(path, "rb").read()
+        parts = data.split(b"\n", 3)
+        w, h = map(int, parts[1].split())
+        return w, h, parts[3]
+
     def stop(self):
         if self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
 
 
-def boot(board, flash, workdir, name="node", hci=None, **opts):
+def boot(board, flash, workdir, name="node", hci=None, extra=(), **opts):
     """Boot flash (a merged image) on a board. UART0 goes to <workdir>/<name>.log, the
     USB serial (plugged in) to <name>-usb.log; hci: a TCP port for UART1 (a virtual
     Bluetooth controller), else nothing on it."""
@@ -111,15 +168,16 @@ def boot(board, flash, workdir, name="node", hci=None, **opts):
         while size < len(data):
             size *= 2                          # QEMU wants the whole chip: 4, 8 or 16 MB
         dst.write(data + b"\xff" * (size - len(data)))
-    args = [QEMU, "-machine", machine, "-nographic", "-monitor", "none", "-nic", "none",
+    args = [QEMU, "-machine", machine, "-display", "none", "-monitor", "none", "-nic", "none",
             "-drive", "file=%s,if=mtd,format=raw" % img,
             "-serial", "file:" + log,
             "-serial", "tcp:127.0.0.1:%d" % hci if hci else "null",
             "-serial", "null",
             "-serial", "file:" + log[:-4] + "-usb.log"]
+    args += ["-qmp", "unix:%s,server=on,wait=off" % (log[:-4] + "-qmp.sock")]
     if QEMU_BIOS:
         args += ["-L", QEMU_BIOS]
-    args += devices
+    args += devices + list(extra)                  # e.g. ["-gdb", "tcp::1234"]
     with open(os.path.join(workdir, name + "-qemu.txt"), "w") as f:
         f.write(" ".join(args) + "\n")
     proc = subprocess.Popen(args, stdout=open(os.path.join(workdir, name + "-qemu.log"), "w"),
