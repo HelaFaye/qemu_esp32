@@ -41,9 +41,20 @@ peripherals they use. Details and how to run each: [`firmware/`](../firmware/REA
 
 | Firmware | Board | What it confirms |
 |---|---|---|
-| [gbagate](https://github.com/HelaFaye/gbagate) | its touch carrier and devkit | ILI9341, XPT2046, SD over SPI with ESP-IDF's sdspi, MCP23017s, ST7735; the picture read back from the glass, touches reaching the UI |
+| [gbagate](https://github.com/HelaFaye/gbagate) | its touch carrier, devkit and Supermini | ILI9341, XPT2046, SD over SPI with ESP-IDF's sdspi, MCP23017s (a chip reader, and buttons), ST7735, GPIO buttons; the picture read back from the glass, touches and button presses reaching the UI |
 | [meshcore-bare-esp32s3](https://github.com/mytechnotalent/meshcore-bare-esp32s3) | ESP32-S3 + SX1262 | GP-SPI2, GPIO interrupts, the SX1262 and time on air, the air hub; NimBLE over virtual Bluetooth with a phone pairing. Two nodes advertise over LoRa and store each other as contacts |
 | [LilyGO T-Deck](https://github.com/Xinyuan-LilyGO/T-Deck) (factory firmware) | T-Deck | The ST7789 under TFT_eSPI and LVGL, the GT911 and keyboard, RadioLib on the SX1262, PSRAM, USB Serial/JTAG, its peripherals' power switch. Known gap: Wi-Fi start-up stops in the PHY's calibration, so its main loop doesn't run yet |
+
+What the test cases have found, so far (each fixed, with a qtest that reproduces it):
+- QEMU's SD model in SPI mode answered CMD9/CMD10 only from the wrong state and CMD13
+  with the SD bus's response (patch 0008), and carried an illegal command's error into
+  the next command's R1 (0013): gbagate's card wouldn't mount.
+- The GT911 dropped INT before the host had read the touch (0009): the T-Deck's touch.
+- The S3's PHY calibration waited forever on a peak detector (0009): Wi-Fi start-up.
+- Encoder edges came faster than firmware polling each tick could follow (0014):
+  gbagate's devkit encoder.
+- In gbagate itself, its own QEMU checks found an ST7735 driver sending pixels low byte
+  first, and no board mounting its SD card.
 
 And the stress demos, each against a small target firmware of its own
 ([`faults/`](../faults/README.md)): a glitch campaign on a PIN check, power cuts during

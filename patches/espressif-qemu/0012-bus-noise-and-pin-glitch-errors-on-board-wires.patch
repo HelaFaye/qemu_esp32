@@ -1,7 +1,7 @@
 From 181d0792ec29583e967356787308be5088ba0151 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Sat, 14 Nov 2026 14:19:39 +0000
-Subject: [PATCH 12/12] bus-noise and pin-glitch: errors on board wires
+Subject: [PATCH 12/14] bus-noise and pin-glitch: errors on board wires
 
 bus-noise names parts by id and flips bits in their SPI transfers (MOSI and
 MISO, while selected) and I2C bytes (both ways) at a rate per bit, in bursts,

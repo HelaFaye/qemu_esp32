@@ -84,8 +84,10 @@ The boards here, each from its project's own pin definitions:
 | `esp32s3-devkitc` | The chip alone |
 | `meshcore-bare` | A DevKitC and an SX1262 module |
 | `t-deck` | LilyGO T-Deck: ST7789, GT911, keyboard, SX1262, SD, trackball, PSRAM; peripherals powered by GPIO10 |
-| `gbagate-carrier-touch` | gbagate's touch carrier: ILI9341, XPT2046, SD, two MCP23017s |
-| `gbagate-devkit` | gbagate on a DevKitC with an ST7735 |
+| `gbagate-devkit` | gbagate on a 44-pin DevKitC: ST7735, SD, ten switches (or an encoder on three of their pins) |
+| `gbagate-supermini` | gbagate on a Supermini: ST7735, SD, its switches on an MCP23017 |
+| `gbagate-carrier-touch` | gbagate's touch carrier: ILI9341 with backlight, XPT2046, SD, two MCP23017s and their shared interrupt |
+| `gbagate-carrier-knob` | gbagate's knob carrier: the same, with an encoder and two keys for the touch (gbagate doesn't build it yet) |
 
 ## Boards from KiCad
 

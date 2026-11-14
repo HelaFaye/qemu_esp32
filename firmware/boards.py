@@ -109,33 +109,91 @@ def t_deck(air=None, sd=None, **_):
     return "esp32s3", args
 
 
-def gbagate_carrier_touch(card=None, **_):
-    """HelaFaye/gbagate's touch carrier (its doc/CARRIER.md): an ESP32-S3 Supermini, an
-    ILI9341 320x240 with an XPT2046 on GP-SPI2 (SCK 12, MOSI 11, MISO 13; LCD CS 10,
-    D/C 9; touch CS 16, PENIRQ 17), a micro SD (CS 15; card: a raw image), and the
-    Battle Chip board's two MCP23017s on I2C0 (SDA 1, SCL 2). Pins: its
-    port/esp32s3/board.h at firmware/gbagate/COMMIT. Its own check, which also presses
-    the touch and reads the glass, is firmware/gbagate/check.sh."""
-    args = ["-device", "ili9341,bus=spi2,id=lcd"]
-    args += link(10, "lcd", "ssi-gpio-cs", pull="up") + link(9, "lcd", "dc")
-    args += ["-device", "xpt2046,bus=spi2,cs=1,id=touch"]
-    args += link(16, "touch", "ssi-gpio-cs", pull="up")
-    args += link(17, "touch", "penirq", out=True, open_drain=True, pull="up")
-    if card:
-        args += ["-drive", "id=card,if=none,format=raw,file=%s" % card,
-                 "-device", "ssi-sd,bus=spi2,cs=2,id=sd,drive=card"]
-        args += link(15, "sd", "ssi-gpio-cs", pull="up")
-    args += ["-device", "mcp23017,bus=i2c0,address=0x20,id=exp0",
-             "-device", "mcp23017,bus=i2c0,address=0x21,id=exp1"]
+# HelaFaye/gbagate's boards, from its port/esp32s3/board.h at firmware/gbagate/COMMIT.
+# Shared by all: the SPI bus (SCK 12, MOSI 11, MISO 13) and the GBA link port (SC 4,
+# SD 5, SI 6, SO 7: bit-banged, no part on it here). Not emulated: the WS2812 (RMT), the
+# link partner (a GBA), infrared. Its keys, as ui_input.h numbers them:
+GBAGATE_KEYS = ["up", "down", "left", "right", "a", "b", "select", "l", "r", "start"]
+
+
+def _gbagate_st7735(cs, dc):
+    """The 1.44" 128x128 ST7735 module (BGR, its glass at 2,3)."""
+    return ["-device", "st7735,bus=spi2,id=lcd,width=128,height=128,x-offset=2,y-offset=3,panel-bgr=on"] + \
+        link(cs, "lcd", "ssi-gpio-cs", pull="up") + link(dc, "lcd", "dc")
+
+
+def _sd(cs, card, n=2):
+    """A micro SD slot on SPI2: card a raw image, or the slot empty."""
+    if not card:
+        return ["-device", "esp32s3.pin-link,pin=%d,pull=up" % cs]
+    return ["-drive", "id=card,if=none,format=raw,file=%s" % card,
+            "-device", "ssi-sd,bus=spi2,cs=%d,id=sd,drive=card" % n] + link(cs, "sd", "ssi-gpio-cs", pull="up")
+
+
+def encoder(name, a, b):
+    """A rotary encoder on two pins (qom-set turn N: N detents)."""
+    return ["-device", "gpio-button,encoder=on,pin=%d,pin-b=%d,id=%s" % (a, b, name)]
+
+
+def gbagate_devkit(card=None, input="encoder", **_):
+    """gbagate on a 44-pin ESP32-S3 DevKitC: the ST7735 (CS 14, D/C 21), a micro SD
+    (CS 10), and its input: an encoder on 15/16 ("knob") with its switch on 35 (btn_a),
+    gbagate's default (settings.c), plus the other switches; or input="buttons", all ten
+    switches to ground on their own pins (up 15, down 16, left 17, right 18, A 35, B 36,
+    select 37, start 38, L 39, R 40), ids btn_<key>."""
+    args = _gbagate_st7735(14, 21) + _sd(10, card, n=1)
+    pins = dict(up=15, down=16, left=17, right=18, a=35, b=36, select=37, start=38, l=39, r=40)
+    if input == "encoder":
+        args += encoder("knob", 15, 16)
+        pins = {k: v for k, v in pins.items() if k not in ("up", "down")}
+    for key, pin in pins.items():
+        args += button("btn_" + key, pin)
     return "esp32s3", args
 
 
-def gbagate_devkit(**_):
-    """HelaFaye/gbagate on an ESP32-S3 DevKitC with a 128x128 ST7735 (a BGR module) on
-    GP-SPI2: CS 14, D/C 21."""
-    args = ["-device", "st7735,bus=spi2,id=lcd,width=128,height=128,x-offset=2,y-offset=3,"
-                       "panel-bgr=on"]
-    args += link(14, "lcd", "ssi-gpio-cs", pull="up") + link(21, "lcd", "dc")
+def gbagate_supermini(card=None, **_):
+    """gbagate on an ESP32-S3 Supermini (14 usable pins): the ST7735 (CS 10, D/C 48), a
+    micro SD (CS 3), and its switches on an MCP23017 at 0x21 on I2C0 (SDA 1, SCL 2), one
+    per input in ui_input.h's order (GPA0 up ... GPB1 start), polled: ids btn_<key>."""
+    args = _gbagate_st7735(10, 48) + _sd(3, card, n=1)
+    args += ["-device", "mcp23017,bus=i2c0,address=0x21,id=buttons"]
+    for n, key in enumerate(GBAGATE_KEYS):
+        args += ["-device", "gpio-button,dev=buttons,line=in,n=%d,id=btn_%s" % (n, key)]
+    return "esp32s3", args
+
+
+def _gbagate_carrier(card):
+    """What both carriers have (doc/CARRIER.md): an ILI9341 320x240 (CS 10, D/C 9,
+    backlight 21; its reset on 18 is a pin the model doesn't have), a micro SD (CS 15),
+    and the Battle Chip board's two MCP23017s on I2C0 (SDA 1, SCL 2) with their
+    interrupts on GPIO36, shared (open drain)."""
+    args = ["-device", "ili9341,bus=spi2,id=lcd"]
+    args += link(10, "lcd", "ssi-gpio-cs", pull="up") + link(9, "lcd", "dc") + link(21, "lcd", "backlight")
+    args += _sd(15, card)
+    args += ["-device", "mcp23017,bus=i2c0,address=0x20,id=exp0",
+             "-device", "mcp23017,bus=i2c0,address=0x21,id=exp1"]
+    args += link(36, "exp0", "inta", out=True, open_drain=True, pull="up")
+    args += link(36, "exp1", "inta", out=True, open_drain=True, pull="up")
+    return args
+
+
+def gbagate_carrier_touch(card=None, **_):
+    """gbagate's touch carrier: the carrier (above), and an XPT2046 on the panel (CS 16,
+    PENIRQ 17). Its own check, which also presses the touch and reads the glass, is
+    firmware/gbagate/check.sh."""
+    args = _gbagate_carrier(card)
+    args += ["-device", "xpt2046,bus=spi2,cs=1,id=touch"]
+    args += link(16, "touch", "ssi-gpio-cs", pull="up")
+    args += link(17, "touch", "penirq", out=True, open_drain=True, pull="up")
+    return "esp32s3", args
+
+
+def gbagate_carrier_knob(card=None, **_):
+    """gbagate's knob carrier: the carrier (above), and the panel module's encoder (16,
+    17) with its switch (33) and two keys (A 34, B 35). gbagate doesn't build it yet (its
+    keys have no switch map)."""
+    args = _gbagate_carrier(card)
+    args += encoder("knob", 16, 17) + button("btn_enc", 33) + button("btn_a", 34) + button("btn_b", 35)
     return "esp32s3", args
 
 
@@ -162,8 +220,10 @@ BOARDS = {
     "esp32s3-devkitc": esp32s3_devkitc,
     "meshcore-bare": meshcore_bare,
     "t-deck": t_deck,
-    "gbagate-carrier-touch": gbagate_carrier_touch,
     "gbagate-devkit": gbagate_devkit,
+    "gbagate-supermini": gbagate_supermini,
+    "gbagate-carrier-touch": gbagate_carrier_touch,
+    "gbagate-carrier-knob": gbagate_carrier_knob,
 }
 
 
@@ -298,6 +358,9 @@ def boot(board, flash, workdir, name="node", hci=None, extra=(), **opts):
     else:
         machine, devices = BOARDS[board](**opts)
     log = os.path.join(workdir, name + ".log")
+    for old in (log, log[:-4] + "-usb.log", log[:-4] + "-qemu.log"):
+        if os.path.exists(old):
+            os.remove(old)                     # A previous run's: wait_for would match it
     img = os.path.join(workdir, name + "-flash.bin")
     with open(flash, "rb") as src, open(img, "wb") as dst:
         data = src.read()                      # Each node its own flash (NVS: its identity)

@@ -1,7 +1,7 @@
 From 1211f00cd95d2ce1c71cc0150749425a97dc7e77 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Tue, 10 Nov 2026 10:30:35 +0000
-Subject: [PATCH 04/12] esp32s3: I2C0/I2C1 masters
+Subject: [PATCH 04/14] esp32s3: I2C0/I2C1 masters
 
 The S3 had no I2C controller. Both now run ESP-IDF's command lists
 (COMD0-7: RSTART, WRITE with the address after a start, READ with the

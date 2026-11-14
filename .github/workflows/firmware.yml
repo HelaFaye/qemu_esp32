@@ -107,7 +107,7 @@ jobs:
         with:
           name: qemu-xtensa
           path: ${{ runner.temp }}/qemu
-      - name: Build the firmware (touch carrier and devkit)
+      - name: Build the firmware (touch carrier, devkit, Supermini)
         shell: bash
         run: |
           . "$IDF_PATH/export.sh" >/dev/null
@@ -120,6 +120,13 @@ jobs:
         run: |
           chmod +x "$QEMU_XTENSA"
           firmware/gbagate/check.sh "$RUNNER_TEMP/gbagate"
+      - name: Its full boards (devkit and Supermini buttons, SD on every board)
+        if: always()
+        shell: bash
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: python3 firmware/gbagate/boards_check.py "$RUNNER_TEMP/gbagate" devkit supermini
       - uses: actions/upload-artifact@v4
         if: always()
         with:

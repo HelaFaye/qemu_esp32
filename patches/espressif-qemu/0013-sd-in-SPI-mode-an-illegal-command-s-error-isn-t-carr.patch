@@ -1,0 +1,58 @@
+From d2626101db0de38764dd4b3f33b4af9265d730c4 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Sat, 14 Nov 2026 18:29:02 +0000
+Subject: [PATCH 13/14] sd: in SPI mode, an illegal command's error isn't
+ carried to the next
+
+On the SD bus an illegal command gets no response, so ILLEGAL_COMMAND is kept
+for the next command's status. In SPI mode ssi-sd answers the illegal command
+itself (R1 0x04), and R1 describes the command it answers; the kept bit made
+the next, legal command look rejected. ESP-IDF 5.5.1's sdspi probes CMD5 and
+CMD52 (SDIO), then takes CMD59's R1 as 'not supported' and fails the mount:
+gbagate's carrier-touch found it. The qtest sends that sequence.
+---
+ hw/sd/sd.c                             | 11 ++++++++++-
+ tests/qtest/esp32s3-spi-devices-test.c |  5 +++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index 4316a10..497ff8a 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -2263,7 +2263,16 @@ int sd_do_command(SDState *sd, SDRequest *req,
+     }
+ 
+     if (rtype == sd_illegal) {
+-        sd->card_status |= ILLEGAL_COMMAND;
++        /*
++         * On the SD bus an illegal command gets no response, so the next one's
++         * reports it. In SPI mode the host answers the illegal command itself
++         * (R1 0x04, ssi-sd), and R1 describes the command it answers: kept, the
++         * bit would make the next, legal command look rejected too (ESP-IDF's
++         * sdspi probes CMD5 and CMD52, then takes CMD59's R1 as "not supported").
++         */
++        if (!sd_is_spi(sd)) {
++            sd->card_status |= ILLEGAL_COMMAND;
++        }
+     } else {
+         /* Valid command, we can update the 'state before command' bits.
+          * (Do this now so they appear in r1 responses.)
+diff --git a/tests/qtest/esp32s3-spi-devices-test.c b/tests/qtest/esp32s3-spi-devices-test.c
+index 9a43203..a8f99d1 100644
+--- a/tests/qtest/esp32s3-spi-devices-test.c
++++ b/tests/qtest/esp32s3-spi-devices-test.c
+@@ -352,6 +352,11 @@ static void test_sd(void)
+     uint8_t r7[4];
+     g_assert_cmphex(sd_cmd(qts, 8, 0x1AA, 0x87, r7, 4), ==, 0x01);         /* SEND_IF_COND */
+     g_assert_cmphex(r7[3], ==, 0xAA);
++    /* ESP-IDF's sdspi next probes for SDIO (CMD5, CMD52): illegal for an SD card, in
++     * their own R1; then CMD59 (CRC on), legal, whose R1 must not say illegal */
++    g_assert_cmphex(sd_cmd(qts, 5, 0, 0xFF, NULL, 0) & 0x04, ==, 0x04);     /* Illegal */
++    g_assert_cmphex(sd_cmd(qts, 52, 0, 0xFF, NULL, 0) & 0x04, ==, 0x04);
++    g_assert_cmphex(sd_cmd(qts, 59, 1, 0xFF, NULL, 0), ==, 0x01);           /* Idle, accepted */
+     uint8_t r1 = 0x01;
+     for (int i = 0; i < 20 && r1 == 0x01; i++) {
+         sd_cmd(qts, 55, 0, 0x65, NULL, 0);
+-- 
+2.43.0
+

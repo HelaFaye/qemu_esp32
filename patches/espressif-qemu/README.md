@@ -19,6 +19,8 @@ in `BASE`; `build.sh [dir]` fetches it, applies them and builds `qemu-system-xte
 | 0010 | The S3's supply and brown-out detector: `vdd-mv` on `/machine/soc/rtc_cntl`, set at run time (`qom-set`); RTC_CNTL's interrupts (on RTC_CORE) and BROWN_OUT register: below `bod-mv` (2440) the detector trips (DET, its interrupt, a brown-out reset with RST_ENA); below `por-mv` (1800) the chip is off, and the supply's return is a power-on reset |
 | 0011 | `power-domain`: board parts on a switched supply (`devices=lcd:touch`), by `qom-set ... on` or by a pin (`switched=on` and a `pin-link` to its `enable` line: a regulator's enable, T-Deck's BOARD_POWERON). Off, its SPI and I2C parts leave their buses (no ACK, nothing on MISO); on again, each is cold-reset |
 | 0012 | `bus-noise`: errors on parts' wires (`devices=touch:exp`): bit flips on SPI (MOSI and MISO, while selected) and I2C (both ways) at `ber` per bit, `burst` bits at a time, and lost I2C ACKs at `nack`; rates set at run time, `flips`/`nacks` count what was injected, `seed` repeats it. `pin-glitch`: pulses pulling a pin low (open-drain through a `pin-link`), at random (`rate` a second) or on demand (`pulse`) |
+| 0013 | SD cards in SPI mode: an illegal command's error isn't carried into the next command's R1 (ESP-IDF 5.5.1's sdspi probes CMD5/CMD52, then read CMD59 as rejected and failed the mount) |
+| 0014 | `gpio-button` encoders: edges 2 ms apart (`edge-us`), slow enough for firmware that polls its encoder pins each tick |
 
 ## Wiring a board
 

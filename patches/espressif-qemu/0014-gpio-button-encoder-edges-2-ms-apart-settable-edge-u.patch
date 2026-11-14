@@ -1,0 +1,90 @@
+From d9ec4d589bcdf122f9f2b825a62d377d00824225 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Sat, 14 Nov 2026 18:29:02 +0000
+Subject: [PATCH 14/14] gpio-button: encoder edges 2 ms apart, settable
+ (edge-us)
+
+The edges came 0.5 ms apart, faster than firmware that polls its encoder pins
+once a 1 ms tick can follow: it saw two transitions at once and counted a
+glitch, never a detent (gbagate's devkit). 2 ms an edge is 8 ms a detent, a
+brisk turn by hand; edge-us sets it.
+---
+ hw/input/gpio_button.c                 | 14 +++++++++++---
+ tests/qtest/esp32s3-i2c-devices-test.c |  6 +++---
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/hw/input/gpio_button.c b/hw/input/gpio_button.c
+index 7864900..4f3ed2f 100644
+--- a/hw/input/gpio_button.c
++++ b/hw/input/gpio_button.c
+@@ -34,7 +34,13 @@
+ #define TYPE_GPIO_BUTTON "gpio-button"
+ OBJECT_DECLARE_SIMPLE_TYPE(GpioButtonState, GPIO_BUTTON)
+ 
+-#define STEP_NS (500 * SCALE_US)
++/*
++ * An encoder's edges come edge-us apart (default 2 ms: 8 ms a detent, a brisk turn by
++ * hand). Firmware that polls its pins, rather than taking interrupts or using PCNT,
++ * needs edges further apart than its polling (gbagate samples every 1 ms tick):
++ * closer, it sees two transitions at once and counts a glitch.
++ */
++#define STEP_NS(s) ((int64_t)(s)->edge_us * SCALE_US)
+ 
+ struct GpioButtonState {
+     DeviceState parent_obj;
+@@ -43,6 +49,7 @@ struct GpioButtonState {
+     char *dev, *line, *key;
+     int32_t n;
+     bool active_high, encoder;
++    uint32_t edge_us;
+ 
+     qemu_irq a, b;
+     bool pressed;
+@@ -84,7 +91,7 @@ static void encoder_tick(void *opaque)
+     qemu_set_irq(s->a, gray_a[s->phase] ? 0 : -1);
+     qemu_set_irq(s->b, gray_b[s->phase] ? 0 : -1);
+     if (s->pending) {
+-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + STEP_NS);
++        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + STEP_NS(s));
+     }
+ }
+ 
+@@ -96,7 +103,7 @@ static void set_turn(Object *obj, Visitor *v, const char *name, void *opaque, Er
+         return;
+     }
+     s->pending += steps * 4;
+-    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + STEP_NS);
++    timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + STEP_NS(s));
+ }
+ 
+ static void button_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
+@@ -183,6 +190,7 @@ static Property button_properties[] = {
+     DEFINE_PROP_STRING("key", GpioButtonState, key),
+     DEFINE_PROP_BOOL("active-high", GpioButtonState, active_high, false),
+     DEFINE_PROP_BOOL("encoder", GpioButtonState, encoder, false),
++    DEFINE_PROP_UINT32("edge-us", GpioButtonState, edge_us, 2000),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+diff --git a/tests/qtest/esp32s3-i2c-devices-test.c b/tests/qtest/esp32s3-i2c-devices-test.c
+index 7d839be..e0ae347 100644
+--- a/tests/qtest/esp32s3-i2c-devices-test.c
++++ b/tests/qtest/esp32s3-i2c-devices-test.c
+@@ -362,11 +362,11 @@ static void test_buttons_and_encoder(void)
+     qtest_writel(qts, PIN(5), 3 << 7);
+     qtest_writel(qts, STATUS_W1TC, ~0u);
+     qom_set(qts, "/machine/peripheral/knob", "turn", "1");
+-    qtest_clock_step(qts, 600 * 1000);                      /* The first quarter step */
++    qtest_clock_step(qts, 2100 * 1000);                     /* The first edge (2 ms apart) */
+     g_assert_cmphex(qtest_readl(qts, IN) & (BIT(4) | BIT(5)), ==, BIT(5));     /* A low, B high */
+-    qtest_clock_step(qts, 500 * 1000);
++    qtest_clock_step(qts, 2000 * 1000);
+     g_assert_cmphex(qtest_readl(qts, IN) & (BIT(4) | BIT(5)), ==, 0);          /* Both low */
+-    qtest_clock_step(qts, 2 * 1000 * 1000);
++    qtest_clock_step(qts, 5 * 1000 * 1000);
+     g_assert_cmphex(qtest_readl(qts, IN) & (BIT(4) | BIT(5)), ==, BIT(4) | BIT(5));  /* Detent */
+     g_assert_cmphex(qtest_readl(qts, STATUS) & (BIT(4) | BIT(5)), ==, BIT(4) | BIT(5));
+     qtest_quit(qts);
+-- 
+2.43.0
+

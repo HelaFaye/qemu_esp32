@@ -1,6 +1,7 @@
 #!/bin/sh
 # HelaFaye/gbagate at the pinned commit (COMMIT): its gate image for the touch carrier
-# and for the devkit, as its own tools/build_hw.sh builds them (ESP-IDF 5.5; source
+# and for the devkit, and its mini image for the Supermini, as its own tools/build_hw.sh
+# builds them (ESP-IDF 5.5; source
 # $IDF_PATH/export.sh first, or run in the espressif/idf:v5.5.6 container).
 #   OUTDIR/src                  the checkout (check.sh runs its qemu/accurate_boot.py),
 #                               with its tester ROM built (arm-none-eabi-gcc)
@@ -25,9 +26,10 @@ git -C "$SRC" checkout -q -f "$COMMIT"
 # (gbagate's own CI builds it the same way). Needs arm-none-eabi-gcc.
 make -C "$SRC" rom
 
-for board in carrier-touch devkit; do
-    (cd "$SRC" && BOARD=$board tools/build_hw.sh gate)
-    dir="$SRC/build/hw-gate-$board"
+for target in carrier-touch:gate devkit:gate supermini:mini; do
+    board=${target%:*} variant=${target#*:}
+    (cd "$SRC" && BOARD=$board tools/build_hw.sh "$variant")
+    dir="$SRC/build/hw-$variant-$board"
     mkdir -p "$OUT/$board"
     # merge_bin and --fill-flash-size: esptool 4 (ESP-IDF 5.5) knows only these, and 5 still takes them
     (cd "$dir" && python3 -m esptool --chip esp32s3 merge_bin --fill-flash-size 4MB \
