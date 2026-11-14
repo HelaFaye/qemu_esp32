@@ -101,7 +101,8 @@ jobs:
       - name: Tools
         run: |
           apt-get update -qq
-          apt-get install -y -qq libglib2.0-0 libpixman-1-0 libgcrypt20 libslirp0 mtools >/dev/null
+          apt-get install -y -qq libglib2.0-0 libpixman-1-0 libgcrypt20 libslirp0 mtools \
+            gcc-arm-none-eabi >/dev/null
       - uses: actions/download-artifact@v4
         with:
           name: qemu-xtensa

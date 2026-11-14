@@ -2,7 +2,8 @@
 # HelaFaye/gbagate at the pinned commit (COMMIT): its gate image for the touch carrier
 # and for the devkit, as its own tools/build_hw.sh builds them (ESP-IDF 5.5; source
 # $IDF_PATH/export.sh first, or run in the espressif/idf:v5.5.6 container).
-#   OUTDIR/src                  the checkout (check.sh runs its qemu/accurate_boot.py)
+#   OUTDIR/src                  the checkout (check.sh runs its qemu/accurate_boot.py),
+#                               with its tester ROM built (arm-none-eabi-gcc)
 #   OUTDIR/<board>/flash.bin    bootloader, partitions and app, padded to 4 MB
 #   OUTDIR/<board>/gbagate.elf  for addr2line
 # Usage: build.sh OUTDIR
@@ -19,6 +20,10 @@ if [ ! -d "$SRC/.git" ]; then
 fi
 git -C "$SRC" fetch -q --depth 1 origin "$COMMIT"
 git -C "$SRC" checkout -q -f "$COMMIT"
+
+# The tester ROM the touch carrier's SD card holds: built, not committed
+# (gbagate's own CI builds it the same way). Needs arm-none-eabi-gcc.
+make -C "$SRC" rom
 
 for board in carrier-touch devkit; do
     (cd "$SRC" && BOARD=$board tools/build_hw.sh gate)
