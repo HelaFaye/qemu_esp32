@@ -102,6 +102,8 @@ def run(board, outdir):
         check("no panic, abort or watchdog", bad is None, bad.group(0) if bad else "")
         check("no reset after boot", log.count("rst:0x") <= 2)   # UART0 and USB both carry it
         check("QEMU still running", node.proc.poll() is None, node.qemu_output()[-300:])
+        if fails:
+            print("  the console's last lines:\n    " + "\n    ".join(log.splitlines()[-25:]))
     finally:
         node.stop()
 

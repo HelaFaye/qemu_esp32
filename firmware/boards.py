@@ -141,7 +141,7 @@ def gbagate_devkit(card=None, input="encoder", **_):
     gbagate's default (settings.c), plus the other switches; or input="buttons", all ten
     switches to ground on their own pins (up 15, down 16, left 17, right 18, A 35, B 36,
     select 37, start 38, L 39, R 40), ids btn_<key>."""
-    args = _gbagate_st7735(14, 21) + _sd(10, card, n=1)
+    args = ["-m", "8M"] + _gbagate_st7735(14, 21) + _sd(10, card, n=1)       # 16 MB flash, 8 MB PSRAM
     pins = dict(up=15, down=16, left=17, right=18, a=35, b=36, select=37, start=38, l=39, r=40)
     if input == "encoder":
         args += encoder("knob", 15, 16)
@@ -155,7 +155,7 @@ def gbagate_supermini(card=None, **_):
     """gbagate on an ESP32-S3 Supermini (14 usable pins): the ST7735 (CS 10, D/C 48), a
     micro SD (CS 3), and its switches on an MCP23017 at 0x21 on I2C0 (SDA 1, SCL 2), one
     per input in ui_input.h's order (GPA0 up ... GPB1 start), polled: ids btn_<key>."""
-    args = _gbagate_st7735(10, 48) + _sd(3, card, n=1)
+    args = ["-m", "2M"] + _gbagate_st7735(10, 48) + _sd(3, card, n=1)        # 4 MB flash, 2 MB PSRAM
     args += ["-device", "mcp23017,bus=i2c0,address=0x21,id=buttons"]
     for n, key in enumerate(GBAGATE_KEYS):
         args += ["-device", "gpio-button,dev=buttons,line=in,n=%d,id=btn_%s" % (n, key)]
@@ -167,7 +167,8 @@ def _gbagate_carrier(card):
     backlight 21; its reset on 18 is a pin the model doesn't have), a micro SD (CS 15),
     and the Battle Chip board's two MCP23017s on I2C0 (SDA 1, SCL 2) with their
     interrupts on GPIO36, shared (open drain)."""
-    args = ["-device", "ili9341,bus=spi2,id=lcd"]
+    args = ["-m", "2M"]                                                       # On a Supermini: 2 MB PSRAM
+    args += ["-device", "ili9341,bus=spi2,id=lcd"]
     args += link(10, "lcd", "ssi-gpio-cs", pull="up") + link(9, "lcd", "dc") + link(21, "lcd", "backlight")
     args += _sd(15, card)
     args += ["-device", "mcp23017,bus=i2c0,address=0x20,id=exp0",
