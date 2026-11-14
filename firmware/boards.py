@@ -48,6 +48,11 @@ def meshcore_bare(air=None, **_):
     return "esp32s3", sx1262(nss=7, reset=8, busy=15, dio1=16, air=air)
 
 
+def esp32s3_devkitc(**_):
+    """An ESP32-S3 DevKitC on its own: the chip, its flash, the console on UART0 and USB."""
+    return "esp32s3", []
+
+
 def button(name, pin, key=None):
     return ["-device", "gpio-button,pin=%d,id=%s%s" % (pin, name, ",key=" + key if key else "")]
 
@@ -107,6 +112,7 @@ def gbagate_devkit(**_):
 
 
 BOARDS = {
+    "esp32s3-devkitc": esp32s3_devkitc,
     "meshcore-bare": meshcore_bare,
     "t-deck": t_deck,
     "gbagate-carrier-touch": gbagate_carrier_touch,
@@ -115,8 +121,9 @@ BOARDS = {
 
 
 class Node:
-    def __init__(self, name, proc, log_path):
+    def __init__(self, name, proc, log_path, qmp_path=None):
         self.name, self.proc, self.log_path = name, proc, log_path
+        self.qmp_path = qmp_path or log_path[:-4] + "-qmp.sock"
 
     def log(self):
         """UART0 and the USB serial (the console is on one or the other)."""
@@ -158,7 +165,7 @@ class Node:
         import json
         import socket
         sock = socket.socket(socket.AF_UNIX)
-        sock.connect(self.log_path[:-4] + "-qmp.sock")
+        sock.connect(self.qmp_path)
         f = sock.makefile("rw")
         f.readline()                                    # Greeting
         for msg in ({"execute": "qmp_capabilities"}, {"execute": command, "arguments": arguments}):
@@ -206,7 +213,11 @@ def boot(board, flash, workdir, name="node", hci=None, extra=(), **opts):
             "-serial", "tcp:127.0.0.1:%d" % hci if hci else "null",
             "-serial", "null",
             "-serial", "file:" + log[:-4] + "-usb.log"]
-    args += ["-qmp", "unix:%s,server=on,wait=off" % (log[:-4] + "-qmp.sock")]
+    qmp = log[:-4] + "-qmp.sock"
+    if len(qmp.encode()) >= 100:                   # Unix socket paths: under 108 bytes
+        import tempfile
+        qmp = os.path.join(tempfile.mkdtemp(prefix="qmp-"), name + ".sock")
+    args += ["-qmp", "unix:%s,server=on,wait=off" % qmp]
     if QEMU_BIOS:
         args += ["-L", QEMU_BIOS]
     args += devices + list(extra)                  # e.g. ["-gdb", "tcp::1234"]
@@ -214,4 +225,4 @@ def boot(board, flash, workdir, name="node", hci=None, extra=(), **opts):
         f.write(" ".join(args) + "\n")
     proc = subprocess.Popen(args, stdout=open(os.path.join(workdir, name + "-qemu.log"), "w"),
                             stderr=subprocess.STDOUT)
-    return Node(name, proc, log)
+    return Node(name, proc, log, qmp)

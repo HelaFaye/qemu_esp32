@@ -4,7 +4,7 @@ name: Firmware in QEMU
 # boards (firmware/boards.py) with the patched QEMU, and checked by its serial output.
 on:
   push:
-    paths: ["patches/espressif-qemu/**", "firmware/**", "radio/**", ".github/workflows/firmware.yml"]
+    paths: ["patches/espressif-qemu/**", "firmware/**", "radio/**", "faults/**", ".github/workflows/firmware.yml"]
   workflow_dispatch:
 
 jobs:
@@ -160,3 +160,38 @@ jobs:
         with:
           name: t-deck-screens-and-logs
           path: ${{ runner.temp }}/tdeck/run
+
+  fault-injection:
+    needs: qemu
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-espidf-faults-${{ hashFiles('faults/target/platformio.ini') }}
+      - name: Tools
+        run: |
+          pip install -q platformio esptool
+          sudo apt-get update && sudo apt-get install -y libglib2.0-0 libpixman-1-0 libgcrypt20 libslirp0
+      - uses: actions/download-artifact@v4
+        with:
+          name: qemu-xtensa
+          path: ${{ runner.temp }}/qemu
+      - name: Build the fault target (a PIN check, plain and hardened)
+        run: faults/target/build.sh "$RUNNER_TEMP/faults"
+      - name: Glitch campaigns on both (skips, zeroed results)
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: |
+          chmod +x "$QEMU_XTENSA"
+          python3 faults/demo.py "$RUNNER_TEMP/faults/flash.bin" "$RUNNER_TEMP/faults/firmware.elf" "$RUNNER_TEMP/faults/run"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fault-campaigns
+          path: ${{ runner.temp }}/faults/run

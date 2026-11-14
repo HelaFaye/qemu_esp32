@@ -71,12 +71,17 @@ A supply that dips or glitches does three things to a chip, all modeled as effec
   RTC_CNTL brown-out interrupt and reset). A test schedules dips (by time, or at a code
   address: "during the flash write") and checks the firmware comes back consistent
   (its NVS, its files, its pairing data).
-- **Glitches.** A dip too short for a reset makes instructions misbehave: one skipped,
-  a load returning the wrong value, a compare going the wrong way. Injected at an address
-  or a time window, with a probability per instruction, through a QEMU device driven over
-  QMP. This is how secure-boot checks, PIN checks and length checks are attacked; a test
-  shows whether the firmware's own checks survive one fault (double checks, verified
-  results).
+- **Glitches (exists: `faults/`).** A dip too short for a reset makes instructions
+  misbehave: one skipped, a load returning the wrong value, a compare going the wrong
+  way. Injected at an instruction address (and its N-th execution) through QEMU's GDB
+  stub, so any board and firmware can be glitched unchanged: `faults/inject.py` (skip,
+  flip or set a register after an instruction, flip or set memory, reset) and
+  `faults/campaign.py`, which faults every instruction of the functions you name and
+  sorts the outcomes (bypass, no effect, crash, hang). This is how secure-boot checks,
+  PIN checks and length checks are attacked; the demo (`faults/target`, `faults/demo.py`,
+  run in CI) shows a plain PIN check bypassed by 4 different single skips and a hardened
+  one bypassed by none. Next: faults by time window and probability, and multi-fault
+  (pairs of instructions).
 - **Peripheral effects.** A dip that resets a part but not the chip (the display or radio
   on its own regulator): the part loses its state, and the firmware has to notice.
 
@@ -86,7 +91,8 @@ A pulse from a probe over the chip does locally what a voltage glitch does globa
 instruction and data faults, register and memory bit flips. Modeled the same way as
 glitches (3), with spatial choice: which unit is hit (a CPU core, its cache or SRAM, a
 peripheral's registers) instead of the whole chip, and a fault model per unit (bit
-flips, stuck bits, a skipped instruction). Same QMP-driven injector, same tests.
+flips, stuck bits, a skipped instruction). Same injector (`faults/`), same campaigns;
+today a memory fault can already be aimed at one SRAM region or peripheral register.
 
 ## 5. Boards from KiCad
 
@@ -108,8 +114,8 @@ Today a board is written by hand in `firmware/boards.py`. Planned, in two steps:
 
 1. Radio: positions, path loss, SNR limits and noise-raising interferers (done); moving
    nodes, interferers as packets, recording and replay.
-2. Fault injector device in QEMU (instruction skip, register and memory faults, resets),
-   driven over QMP, with a Python API next to `boards.py`.
+2. Fault injector (done: instruction skip, register and memory faults, resets, campaigns,
+   through the GDB stub); next, faults by time and probability, and multiple faults.
 3. Brown-out (RTC_CNTL) and part power domains.
 4. Bus and pin error models (SPI, I2C, UART, SD, GPIO).
 5. KiCad netlist to board; then the PCB file's routing to EMI rates; then the plugin.

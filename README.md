@@ -23,7 +23,8 @@ design: [docs/STRESS-TESTING.md](docs/STRESS-TESTING.md).
 |---|---|
 | [`patches/espressif-qemu/`](patches/espressif-qemu) | The emulation: a patch series for [Espressif's QEMU](https://github.com/espressif/qemu) (pinned in `BASE`; `build.sh` fetches, applies and builds). Its README documents every device, its properties and wiring |
 | [`firmware/boards.py`](firmware/boards.py) | Boards as Python: a function per board returns its QEMU devices and wiring; `boot()` starts one and gives you its serial log, its screens (`screendump`) and its inputs (`qmp`) |
-| [`radio/`](radio) | The air between LoRa radios in different QEMUs (`airhub.py`): per-link signal strength, loss and corruption |
+| [`radio/`](radio) | The air between LoRa radios in different QEMUs (`airhub.py`): per-link signal strength, loss and corruption, or positions, path loss, noise and interferers (`environment.py`) |
+| [`faults/`](faults) | Fault injection: skipped instructions, corrupted registers and memory, resets, aimed at any instruction of any firmware; glitch campaigns over whole functions (`campaign.py`) |
 | [`bluetooth/`](bluetooth) | Virtual Bluetooth: your firmware's own host stack (Bluedroid, NimBLE) over HCI to a virtual controller, with virtual phones and controllers as peers |
 | [`firmware/`](firmware) | Test cases: real firmware built from its repository and checked on its board |
 
