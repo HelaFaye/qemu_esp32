@@ -172,7 +172,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.platformio
-          key: pio-espidf-faults-${{ hashFiles('faults/target/platformio.ini') }}
+          key: pio-espidf-faults-${{ hashFiles('faults/*/platformio.ini') }}
       - name: Tools
         run: |
           pip install -q platformio esptool
@@ -190,6 +190,13 @@ jobs:
         run: |
           chmod +x "$QEMU_XTENSA"
           python3 faults/demo.py "$RUNNER_TEMP/faults/flash.bin" "$RUNNER_TEMP/faults/firmware.elf" "$RUNNER_TEMP/faults/run"
+      - name: Build the power-failure target (a counter in NVS)
+        run: faults/power-target/build.sh "$RUNNER_TEMP/power"
+      - name: Power cuts, cuts in flash writes, brown-outs
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: python3 faults/power_demo.py "$RUNNER_TEMP/power/flash.bin" "$RUNNER_TEMP/power/firmware.elf" "$RUNNER_TEMP/faults/run/power" 12
       - uses: actions/upload-artifact@v4
         if: always()
         with:

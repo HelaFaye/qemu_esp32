@@ -67,10 +67,17 @@ optional properties on the bus and pin models:
 ## 3. Voltage fault injection (VFI)
 
 A supply that dips or glitches does three things to a chip, all modeled as effects:
-- **Brown-out.** Below the brown-out detector's threshold the chip resets (the S3's
-  RTC_CNTL brown-out interrupt and reset). A test schedules dips (by time, or at a code
-  address: "during the flash write") and checks the firmware comes back consistent
-  (its NVS, its files, its pairing data).
+- **Brown-out and power cuts (exists: patch 0010, `Node.set_vdd`/`brownout`/
+  `power_cut`).** The S3's supply is a number a test sets: below the brown-out
+  detector's threshold its interrupt fires (ESP-IDF reports it and restarts, again while
+  the supply stays low) or, if the firmware asked for it, the chip resets with the
+  brown-out cause; with no supply the chip stops, and its return is a power-on reset.
+  Dips go by time, or at a code address with the injector ("as the flash write
+  starts"). `faults/power_demo.py` cuts and dips power under an NVS counter committed
+  every 10 ms and checks it comes back with the right reset reason and nothing
+  committed lost (in CI). Next: the threshold the firmware writes over the analog I2C
+  bus (a property for now), flash power-down during the dip (CLOSE_FLASH_ENA), and cuts
+  in the middle of a flash program or erase rather than at its start.
 - **Glitches (exists: `faults/`).** A dip too short for a reset makes instructions
   misbehave: one skipped, a load returning the wrong value, a compare going the wrong
   way. Injected at an instruction address (and its N-th execution) through QEMU's GDB
@@ -116,6 +123,7 @@ Today a board is written by hand in `firmware/boards.py`. Planned, in two steps:
    nodes, interferers as packets, recording and replay.
 2. Fault injector (done: instruction skip, register and memory faults, resets, campaigns,
    through the GDB stub); next, faults by time and probability, and multiple faults.
-3. Brown-out (RTC_CNTL) and part power domains.
+3. Brown-out and power cuts (done: the S3's supply and brown-out detector); next, part
+   power domains (a display or radio on its own regulator).
 4. Bus and pin error models (SPI, I2C, UART, SD, GPIO).
 5. KiCad netlist to board; then the PCB file's routing to EMI rates; then the plugin.

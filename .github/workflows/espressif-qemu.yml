@@ -24,7 +24,7 @@ jobs:
       - name: QTests
         working-directory: ${{ runner.temp }}/esp-qemu/build
         run: |
-          tests="esp-periph-test esp-spi-test esp32s3-intmatrix-test esp32s3-gpio-test esp32s3-gpspi-test esp32s3-spi-devices-test esp32s3-i2c-test esp32s3-i2c-devices-test esp32s3-sx1262-test esp32s3-usb-serial-jtag-test"
+          tests="esp-periph-test esp-spi-test esp32s3-intmatrix-test esp32s3-gpio-test esp32s3-gpspi-test esp32s3-spi-devices-test esp32s3-i2c-test esp32s3-i2c-devices-test esp32s3-sx1262-test esp32s3-usb-serial-jtag-test esp32s3-brownout-test"
           ninja $(for t in $tests; do echo tests/qtest/$t; done)
           for t in $tests; do
             echo "== $t"

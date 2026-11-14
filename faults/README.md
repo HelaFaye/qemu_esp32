@@ -20,12 +20,29 @@ inj.skip(0x42001201)                              # Next time it gets there: not
 inj.flip_register_after(0x420011ef, "a2", bit=4)  # Executed, its result with bit 4 flipped
 inj.set_register_after(0x420011ef, "a2", 0)       # ... or zeroed
 inj.flip_memory(0x3fc90000, bit=7)                # Now (or at=ADDR: when it gets there)
-node.qmp("system_reset")                          # Brown-out: the whole chip resets
+node.qmp("system_reset")                          # A reset, no more
 inj.close()
 ```
 
 `count=N` picks the N-th time an address is reached. Registers: `pc`, `a0`-`a15` (the
 current window), `ar0`-`ar63`, `sar`, `windowbase`, `windowstart`, `ps`.
+
+## Power (`boards.Node`, patch 0010)
+
+```python
+node.set_vdd(2300)            # Below the brown-out threshold (2440 mV): ESP-IDF restarts
+node.brownout(2300, 0.05)     # A 50 ms dip
+node.power_cut(0.1)           # No supply for 100 ms, then a power-on reset
+inj.run_to(esp_flash_write_addr); node.set_vdd(0); inj.cont()   # A cut as a flash write starts
+```
+
+`power_demo.py` with `power-target/` (a counter in NVS, committed every 10 ms) runs
+random cuts, cuts as a flash write starts, and brown-outs, and checks each comes back
+with the right reset reason, NVS opening, and nothing it reported committed lost:
+
+```sh
+faults/power-target/build.sh out && faults/power_demo.py out/flash.bin out/firmware.elf out/run 12
+```
 
 ## Campaigns (`campaign.py`)
 

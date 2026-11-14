@@ -188,6 +188,31 @@ class Node:
         w, h = map(int, parts[1].split())
         return w, h, parts[3]
 
+    # -- The supply (patch 0010: RTC_CNTL's vdd-mv; the S3) ---------------------------
+
+    RTC_CNTL = "/machine/soc/rtc_cntl"
+
+    def set_vdd(self, mv):
+        """The chip's supply, in millivolts (3300 normally). Below the brown-out
+        detector's threshold (2440, ESP-IDF's default level) the detector trips: ESP-IDF
+        reports it and restarts, again while it stays low; below 1800 the chip is off,
+        and coming back is a power-on reset."""
+        self.qmp("qom-set", path=self.RTC_CNTL, property="vdd-mv", value=int(mv))
+
+    def vdd(self):
+        return self.qmp("qom-get", path=self.RTC_CNTL, property="vdd-mv")
+
+    def brownout(self, mv=2300, seconds=0.05, nominal=3300):
+        """A dip to mv for a while (wall-clock time), then back to nominal."""
+        self.set_vdd(mv)
+        time.sleep(seconds)
+        self.set_vdd(nominal)
+
+    def power_cut(self, seconds=0.1, nominal=3300):
+        """The supply gone (a pulled cable, a dead battery), then back: a power-on reset.
+        Flash keeps what was written before the cut."""
+        self.brownout(0, seconds, nominal)
+
     def stop(self):
         if self.proc.poll() is None:
             self.proc.kill()

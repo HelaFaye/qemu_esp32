@@ -1,0 +1,423 @@
+From c629a1cbe727316d694a92de829d67b9a8e023e1 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Sat, 14 Nov 2026 13:51:51 +0000
+Subject: [PATCH 10/10] esp32s3: supply voltage and brown-out detector
+
+RTC_CNTL gets its interrupt registers (INT_ENA/RAW/ST/CLR, W1TS/W1TC) on
+ETS_RTC_CORE_INTR_SOURCE and the BROWN_OUT register. The supply is a run-time
+property, vdd-mv (qom-set /machine/soc/rtc_cntl): below bod-mv (2440, the
+ESP-IDF default level) the detector reads DET and raises its interrupt (a
+level), and with RST_ENA resets the chip with the brown-out cause after
+RST_WAIT slow-clock cycles; below por-mv (1800) both cores stop, and the
+supply's return is a power-on reset.
+---
+ hw/misc/esp32s3_rtc_cntl.c          | 134 +++++++++++++++++++++++++++-
+ hw/xtensa/esp32s3.c                 |   2 +
+ include/hw/misc/esp32s3_rtc_cntl.h  |  37 ++++++++
+ tests/qtest/esp32s3-brownout-test.c | 119 ++++++++++++++++++++++++
+ tests/qtest/meson.build             |   2 +-
+ 5 files changed, 291 insertions(+), 3 deletions(-)
+ create mode 100644 tests/qtest/esp32s3-brownout-test.c
+
+diff --git a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
+index 76076c7..c3e320f 100644
+--- a/hw/misc/esp32s3_rtc_cntl.c
++++ b/hw/misc/esp32s3_rtc_cntl.c
+@@ -18,11 +18,23 @@
+ #include "hw/sysbus.h"
+ #include "hw/irq.h"
+ #include "hw/qdev-properties.h"
++#include "qapi/visitor.h"
+ #include "hw/misc/esp32s3_reg.h"
+ #include "hw/misc/esp32s3_rtc_cntl.h"
+ 
+ static void esp32s3_rtc_update_cpu_stall(Esp32s3RtcCntlState* s);
+ static void esp32s3_rtc_update_clk(Esp32s3RtcCntlState* s);
++static void esp32s3_rtc_supply_update(Esp32s3RtcCntlState *s);
++
++static bool esp32s3_rtc_browned_out(Esp32s3RtcCntlState *s)
++{
++    return s->vdd_mv < s->bod_mv;
++}
++
++static void esp32s3_rtc_update_irq(Esp32s3RtcCntlState *s)
++{
++    qemu_set_irq(s->irq, !!(s->int_raw & s->int_ena));
++}
+ 
+ static uint64_t esp32s3_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+@@ -66,6 +78,20 @@ static uint64_t esp32s3_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int si
+         r = s->sw_cpu_stall_reg;
+         break;
+ 
++    case A_RTC_CNTL_INT_ENA:
++        r = s->int_ena;
++        break;
++    case A_RTC_CNTL_INT_RAW:
++        r = s->int_raw;
++        break;
++    case A_RTC_CNTL_INT_ST:
++        r = s->int_raw & s->int_ena;
++        break;
++    case A_RTC_CNTL_BROWN_OUT:
++        r = s->brown_out_reg;
++        r = FIELD_DP32(r, RTC_CNTL_BROWN_OUT, DET, esp32s3_rtc_browned_out(s));
++        break;
++
+     case A_RTC_CNTL_STORE4:
+     case A_RTC_CNTL_STORE5:
+     case A_RTC_CNTL_STORE6:
+@@ -136,6 +162,29 @@ static void esp32s3_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
+         esp32s3_rtc_update_cpu_stall(s);
+         break;
+ 
++    case A_RTC_CNTL_INT_ENA:
++        s->int_ena = value;
++        esp32s3_rtc_update_irq(s);
++        break;
++    case A_RTC_CNTL_INT_ENA_W1TS:
++        s->int_ena |= value;
++        esp32s3_rtc_update_irq(s);
++        break;
++    case A_RTC_CNTL_INT_ENA_W1TC:
++        s->int_ena &= ~value;
++        esp32s3_rtc_update_irq(s);
++        break;
++    case A_RTC_CNTL_INT_CLR:
++        s->int_raw &= ~value;
++        /* The detector's output is a level: still below, still pending */
++        esp32s3_rtc_supply_update(s);
++        esp32s3_rtc_update_irq(s);
++        break;
++    case A_RTC_CNTL_BROWN_OUT:
++        s->brown_out_reg = value & ~(R_RTC_CNTL_BROWN_OUT_DET_MASK | R_RTC_CNTL_BROWN_OUT_CNT_CLR_MASK);
++        esp32s3_rtc_supply_update(s);
++        break;
++
+     case A_RTC_CNTL_STORE4:
+     case A_RTC_CNTL_STORE5:
+     case A_RTC_CNTL_STORE6:
+@@ -155,8 +204,9 @@ static void esp32s3_rtc_update_cpu_stall(Esp32s3RtcCntlState* s)
+ 
+     const uint32_t stall_magic_val = 0x86;
+ 
+-    s->cpu_stall_state[0] = procpu_stall == stall_magic_val;
+-    s->cpu_stall_state[1] = appcpu_stall == stall_magic_val;
++    /* No supply: both cores held */
++    s->cpu_stall_state[0] = procpu_stall == stall_magic_val || s->powered_off;
++    s->cpu_stall_state[1] = appcpu_stall == stall_magic_val || s->powered_off;
+ 
+     qemu_set_irq(s->cpu_stall_req[0], s->cpu_stall_state[0]);
+     qemu_set_irq(s->cpu_stall_req[1], s->cpu_stall_state[1]);
+@@ -171,6 +221,76 @@ static void esp32s3_rtc_update_clk(Esp32s3RtcCntlState* s)
+     qemu_irq_pulse(s->clk_update);
+ }
+ 
++/* The brown-out reset, RST_WAIT slow-clock cycles after the detector tripped */
++static void esp32s3_rtc_bod_reset(void *opaque)
++{
++    Esp32s3RtcCntlState *s = ESP32S3_RTC_CNTL(opaque);
++    if (!esp32s3_rtc_browned_out(s) || s->powered_off) {
++        return;
++    }
++    s->reset_cause[0] = ESP32_RTCWDT_BROWN_OUT_RESET;
++    s->reset_cause[1] = ESP32_RTCWDT_BROWN_OUT_RESET;
++    qemu_irq_pulse(s->dig_reset_req);
++}
++
++static void esp32s3_rtc_supply_update(Esp32s3RtcCntlState *s)
++{
++    bool enabled = FIELD_EX32(s->brown_out_reg, RTC_CNTL_BROWN_OUT, ENA);
++    bool low = esp32s3_rtc_browned_out(s);
++
++    if (s->vdd_mv < s->por_mv) {
++        if (!s->powered_off) {
++            s->powered_off = true;
++            timer_del(s->bod_reset_timer);
++            esp32s3_rtc_update_cpu_stall(s);
++        }
++        return;
++    }
++    if (s->powered_off) {
++        /* Power is back: everything starts over, as from power-on */
++        s->powered_off = false;
++        s->brown_out_reg = 0;
++        s->int_ena = s->int_raw = 0;
++        s->reset_cause[0] = ESP32_POWERON_RESET;
++        s->reset_cause[1] = ESP32_POWERON_RESET;
++        esp32s3_rtc_update_cpu_stall(s);
++        esp32s3_rtc_update_irq(s);
++        qemu_irq_pulse(s->dig_reset_req);
++        return;
++    }
++    if (enabled && low) {
++        s->int_raw |= RTC_CNTL_INT_BROWN_OUT;
++        if (FIELD_EX32(s->brown_out_reg, RTC_CNTL_BROWN_OUT, RST_ENA) &&
++            !timer_pending(s->bod_reset_timer)) {
++            uint32_t wait = FIELD_EX32(s->brown_out_reg, RTC_CNTL_BROWN_OUT, RST_WAIT);
++            timer_mod(s->bod_reset_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                      muldiv64(wait, NANOSECONDS_PER_SECOND, s->rtc_slowclk_freq));
++        }
++    } else {
++        timer_del(s->bod_reset_timer);
++    }
++    esp32s3_rtc_update_irq(s);
++}
++
++static void esp32s3_rtc_get_vdd(Object *obj, Visitor *v, const char *name,
++                                void *opaque, Error **errp)
++{
++    Esp32s3RtcCntlState *s = ESP32S3_RTC_CNTL(obj);
++    visit_type_uint32(v, name, &s->vdd_mv, errp);
++}
++
++static void esp32s3_rtc_set_vdd(Object *obj, Visitor *v, const char *name,
++                                void *opaque, Error **errp)
++{
++    Esp32s3RtcCntlState *s = ESP32S3_RTC_CNTL(obj);
++    uint32_t mv;
++    if (!visit_type_uint32(v, name, &mv, errp)) {
++        return;
++    }
++    s->vdd_mv = mv;
++    esp32s3_rtc_supply_update(s);
++}
++
+ static const MemoryRegionOps esp32s3_rtc_cntl_ops = {
+     .read =  esp32s3_rtc_cntl_read,
+     .write = esp32s3_rtc_cntl_write,
+@@ -182,6 +302,10 @@ static void esp32s3_rtc_cntl_reset_hold(Object *obj, ResetType type)
+     Esp32s3RtcCntlState *s = ESP32S3_RTC_CNTL(obj);
+ 
+     s->time_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    s->int_ena = 0;
++    s->int_raw = 0;
++    timer_del(s->bod_reset_timer);
++    esp32s3_rtc_update_irq(s);
+ }
+ 
+ static void esp32s3_rtc_cntl_realize(DeviceState *dev, Error **errp)
+@@ -210,12 +334,18 @@ static void esp32s3_rtc_cntl_init(Object *obj)
+     s->rtc_slowclk = ESP32_SLOW_CLK_RC;
+     s->rtc_fastclk = ESP32_FAST_CLK_8M;
+     s->soc_clk = ESP32_SOC_CLK_XTAL;
++    s->bod_reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_rtc_bod_reset, s);
++    s->vdd_mv = 3300;
++    object_property_add(obj, "vdd-mv", "uint32", esp32s3_rtc_get_vdd, esp32s3_rtc_set_vdd,
++                        NULL, NULL);
+     s->xtal_apb_freq = 40000000;
+     s->pll_apb_freq = 80000000;
+     esp32s3_rtc_update_clk(s);
+ }
+ 
+ static Property esp32s3_rtc_cntl_properties[] = {
++    DEFINE_PROP_UINT32("bod-mv", Esp32s3RtcCntlState, bod_mv, 2440),
++    DEFINE_PROP_UINT32("por-mv", Esp32s3RtcCntlState, por_mv, 1800),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index 61325ad..2155666 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -513,6 +513,8 @@ static void esp32s3_soc_realize(DeviceState *dev, Error **errp)
+ 
+     qdev_realize(DEVICE(&s->rtc_cntl), &s->rtc_bus, &error_fatal);
+     esp32s3_soc_add_periph_device(sys_mem, &s->rtc_cntl, DR_REG_RTCCNTL_BASE);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc_cntl), 0,
++                       qdev_get_gpio_in(DEVICE(&s->intmatrix), ETS_RTC_CORE_INTR_SOURCE));
+ 
+     qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_DIG_RESET_GPIO, 0,
+                                 qdev_get_gpio_in_named(dev, ESP32S3_RTC_DIG_RESET_GPIO, 0));
+diff --git a/include/hw/misc/esp32s3_rtc_cntl.h b/include/hw/misc/esp32s3_rtc_cntl.h
+index 45bd7e2..1ba2432 100644
+--- a/include/hw/misc/esp32s3_rtc_cntl.h
++++ b/include/hw/misc/esp32s3_rtc_cntl.h
+@@ -84,8 +84,45 @@ typedef struct Esp32s3RtcCntlState {
+     uint32_t scratch_reg[ESP32S3_RTC_CNTL_SCRATCH_REG_COUNT];
+     Esp32s3ResetCause reset_cause[ESP32S3_CPU_COUNT];
+     bool stat_vector_sel[ESP32S3_CPU_COUNT];
++
++    /* Interrupts (only the brown-out detector's is raised here) */
++    uint32_t int_ena;
++    uint32_t int_raw;
++
++    /* The supply and the brown-out detector. vdd_mv is set at run time (QMP qom-set
++     * <rtc_cntl> vdd-mv): below bod_mv the detector trips (BROWN_OUT_DET, its interrupt,
++     * and a brown-out reset after RST_WAIT if RST_ENA); below por_mv the chip is off
++     * (both cores held) and coming back above it is a power-on reset. bod_mv is the
++     * threshold the firmware picked (ESP-IDF: CONFIG_ESP_BROWNOUT_DET_LVL, level 7 =
++     * 2.44 V); it's written over the analog I2C bus, which isn't modeled, so it's a
++     * property. */
++    uint32_t brown_out_reg;
++    uint32_t vdd_mv;
++    uint32_t bod_mv;
++    uint32_t por_mv;
++    bool powered_off;
++    QEMUTimer *bod_reset_timer;
+ } Esp32s3RtcCntlState;
+ 
++REG32(RTC_CNTL_INT_ENA, 0x40)
++REG32(RTC_CNTL_INT_RAW, 0x44)
++REG32(RTC_CNTL_INT_ST, 0x48)
++REG32(RTC_CNTL_INT_CLR, 0x4c)
++#define RTC_CNTL_INT_BROWN_OUT (1u << 9)
++REG32(RTC_CNTL_BROWN_OUT, 0xe8)
++    FIELD(RTC_CNTL_BROWN_OUT, DET, 31, 1)
++    FIELD(RTC_CNTL_BROWN_OUT, ENA, 30, 1)
++    FIELD(RTC_CNTL_BROWN_OUT, CNT_CLR, 29, 1)
++    FIELD(RTC_CNTL_BROWN_OUT, ANA_RST_EN, 28, 1)
++    FIELD(RTC_CNTL_BROWN_OUT, RST_SEL, 27, 1)
++    FIELD(RTC_CNTL_BROWN_OUT, RST_ENA, 26, 1)
++    FIELD(RTC_CNTL_BROWN_OUT, RST_WAIT, 16, 10)
++    FIELD(RTC_CNTL_BROWN_OUT, PD_RF_ENA, 15, 1)
++    FIELD(RTC_CNTL_BROWN_OUT, CLOSE_FLASH_ENA, 14, 1)
++    FIELD(RTC_CNTL_BROWN_OUT, INT_WAIT, 4, 10)
++REG32(RTC_CNTL_INT_ENA_W1TS, 0x138)
++REG32(RTC_CNTL_INT_ENA_W1TC, 0x13c)
++
+ REG32(RTC_CNTL_OPTIONS0, 0x00)
+     FIELD(RTC_CNTL_OPTIONS0, SW_SYS_RESET, 31, 1)
+     FIELD(RTC_CNTL_OPTIONS0, SW_PROCPU_RESET, 5, 1)
+diff --git a/tests/qtest/esp32s3-brownout-test.c b/tests/qtest/esp32s3-brownout-test.c
+new file mode 100644
+index 0000000..76f0a80
+--- /dev/null
++++ b/tests/qtest/esp32s3-brownout-test.c
+@@ -0,0 +1,119 @@
++/*
++ * QTest for the ESP32-S3 supply and brown-out detector (RTC_CNTL): the supply is a
++ * property (vdd-mv); below the threshold the detector trips, raises its interrupt
++ * while it stays low, and resets the chip with the brown-out cause when RST_ENA; with
++ * no supply the cores stop, and its return is a power-on reset.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "libqtest.h"
++#include "qapi/qmp/qdict.h"
++
++#define RTC             0x60008000
++#define RESET_STATE     (RTC + 0x38)
++#define INT_ENA         (RTC + 0x40)
++#define INT_RAW         (RTC + 0x44)
++#define INT_ST          (RTC + 0x48)
++#define INT_CLR         (RTC + 0x4c)
++#define BROWN_OUT       (RTC + 0xe8)
++#define INT_ENA_W1TS    (RTC + 0x138)
++
++#define BOD_INT         BIT(9)
++#define BOD_DET         BIT(31)
++#define BOD_ENA         BIT(30)
++#define BOD_RST_ENA     BIT(26)
++#define BOD_RST_WAIT(n) ((uint32_t)(n) << 16)
++
++#define INTMATRIX_STATUS1   0x600C2190      /* Sources 32-63 */
++#define RTC_CORE_SOURCE     39
++
++#define PATH "/machine/soc/rtc_cntl"
++
++static void set_vdd(QTestState *qts, unsigned mv)
++{
++    QDict *r = qtest_qmp(qts, "{'execute': 'qom-set', 'arguments': "
++                         "{'path': %s, 'property': 'vdd-mv', 'value': %u}}", PATH, mv);
++    g_assert(qdict_haskey(r, "return"));
++    qobject_unref(r);
++}
++
++static void test_interrupt(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++
++    qtest_writel(qts, BROWN_OUT, BOD_ENA);
++    qtest_writel(qts, INT_ENA_W1TS, BOD_INT);
++    g_assert_cmphex(qtest_readl(qts, BROWN_OUT) & BOD_DET, ==, 0);
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & BOD_INT, ==, 0);
++
++    set_vdd(qts, 2300);                         /* Below 2.44 V */
++    g_assert_cmphex(qtest_readl(qts, BROWN_OUT) & BOD_DET, ==, BOD_DET);
++    g_assert_cmphex(qtest_readl(qts, INT_ST) & BOD_INT, ==, BOD_INT);
++    g_assert_cmphex(qtest_readl(qts, INTMATRIX_STATUS1) & BIT(RTC_CORE_SOURCE - 32), !=, 0);
++
++    /* A level: cleared while still low, it's pending again */
++    qtest_writel(qts, INT_CLR, BOD_INT);
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & BOD_INT, ==, BOD_INT);
++
++    set_vdd(qts, 3300);
++    qtest_writel(qts, INT_CLR, BOD_INT);
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & BOD_INT, ==, 0);
++    g_assert_cmphex(qtest_readl(qts, BROWN_OUT) & BOD_DET, ==, 0);
++    g_assert_cmphex(qtest_readl(qts, INTMATRIX_STATUS1) & BIT(RTC_CORE_SOURCE - 32), ==, 0);
++
++    /* Detector off: nothing */
++    qtest_writel(qts, BROWN_OUT, 0);
++    set_vdd(qts, 2300);
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & BOD_INT, ==, 0);
++    qtest_quit(qts);
++}
++
++static void test_reset(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++
++    /* RST_WAIT 0x3ff slow-clock cycles: about 6.8 ms at 150 kHz */
++    qtest_writel(qts, BROWN_OUT, BOD_ENA | BOD_RST_ENA | BOD_RST_WAIT(0x3ff));
++    set_vdd(qts, 2000);
++    qtest_clock_step(qts, 3 * 1000 * 1000);
++    g_assert_cmpint(qtest_readl(qts, RESET_STATE) & 0x3f, ==, 1);    /* Not yet */
++    set_vdd(qts, 3300);                                              /* Recovered in time */
++    qtest_clock_step(qts, 10 * 1000 * 1000);
++    g_assert_cmpint(qtest_readl(qts, RESET_STATE) & 0x3f, ==, 1);
++
++    set_vdd(qts, 2000);
++    qtest_clock_step(qts, 10 * 1000 * 1000);
++    g_assert_cmpint(qtest_readl(qts, RESET_STATE) & 0x3f, ==, 15);   /* Brown-out */
++    qtest_quit(qts);
++}
++
++static void test_power_cut(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++
++    qtest_writel(qts, RTC + 0x00, BIT(31));      /* A software reset first: cause 3 */
++    qtest_clock_step(qts, 1000);
++    g_assert_cmpint(qtest_readl(qts, RESET_STATE) & 0x3f, ==, 3);
++    qtest_writel(qts, BROWN_OUT, BOD_ENA);
++    set_vdd(qts, 0);
++    qtest_clock_step(qts, 1000 * 1000);
++    set_vdd(qts, 3300);
++    qtest_clock_step(qts, 1000);
++    g_assert_cmpint(qtest_readl(qts, RESET_STATE) & 0x3f, ==, 1);    /* Power-on */
++    g_assert_cmphex(qtest_readl(qts, BROWN_OUT), ==, 0);
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/brownout/interrupt", test_interrupt);
++    qtest_add_func("/esp32s3/brownout/reset", test_reset);
++    qtest_add_func("/esp32s3/brownout/power-cut", test_power_cut);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 05d2af8..4db43a4 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+

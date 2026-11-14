@@ -1,7 +1,7 @@
 From c969c73c662d76cac75c466494a422f14a2f6e96 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Tue, 10 Nov 2026 05:32:12 +0000
-Subject: [PATCH 2/9] esp32s3: GP-SPI2/3 masters with GDMA; pin-link to wire
+Subject: [PATCH 02/10] esp32s3: GP-SPI2/3 masters with GDMA; pin-link to wire
  boards
 
 GP-SPI2 (0x60024000) and GP-SPI3 (0x60025000) were missing. Each now

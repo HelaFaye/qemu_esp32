@@ -1,7 +1,7 @@
 From daa6af0e44c501821b8b225a20527f7e98e6a57c Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Tue, 10 Nov 2026 05:25:03 +0000
-Subject: [PATCH 1/9] esp32s3: GPIO pins as wires: matrix, IO_MUX pulls,
+Subject: [PATCH 01/10] esp32s3: GPIO pins as wires: matrix, IO_MUX pulls,
  interrupts
 
 The S3's GPIO was register loopback: no pin levels, no IO_MUX (an unimp
