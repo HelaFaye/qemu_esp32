@@ -61,6 +61,17 @@ USB serial to `<name>-usb.log`; `node.log()` reads both (ESP-IDF often prints to
 Arduino's USB CDC boards only to the second). UART1 can carry HCI to a virtual Bluetooth
 controller: `boot(..., hci=PORT)`, see [`bluetooth/`](../bluetooth/README.md).
 
+A protocol on UART1 or UART2 (a bridge, a modem, a link to a host) can be driven from a
+test: `boot(..., uart1=5556, uart2=5557)` puts them on TCP ports QEMU listens on, and
+`node.uart(1)` connects. Two things make such a link slow without being wrong:
+- **Nagle and delayed ACKs.** A few bytes each way, as a request and its reply, each wait
+  25-50 ms on the host's TCP stack. `boot()` sets `nodelay=on` on its TCP serial ports
+  and `Node.uart()` sets `TCP_NODELAY`; do the same on your own sockets.
+- **Reading a whole buffer.** `uart_read_bytes(port, buf, sizeof buf, timeout)` returns
+  when the buffer is full or the timeout runs out, so every short packet waits out the
+  timeout (gbagate's bridge took ~50 ms a transfer this way). Read the first byte with the
+  timeout, then what `uart_get_buffered_data_len()` says has arrived, at once.
+
 ## Screens and inputs
 
 Every display is a screen: `node.screendump(path, device="lcd")` writes it as a PPM and
@@ -81,12 +92,14 @@ node.qmp("qom-set", path="/machine/peripheral/ball_click", property="pressed", v
 
 `boot(board, flash, workdir, name="node", hci=None, extra=(), **opts)` starts QEMU and
 returns a `Node`. `board` is a name from `BOARDS` or `"kicad:<design>"`; `opts` go to the
-board (`card=`, `sd=`, `air=`); `extra` adds QEMU arguments (`["-gdb", "tcp::1234"]`).
+board (`card=`, `sd=`, `air=`); `uart1=`/`uart2=` put those UARTs on TCP ports, `hci=`
+connects UART1 to a Bluetooth controller; `extra` adds QEMU arguments (`["-gdb", "tcp::1234"]`).
 Each node gets its own copy of the flash, so its NVS is its own.
 
 | `Node` | |
 |---|---|
 | `log()`, `wait_for(regex, timeout)`, `count(regex)` | Serial output (UART0 and USB) |
+| `uart(n)` | A socket on UART n, given `boot(..., uartN=port)` |
 | `qemu_output()` | What QEMU itself printed (why it didn't start) |
 | `qmp(command, **args)` | Any QMP command; its result |
 | `screendump(path, device)` | A display's picture |

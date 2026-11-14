@@ -232,6 +232,23 @@ class Node:
     def __init__(self, name, proc, log_path, qmp_path=None):
         self.name, self.proc, self.log_path = name, proc, log_path
         self.qmp_path = qmp_path or log_path[:-4] + "-qmp.sock"
+        self.uart_ports = {}
+
+    def uart(self, n, timeout=30):
+        """A socket on UART n (boot(..., uartN=port)): what the firmware writes to it
+        comes out, what's sent goes in. Nodelay, like QEMU's end."""
+        import socket
+        end = time.time() + timeout
+        while True:
+            try:
+                s = socket.create_connection(("127.0.0.1", self.uart_ports[n]), timeout=2)
+                break
+            except OSError:
+                if time.time() > end or self.proc.poll() is not None:
+                    raise
+                time.sleep(0.2)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return s
 
     def log(self):
         """UART0 and the USB serial (the console is on one or the other)."""
@@ -350,10 +367,21 @@ class Node:
             self.proc.wait()
 
 
-def boot(board, flash, workdir, name="node", hci=None, extra=(), **opts):
+def _uart_arg(listen=None, connect=None):
+    if listen:
+        return "tcp:127.0.0.1:%d,server=on,wait=off,nodelay=on" % listen
+    if connect:
+        return "tcp:127.0.0.1:%d,nodelay=on" % connect
+    return "null"
+
+
+def boot(board, flash, workdir, name="node", hci=None, uart1=None, uart2=None, extra=(), **opts):
     """Boot flash (a merged image) on a board. UART0 goes to <workdir>/<name>.log, the
-    USB serial (plugged in) to <name>-usb.log; hci: a TCP port for UART1 (a virtual
-    Bluetooth controller), else nothing on it."""
+    USB serial (plugged in) to <name>-usb.log. UART1 and UART2: uart1=/uart2= a TCP port
+    QEMU listens on, for a test to connect to (Node.uart(n)); or hci: a TCP port UART1
+    connects to (a virtual Bluetooth controller); else nothing on them. TCP serial ports
+    are nodelay: a protocol's few bytes each way would otherwise wait 25-50 ms each on
+    Nagle and delayed ACKs."""
     if board.startswith("kicad:"):
         machine, devices = from_kicad(board[len("kicad:"):], **opts)
     else:
@@ -372,8 +400,8 @@ def boot(board, flash, workdir, name="node", hci=None, extra=(), **opts):
     args = [QEMU, "-machine", machine, "-display", "none", "-monitor", "none", "-nic", "none",
             "-drive", "file=%s,if=mtd,format=raw" % img,
             "-serial", "file:" + log,
-            "-serial", "tcp:127.0.0.1:%d" % hci if hci else "null",
-            "-serial", "null",
+            "-serial", _uart_arg(uart1, hci),
+            "-serial", _uart_arg(uart2),
             "-serial", "file:" + log[:-4] + "-usb.log"]
     qmp = log[:-4] + "-qmp.sock"
     if len(qmp.encode()) >= 100:                   # Unix socket paths: under 108 bytes
@@ -385,6 +413,9 @@ def boot(board, flash, workdir, name="node", hci=None, extra=(), **opts):
     args += devices + list(extra)                  # e.g. ["-gdb", "tcp::1234"]
     with open(os.path.join(workdir, name + "-qemu.txt"), "w") as f:
         f.write(" ".join(args) + "\n")
+    node_ports = {1: uart1, 2: uart2}
     proc = subprocess.Popen(args, stdout=open(os.path.join(workdir, name + "-qemu.log"), "w"),
                             stderr=subprocess.STDOUT)
-    return Node(name, proc, log, qmp)
+    node = Node(name, proc, log, qmp)
+    node.uart_ports = {n: p for n, p in node_ports.items() if p}
+    return node
