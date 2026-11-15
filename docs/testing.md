@@ -19,13 +19,15 @@ patched tree, `tests/qtest/`:
 | `esp32s3-sx1262-test` | Two QEMUs' radios on one air |
 | `esp32s3-usb-serial-jtag-test` | USB Serial/JTAG with and without a host |
 | `esp32s3-brownout-test` | The supply, the brown-out detector, power cuts |
-| `esp32s3-phy-test` | What Wi-Fi start-up polls (calibrations, the MAC's reset), the temperature sensor, ADC conversions |
+| `esp32s3-phy-test` | What Wi-Fi start-up polls (calibrations, the MAC's reset), the temperature sensor, ADC conversions; LEDC's registers |
+| `esp32s3-lcd-cam-test` | LCD_CAM: an ST7789 on its parallel bus, commands and pixels by GDMA, byte order, the done interrupt; the glass read back exactly |
 
 ```sh
 cd ~/esp-qemu/build
 for t in esp32s3-intmatrix-test esp32s3-gpio-test esp32s3-gpspi-test esp32s3-spi-devices-test \
          esp32s3-i2c-test esp32s3-i2c-devices-test esp32s3-sx1262-test \
-         esp32s3-usb-serial-jtag-test esp32s3-brownout-test esp32s3-phy-test; do
+         esp32s3-usb-serial-jtag-test esp32s3-brownout-test esp32s3-phy-test \
+         esp32s3-lcd-cam-test; do
   ninja tests/qtest/$t && QTEST_QEMU_BINARY=./qemu-system-xtensa ./tests/qtest/$t
 done
 ```
@@ -45,6 +47,7 @@ peripherals they use. Details and how to run each: [`firmware/`](../firmware/REA
 | [gbagate](https://github.com/HelaFaye/gbagate) | its touch carrier, devkit and Supermini | ILI9341, XPT2046, SD over SPI with ESP-IDF's sdspi, MCP23017s (a chip reader, and buttons), ST7735, GPIO buttons; the picture read back from the glass, touches and button presses reaching the UI |
 | [meshcore-bare-esp32s3](https://github.com/mytechnotalent/meshcore-bare-esp32s3) | ESP32-S3 + SX1262 | GP-SPI2, GPIO interrupts, the SX1262 and time on air, the air hub; NimBLE over virtual Bluetooth with a phone pairing. Two nodes advertise over LoRa and store each other as contacts |
 | [LilyGO T-Deck](https://github.com/Xinyuan-LilyGO/T-Deck) (factory firmware) | T-Deck | The ST7789 under TFT_eSPI and LVGL, the GT911 and keyboard, RadioLib on the SX1262, PSRAM, USB Serial/JTAG, its peripherals' power switch, Wi-Fi start-up; its main loop: keys typed reach it, its radio sends, its screen answers |
+| [LilyGO T-Display-S3](https://github.com/Xinyuan-LilyGO/T-Display-S3) (factory firmware) | T-Display-S3 | LCD_CAM and the GDMA under ESP-IDF's esp_lcd i80 driver, LVGL, octal PSRAM, LEDC, Wi-Fi start-up; its UI on the glass, its KEY button turning its pages |
 | [wifi-start](../firmware/wifi-start) (a minimal ESP-IDF app) | DevKitC | Wi-Fi start-up: the PHY's calibrations, the MAC's reset; a station starts and a scan completes |
 
 What the test cases have found, so far (each fixed, with a qtest that reproduces it):
@@ -56,6 +59,9 @@ What the test cases have found, so far (each fixed, with a qtest that reproduces
   DC-offset measurement, the temperature sensor, IQ estimation and the MAC's reset
   (0015): Wi-Fi start-up, and the T-Deck's whole main loop behind it; then on an ADC
   conversion (its battery reading, 0015).
+- The T-Display-S3 panicked dividing by LEDC's clock divider, which read 0 (0018); then
+  its screenshots came out sheared: QEMU's `screendump` padded each row of a 170-pixel
+  screen (0016). The panel had it right all along.
 - Encoder edges came faster than firmware polling each tick could follow (0014):
   gbagate's devkit encoder.
 - In gbagate itself, its own QEMU checks found an ST7735 driver sending pixels low byte

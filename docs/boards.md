@@ -13,6 +13,8 @@ Python, on the command line, or read from a KiCad design.
 | I2C0, I2C1 | Command lists, FIFOs, ACK checks, interrupts, SCL timing |
 | USB Serial/JTAG | The CDC serial side; start-of-frame packets while plugged in (what HWCDC checks) |
 | RTC_CNTL | Its interrupts and brown-out detector, with the supply a run-time setting |
+| LCD_CAM | Its LCD side: 8080 parallel displays (bus `lcd`), data by GDMA, CS and D/C through the matrix |
+| LEDC | Its registers keep what's written; no waveform on the pins |
 | Wi-Fi start-up | The PHY's calibrations and the MAC's reset complete: `esp_wifi_start()` returns and a station starts; no frames move, so a scan finds nothing |
 | SAR ADC | Conversions finish, reading mid-scale whatever the pin (no per-channel model yet) |
 | (Espressif's) | CPUs, flash, PSRAM (`-m`), UART, GDMA, crypto, timers, SDMMC, TWAI, RGB framebuffer |
@@ -27,8 +29,8 @@ Python, on the command line, or read from a KiCad design.
 | Radio | `sx1262` `sx1261` `sx1268` (LoRa between QEMUs, [`radio/`](../radio/README.md)); Bluetooth through [`bluetooth/`](../bluetooth/README.md) |
 | Board-level | `power-domain` (parts on a switched supply), `bus-noise` (errors on wires), `pin-glitch` (pulses on an input) |
 
-Not yet: the S3's LCD_CAM (8080 parallel displays), the ADC's inputs (a voltage per pin),
-LEDC/PWM, RMT, Wi-Fi frames (an access point, a network), its Bluetooth controller, SX127x radios, and the classic ESP32's and C3's peripherals beyond
+Not yet: LCD_CAM's RGB mode and camera, the ADC's inputs (a voltage per pin), LEDC's
+waveforms (a PWM backlight is always lit), RMT, Wi-Fi frames (an access point, a network), its Bluetooth controller, SX127x radios, and the classic ESP32's and C3's peripherals beyond
 Espressif's. Each device's properties and lines: the
 [device reference](../patches/espressif-qemu/README.md).
 
@@ -45,7 +47,7 @@ pin:
 -device esp32s3.pin-link,pin=16,dev=touch,line=int,dir=out
 ```
 
-- A part on an SPI bus is selected by its chip-select pin, so the controller's own chip
+- A part on an SPI bus (or LCD_CAM's `lcd`, the S3's parallel bus) is selected by its chip-select pin, so the controller's own chip
   selects and GPIO-toggled ones both work. Parts on one bus need different `cs=`
   numbers, which is all they're for.
 - `dir=out`: the part drives the pin (an interrupt, BUSY); otherwise it follows the pin.
@@ -85,6 +87,7 @@ The boards here, each from its project's own pin definitions:
 |---|---|
 | `esp32s3-devkitc` | The chip alone |
 | `meshcore-bare` | A DevKitC and an SX1262 module |
+| `t-display-s3` | LilyGO T-Display-S3: a 170x320 ST7789 on LCD_CAM's 8-bit bus, octal PSRAM, its LCD's supply on GPIO15, buttons on 0 and 14 |
 | `t-deck` | LilyGO T-Deck: ST7789, GT911, keyboard, SX1262, SD, trackball, PSRAM; peripherals powered by GPIO10 |
 | `gbagate-devkit` | gbagate on a 44-pin DevKitC: ST7735, SD, ten switches (or an encoder on three of their pins) |
 | `gbagate-supermini` | gbagate on a Supermini: ST7735, SD, its switches on an MCP23017 |

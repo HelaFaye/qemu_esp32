@@ -1,0 +1,35 @@
+From 6534af83ef3f6d5a2b6d21e18147a9a2d39e31ec Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Sun, 15 Nov 2026 09:35:23 +0000
+Subject: [PATCH 16/18] ui: screendump writes width * 3 bytes a row
+
+ppm_save() wrote each row at its line buffer's stride, which pixman rounds up
+to a multiple of 4 bytes. A screen whose width * 3 isn't one (170 pixels: the
+T-Display-S3's ST7789) got 2 bytes more each row, and the picture came out
+sheared, with striped colors. Write the row's bytes only.
+---
+ ui/ui-qmp-cmds.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/ui/ui-qmp-cmds.c b/ui/ui-qmp-cmds.c
+index 74fa6c6..f0c9e3c 100644
+--- a/ui/ui-qmp-cmds.c
++++ b/ui/ui-qmp-cmds.c
+@@ -314,11 +314,13 @@ static bool ppm_save(int fd, pixman_image_t *image, Error **errp)
+     }
+ 
+     linebuf = qemu_pixman_linebuf_create(PIXMAN_BE_r8g8b8, width);
++    /* A row is width * 3 bytes: the line buffer's stride rounds that up to 4, which
++     * would add bytes to each row of a screen whose width isn't a multiple of 4 */
+     for (y = 0; y < height; y++) {
+         qemu_pixman_linebuf_fill(linebuf, image, width, 0, y);
+         if (qio_channel_write_all(QIO_CHANNEL(ioc),
+                                   (char *)pixman_image_get_data(linebuf),
+-                                  pixman_image_get_stride(linebuf), errp) < 0) {
++                                  width * 3, errp) < 0) {
+             return false;
+         }
+     }
+-- 
+2.43.0
+

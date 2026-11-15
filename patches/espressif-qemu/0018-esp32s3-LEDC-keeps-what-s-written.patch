@@ -1,0 +1,71 @@
+From 70fefc652c68daf92285fe3df6415a5a34db6529 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Sun, 15 Nov 2026 09:35:39 +0000
+Subject: [PATCH 18/18] esp32s3: LEDC keeps what's written
+
+LEDC (0x60019000) read as 0, so ESP-IDF's ledc_get_freq() divided by a timer's
+clock divider of 0: the T-Display-S3's factory firmware (its backlight on LEDC)
+panicked with IntegerDivideByZero at every boot. Its registers now keep what's
+written, as the PHY's blocks do; no waveform reaches the pins yet.
+---
+ hw/xtensa/esp32s3.c            | 12 +++++++++++-
+ tests/qtest/esp32s3-phy-test.c |  5 +++--
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index b23821d..06e490e 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -604,8 +604,13 @@ static void esp32s3_soc_realize(DeviceState *dev, Error **errp)
+ /* The Wi-Fi MAC (0x60033000): kept too. No frames move: Wi-Fi starts, and finds nothing */
+ #define ESP32S3_MAC_BLOCK_START        0x60033000
+ #define ESP32S3_MAC_BLOCK_WORDS        2048
++/* LEDC (PWM): kept, so its drivers read back their timers' dividers and resolutions (a
++ * frequency read divides by them); no waveform reaches the pins yet */
++#define ESP32S3_LEDC_BLOCK_START       0x60019000
++#define ESP32S3_LEDC_BLOCK_WORDS       64
+ static uint32_t esp32s3_ana_block[ESP32S3_ANA_BLOCK_WORDS + ESP32S3_SENS_BLOCK_WORDS +
+-                                  ESP32S3_BB_BLOCK_WORDS + ESP32S3_MAC_BLOCK_WORDS];
++                                  ESP32S3_BB_BLOCK_WORDS + ESP32S3_MAC_BLOCK_WORDS +
++                                  ESP32S3_LEDC_BLOCK_WORDS];
+ 
+ /*
+  * Status bits the PHY's calibrations poll for "done" (found by halting a stuck start-up
+@@ -638,6 +643,11 @@ static bool esp32s3_ana_word(hwaddr a, unsigned *i)
+              (a - ESP32S3_MAC_BLOCK_START) / 4;
+         return true;
+     }
++    if (a >= ESP32S3_LEDC_BLOCK_START && a < ESP32S3_LEDC_BLOCK_START + 4 * ESP32S3_LEDC_BLOCK_WORDS) {
++        *i = ESP32S3_ANA_BLOCK_WORDS + ESP32S3_SENS_BLOCK_WORDS + ESP32S3_BB_BLOCK_WORDS +
++             ESP32S3_MAC_BLOCK_WORDS + (a - ESP32S3_LEDC_BLOCK_START) / 4;
++        return true;
++    }
+     return false;
+ }
+ 
+diff --git a/tests/qtest/esp32s3-phy-test.c b/tests/qtest/esp32s3-phy-test.c
+index 31c4747..652cb89 100644
+--- a/tests/qtest/esp32s3-phy-test.c
++++ b/tests/qtest/esp32s3-phy-test.c
+@@ -2,7 +2,7 @@
+  * QTest for what Wi-Fi and Bluetooth start-up polls on the ESP32-S3 with no radio behind
+  * it: the analog, SENS, baseband and MAC blocks keep what's written; the PHY's
+  * calibrations (peak detector, TX DC offset, IQ estimation), the temperature sensor, the
+- * MAC's reset and SAR ADC conversions read as done.
++ * MAC's reset and SAR ADC conversions read as done. LEDC keeps what's written too.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License version 2 or
+@@ -16,7 +16,8 @@
+ static void test_kept(void)
+ {
+     QTestState *qts = qtest_init("-machine esp32s3");
+-    const uint32_t regs[] = { 0x6000E000, 0x60008800 + 0x40, 0x60006144, 0x60033c34 };
++    const uint32_t regs[] = { 0x6000E000, 0x60008800 + 0x40, 0x60006144, 0x60033c34,
++                              0x600190A0 /* LEDC timer 0's divider */ };
+     for (unsigned i = 0; i < ARRAY_SIZE(regs); i++) {
+         qtest_writel(qts, regs[i], 0x12345678);
+         g_assert_cmphex(qtest_readl(qts, regs[i]), ==, 0x12345678);
+-- 
+2.43.0
+

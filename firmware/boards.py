@@ -178,6 +178,20 @@ def _gbagate_carrier(card):
     return args
 
 
+def t_display_s3(**_):
+    """LilyGO T-Display-S3 (ESP32-S3, 16 MB flash, 8 MB octal PSRAM): a 170x320 ST7789 on an
+    8-bit parallel bus, driven by LCD_CAM (patch 0017; D0-D7 39-42/45-48, WR 8, RD 9:
+    LCD_CAM's own bus here), CS 6, D/C 7, backlight 38, its glass at column 35 of the
+    controller's 240; the LCD's supply switched by GPIO15 (PIN_POWER_ON); buttons on 0
+    (BOOT) and 14. examples/factory/pin_config.h at firmware/t-display-s3/COMMIT."""
+    args = ["-m", "8M", "-global", "ssi_psram.is_octal=on",
+            "-device", "st7789,bus=lcd,id=lcd,width=170,height=320,x-offset=35"]
+    args += link(6, "lcd", "ssi-gpio-cs", pull="up") + link(7, "lcd", "dc") + link(38, "lcd", "backlight")
+    args += power_domain("lcd_pwr", "lcd", pin=15)
+    args += button("btn_boot", 0) + button("btn_key", 14)
+    return "esp32s3", args
+
+
 def gbagate_carrier_touch(card=None, **_):
     """gbagate's touch carrier: the carrier (above), and an XPT2046 on the panel (CS 16,
     PENIRQ 17). Its own check, which also presses the touch and reads the glass, is
@@ -221,6 +235,7 @@ BOARDS = {
     "esp32s3-devkitc": esp32s3_devkitc,
     "meshcore-bare": meshcore_bare,
     "t-deck": t_deck,
+    "t-display-s3": t_display_s3,
     "gbagate-devkit": gbagate_devkit,
     "gbagate-supermini": gbagate_supermini,
     "gbagate-carrier-touch": gbagate_carrier_touch,

@@ -168,6 +168,41 @@ jobs:
           name: t-deck-screens-and-logs
           path: ${{ runner.temp }}/tdeck/run
 
+  t-display-s3:
+    needs: qemu
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-arduino-tds3-${{ hashFiles('firmware/t-display-s3/COMMIT') }}
+      - name: Tools
+        run: |
+          pip install -q platformio esptool pillow
+          sudo apt-get update && sudo apt-get install -y libglib2.0-0 libpixman-1-0 libgcrypt20 libslirp0
+      - uses: actions/download-artifact@v4
+        with:
+          name: qemu-xtensa
+          path: ${{ runner.temp }}/qemu
+      - name: Build LilyGO's T-Display-S3 factory firmware
+        run: firmware/t-display-s3/build.sh "$RUNNER_TEMP/tds3"
+      - name: Check it on the emulated T-Display-S3
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: |
+          chmod +x "$QEMU_XTENSA"
+          python3 firmware/t-display-s3/check.py "$RUNNER_TEMP/tds3/flash.bin" "$RUNNER_TEMP/tds3/run"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: t-display-s3-screens-and-logs
+          path: ${{ runner.temp }}/tds3/run
+
   wifi-start:
     needs: qemu
     runs-on: ubuntu-24.04

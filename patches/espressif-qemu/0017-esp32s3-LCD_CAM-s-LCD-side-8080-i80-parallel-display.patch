@@ -1,0 +1,638 @@
+From 5899081a48c60df8d50eb7fc16a743693c671497 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Sun, 15 Nov 2026 09:35:23 +0000
+Subject: [PATCH 17/18] esp32s3: LCD_CAM's LCD side (8080/i80 parallel
+ displays)
+
+LCD_CAM in i80 mode, as ESP-IDF's esp_lcd i80 driver uses it: a transaction
+(USER.START) sends the command phase (CMD_VAL, one or two bytes), sets D/C for
+the dummy phase, then sends data from the GDMA: as long as the descriptors say
+(ALWAYS_OUT) or CYCLELEN cycles of one or two bytes. 8BITS_ORDER swaps byte
+pairs, BIT_ORDER reverses bits. D/C follows MISC's CD_*_SET bits against its
+idle level. The bus is an SSI bus, "lcd", so the MIPI DBI panels work on it as
+on SPI; CS and D/C are GPIO matrix signals 132 and 153. TRANS_DONE raises the
+LCD_CAM interrupt. The RGB mode isn't modelled (logged).
+
+esp_gdma_out_chain_length() gives a channel's descriptor chain's length up to
+its EOF, for ALWAYS_OUT.
+
+Tested with esp32s3-lcd-cam-test, and the T-Display-S3's factory firmware (its
+LVGL UI on a 170x320 ST7789).
+---
+ hw/display/esp32s3_lcd_cam.c         | 230 +++++++++++++++++++++++++++
+ hw/display/meson.build               |   1 +
+ hw/dma/esp_gdma.c                    |  25 +++
+ hw/xtensa/esp32s3.c                  |  17 ++
+ include/hw/display/esp32s3_lcd_cam.h |  35 ++++
+ include/hw/dma/esp_gdma.h            |   1 +
+ tests/qtest/esp32s3-lcd-cam-test.c   | 199 +++++++++++++++++++++++
+ tests/qtest/meson.build              |   2 +-
+ 8 files changed, 509 insertions(+), 1 deletion(-)
+ create mode 100644 hw/display/esp32s3_lcd_cam.c
+ create mode 100644 include/hw/display/esp32s3_lcd_cam.h
+ create mode 100644 tests/qtest/esp32s3-lcd-cam-test.c
+
+diff --git a/hw/display/esp32s3_lcd_cam.c b/hw/display/esp32s3_lcd_cam.c
+new file mode 100644
+index 0000000..6ab65eb
+--- /dev/null
++++ b/hw/display/esp32s3_lcd_cam.c
+@@ -0,0 +1,230 @@
++/*
++ * ESP32-S3 LCD_CAM: the LCD side in i80 (8080 parallel) mode, as ESP-IDF's esp_lcd i80
++ * driver uses it.
++ *
++ * A transaction (LCD_USER.LCD_START) is a command phase (1 or 2 cycles: LCD_CMD_VAL, low
++ * byte first), a dummy phase (no data) and a data phase, from the GDMA's LCD_CAM OUT
++ * channel: LCD_DOUT_CYCLELEN+1 cycles, or with LCD_ALWAYS_OUT_EN until the DMA chain's
++ * EOF. The bytes go to the panel on this device's "lcd" bus (-device st7789,bus=lcd), so
++ * the SPI panel models serve: the D/C level of each phase (LCD_MISC: idle level, and per
++ * phase whether it differs) goes out on LCD_DC, and the transaction is framed by LCD_CS,
++ * both through the GPIO matrix to whichever pins the firmware routed them to, where
++ * esp32s3.pin-link takes them to the panel's dc and CS lines. LCD_8BITS_ORDER swaps
++ * adjacent data bytes, LCD_BIT_ORDER reverses each byte's bits. Done: LCD_TRANS_DONE
++ * (LC_DMA_INT_RAW bit 1) and the interrupt. The camera, RGB mode and the clock's timing
++ * aren't modelled (a transaction completes at once).
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qapi/error.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/display/esp32s3_lcd_cam.h"
++
++#define LCD_CLOCK         0x00
++#define LCD_USER          0x14
++#define LCD_MISC          0x18
++#define LCD_CTRL          0x1c
++#define LCD_CTRL1         0x20
++#define LCD_CTRL2         0x24
++#define LCD_CMD_VAL       0x28
++#define LCD_DLY_MODE      0x30
++#define LCD_DATA_DOUT     0x38
++#define LC_DMA_INT_ENA    0x64
++#define LC_DMA_INT_RAW    0x68
++#define LC_DMA_INT_ST     0x6c
++#define LC_DMA_INT_CLR    0x70
++#define LC_REG_DATE       0xfc
++
++#define USER_CYCLELEN     0x1fff
++#define USER_ALWAYS_OUT   BIT(13)
++#define USER_8BITS_ORDER  BIT(19)
++#define USER_UPDATE       BIT(20)
++#define USER_BIT_ORDER    BIT(21)
++#define USER_2BYTE_EN     BIT(23)
++#define USER_DOUT         BIT(24)
++#define USER_DUMMY        BIT(25)
++#define USER_CMD          BIT(26)
++#define USER_START        BIT(27)
++#define USER_RESET        BIT(28)
++#define USER_CMD_2_CYCLE  BIT(31)
++
++#define MISC_AFIFO_RESET  BIT(27)
++#define MISC_CD_DATA_SET  BIT(28)
++#define MISC_CD_DUMMY_SET BIT(29)
++#define MISC_CD_CMD_SET   BIT(30)
++#define MISC_CD_IDLE_EDGE BIT(31)
++
++#define CTRL_RGB_MODE_EN  BIT(31)
++#define INT_TRANS_DONE    BIT(1)
++
++#define MAX_DATA          (1024 * 1024)
++
++static void update_irq(ESP32S3LcdCamState *s)
++{
++    qemu_set_irq(s->irq, (s->int_raw & s->int_ena) != 0);
++}
++
++static bool dc_level(ESP32S3LcdCamState *s, uint32_t set_bit)
++{
++    bool idle = s->misc & MISC_CD_IDLE_EDGE;
++    return idle ^ !!(s->misc & set_bit);
++}
++
++static void lcd_send(ESP32S3LcdCamState *s, uint8_t b)
++{
++    ssi_transfer(s->bus, b);
++    s->bytes++;
++}
++
++static void transaction(ESP32S3LcdCamState *s)
++{
++    if (s->ctrl & CTRL_RGB_MODE_EN) {
++        qemu_log_mask(LOG_UNIMP, "esp32s3.lcd_cam: RGB mode isn't modelled\n");
++        return;
++    }
++    qemu_set_irq(s->cs, 0);
++    if (s->user & USER_CMD) {
++        qemu_set_irq(s->dc, dc_level(s, MISC_CD_CMD_SET));
++        lcd_send(s, s->cmd_val & 0xff);
++        if (s->user & USER_CMD_2_CYCLE) {
++            lcd_send(s, (s->cmd_val >> 8) & 0xff);
++        }
++    }
++    if (s->user & USER_DUMMY) {
++        qemu_set_irq(s->dc, dc_level(s, MISC_CD_DUMMY_SET));
++    }
++    if (s->user & USER_DOUT) {
++        uint32_t chan, n;
++        if (!s->gdma || !esp_gdma_get_channel_periph(s->gdma, GDMA_LCDCAM, ESP_GDMA_OUT_IDX, &chan)) {
++            qemu_log_mask(LOG_GUEST_ERROR, "esp32s3.lcd_cam: data phase, but no GDMA channel\n");
++        } else {
++            if (s->user & USER_ALWAYS_OUT) {
++                n = esp_gdma_out_chain_length(s->gdma, chan);
++            } else {
++                n = ((s->user & USER_CYCLELEN) + 1) * ((s->user & USER_2BYTE_EN) ? 2 : 1);
++            }
++            n = MIN(n, MAX_DATA);
++            g_autofree uint8_t *buf = g_malloc(n ? n : 1);
++            if (n && esp_gdma_read_channel(s->gdma, chan, buf, n)) {
++                qemu_set_irq(s->dc, dc_level(s, MISC_CD_DATA_SET));
++                for (uint32_t i = 0; i < n; i++) {
++                    uint32_t j = ((s->user & USER_8BITS_ORDER) && (i ^ 1) < n) ? (i ^ 1) : i;
++                    uint8_t b = buf[j];
++                    if (s->user & USER_BIT_ORDER) {
++                        b = revbit8(b);
++                    }
++                    lcd_send(s, b);
++                }
++            }
++        }
++    }
++    qemu_set_irq(s->cs, 1);
++    qemu_set_irq(s->dc, !!(s->misc & MISC_CD_IDLE_EDGE));
++    s->user &= ~(USER_START | USER_UPDATE);
++    s->int_raw |= INT_TRANS_DONE;
++    update_irq(s);
++}
++
++static uint64_t lcd_cam_read(void *opaque, hwaddr addr, unsigned size)
++{
++    ESP32S3LcdCamState *s = opaque;
++    switch (addr) {
++    case LCD_CLOCK:      return s->clock;
++    case LCD_USER:       return s->user;
++    case LCD_MISC:       return s->misc;
++    case LCD_CTRL:       return s->ctrl;
++    case LCD_CTRL1:      return s->ctrl1;
++    case LCD_CTRL2:      return s->ctrl2;
++    case LCD_CMD_VAL:    return s->cmd_val;
++    case LCD_DLY_MODE:   return s->dly_mode;
++    case LCD_DATA_DOUT:  return s->dout_mode;
++    case LC_DMA_INT_ENA: return s->int_ena;
++    case LC_DMA_INT_RAW: return s->int_raw;
++    case LC_DMA_INT_ST:  return s->int_raw & s->int_ena;
++    case LC_REG_DATE:    return 0x2101040;
++    }
++    return 0;
++}
++
++static void lcd_cam_write(void *opaque, hwaddr addr, uint64_t v, unsigned size)
++{
++    ESP32S3LcdCamState *s = opaque;
++    switch (addr) {
++    case LCD_CLOCK:      s->clock = v; break;
++    case LCD_USER:
++        s->user = v & ~USER_RESET;
++        if (v & USER_START) {
++            transaction(s);
++        }
++        break;
++    case LCD_MISC:
++        s->misc = v & ~MISC_AFIFO_RESET;
++        qemu_set_irq(s->dc, !!(s->misc & MISC_CD_IDLE_EDGE));
++        break;
++    case LCD_CTRL:       s->ctrl = v; break;
++    case LCD_CTRL1:      s->ctrl1 = v; break;
++    case LCD_CTRL2:      s->ctrl2 = v; break;
++    case LCD_CMD_VAL:    s->cmd_val = v; break;
++    case LCD_DLY_MODE:   s->dly_mode = v; break;
++    case LCD_DATA_DOUT:  s->dout_mode = v; break;
++    case LC_DMA_INT_ENA: s->int_ena = v; update_irq(s); break;
++    case LC_DMA_INT_CLR: s->int_raw &= ~v; update_irq(s); break;
++    }
++}
++
++static const MemoryRegionOps lcd_cam_ops = {
++    .read = lcd_cam_read,
++    .write = lcd_cam_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static void lcd_cam_reset_hold(Object *obj, ResetType type)
++{
++    ESP32S3LcdCamState *s = ESP32S3_LCD_CAM(obj);
++    s->clock = s->user = s->misc = s->ctrl = s->ctrl1 = s->ctrl2 = 0;
++    s->cmd_val = s->dly_mode = s->dout_mode = s->int_ena = s->int_raw = 0;
++    update_irq(s);
++}
++
++static void lcd_cam_init(Object *obj)
++{
++    ESP32S3LcdCamState *s = ESP32S3_LCD_CAM(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++
++    memory_region_init_io(&s->iomem, obj, &lcd_cam_ops, s, TYPE_ESP32S3_LCD_CAM, 0x100);
++    sysbus_init_mmio(sbd, &s->iomem);
++    sysbus_init_irq(sbd, &s->irq);
++    qdev_init_gpio_out_named(DEVICE(obj), &s->cs, ESP32S3_LCD_CAM_CS_OUT, 1);
++    qdev_init_gpio_out_named(DEVICE(obj), &s->dc, ESP32S3_LCD_CAM_DC_OUT, 1);
++    s->bus = ssi_create_bus(DEVICE(obj), "lcd");
++    object_property_add_uint64_ptr(obj, "bytes", &s->bytes, OBJ_PROP_FLAG_READ);
++}
++
++static void lcd_cam_class_init(ObjectClass *klass, void *data)
++{
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++    rc->phases.hold = lcd_cam_reset_hold;
++}
++
++static const TypeInfo lcd_cam_info = {
++    .name = TYPE_ESP32S3_LCD_CAM,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(ESP32S3LcdCamState),
++    .instance_init = lcd_cam_init,
++    .class_init = lcd_cam_class_init,
++};
++
++static void lcd_cam_register_types(void)
++{
++    type_register_static(&lcd_cam_info);
++}
++
++type_init(lcd_cam_register_types)
+diff --git a/hw/display/meson.build b/hw/display/meson.build
+index af90feb..96751d7 100644
+--- a/hw/display/meson.build
++++ b/hw/display/meson.build
+@@ -146,3 +146,4 @@ system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
+ modules += { 'hw-display': hw_display_modules }
+ system_ss.add(when: 'CONFIG_MIPI_DBI_PANEL', if_true: files('mipi_dbi_panel.c'))
+ system_ss.add(when: 'CONFIG_ESP_BOARD_PERIPHERALS', if_true: files('ssd1306.c'))
++system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('esp32s3_lcd_cam.c'))
+diff --git a/hw/dma/esp_gdma.c b/hw/dma/esp_gdma.c
+index 5b778dd..4680d9a 100644
+--- a/hw/dma/esp_gdma.c
++++ b/hw/dma/esp_gdma.c
+@@ -298,6 +298,31 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
+  * @brief Read data from guest RAM pointed by the linked list configured in the given DmaConfigState index.
+  *        `size` bytes will be read and stored in `buffer`.
+  */
++/*
++ * The number of bytes an OUT channel's descriptor chain holds, up to the descriptor with
++ * suc_eof (or the end of the chain), without consuming it: for a peripheral whose
++ * transfer lasts as long as the DMA's data (LCD_CAM with always_out_en).
++ */
++uint32_t esp_gdma_out_chain_length(ESPGdmaState *s, uint32_t chan)
++{
++    DmaConfigState *state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
++    uint32_t base = (ESP_GDMA_GET_CLASS(s)->ram_addr >> 20) << 20;
++    uint32_t addr = base | FIELD_EX32(state->link, GDMA_OUT_LINK, ADDR);
++    uint32_t total = 0;
++    for (int n = 0; n < 4096 && addr; n++) {
++        GdmaLinkedList node;
++        if (!esp_gdma_read_descr(s, addr, &node)) {
++            break;
++        }
++        total += node.config.length;
++        if (node.config.suc_eof) {
++            break;
++        }
++        addr = node.next_addr;
++    }
++    return total;
++}
++
+ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size)
+ {
+     DmaConfigState* state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index 64eb70f..b23821d 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -62,6 +62,7 @@
+ #include "hw/timer/esp32s3_systimer.h"
+ #include "hw/gpio/esp32s3_gpio.h"
+ #include "hw/ssi/esp32s3_gpspi.h"
++#include "hw/display/esp32s3_lcd_cam.h"
+ #include "hw/i2c/esp32s3_i2c.h"
+ #include "hw/misc/esp32s3_xts_aes.h"
+ #include "hw/misc/esp32s3_pms.h"
+@@ -126,6 +127,7 @@ typedef struct Esp32s3SocState {
+     ESP32S3UARTState uart[ESP32S3_UART_COUNT];
+     ESP32S3GPIOState gpio;
+     ESP32S3GPSPIState gpspi[2];         /* GP-SPI2 and GP-SPI3 */
++    ESP32S3LcdCamState lcd_cam;         /* LCD_CAM's LCD side (i80) */
+     ESP32S3I2CState i2c[2];
+     Esp32s3RngState rng;
+     Esp32S3TWAIState twai;
+@@ -855,6 +857,7 @@ static void esp32s3_machine_init(MachineState *machine)
+     object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ESP32S3_GPIO);
+     object_initialize_child(OBJECT(ss), "spi2", &ss->gpspi[0], TYPE_ESP32S3_GPSPI);
+     object_initialize_child(OBJECT(ss), "spi3", &ss->gpspi[1], TYPE_ESP32S3_GPSPI);
++    object_initialize_child(OBJECT(ss), "lcd_cam", &ss->lcd_cam, TYPE_ESP32S3_LCD_CAM);
+     object_initialize_child(OBJECT(ss), "i2c0", &ss->i2c[0], TYPE_ESP32S3_I2C);
+     object_initialize_child(OBJECT(ss), "i2c1", &ss->i2c[1], TYPE_ESP32S3_I2C);
+     object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
+@@ -1060,6 +1063,20 @@ static void esp32s3_machine_init(MachineState *machine)
+         }
+     }
+ 
++    /* LCD_CAM: its CS and D/C are GPIO matrix signals (LCD_CS_IDX 132, LCD_DC_IDX 153) */
++    {
++        ss->lcd_cam.gdma = ESP_GDMA(&ss->gdma);
++        sysbus_realize(SYS_BUS_DEVICE(&ss->lcd_cam), &error_fatal);
++        memory_region_add_subregion_overlap(sys_mem, DR_REG_LCD_CAM_BASE,
++                                            sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->lcd_cam), 0), 0);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->lcd_cam), 0,
++                           qdev_get_gpio_in(intmatrix_dev, ETS_LCD_CAM_INTR_SOURCE));
++        qdev_connect_gpio_out_named(DEVICE(&ss->lcd_cam), ESP32S3_LCD_CAM_CS_OUT, 0,
++                                    qdev_get_gpio_in_named(DEVICE(&ss->gpio), ESP32S3_GPIO_SIG_OUT, 132));
++        qdev_connect_gpio_out_named(DEVICE(&ss->lcd_cam), ESP32S3_LCD_CAM_DC_OUT, 0,
++                                    qdev_get_gpio_in_named(DEVICE(&ss->gpio), ESP32S3_GPIO_SIG_OUT, 153));
++    }
++
+     /* I2C0 and I2C1 */
+     {
+         static const hwaddr base[2] = { DR_REG_I2C_EXT_BASE, DR_REG_I2C1_EXT_BASE };
+diff --git a/include/hw/display/esp32s3_lcd_cam.h b/include/hw/display/esp32s3_lcd_cam.h
+new file mode 100644
+index 0000000..8f7f788
+--- /dev/null
++++ b/include/hw/display/esp32s3_lcd_cam.h
+@@ -0,0 +1,35 @@
++/*
++ * ESP32-S3 LCD_CAM, its LCD side in i80 (8080 parallel) mode
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++#ifndef HW_DISPLAY_ESP32S3_LCD_CAM_H
++#define HW_DISPLAY_ESP32S3_LCD_CAM_H
++
++#include "hw/sysbus.h"
++#include "hw/ssi/ssi.h"
++#include "hw/dma/esp_gdma.h"
++
++#define TYPE_ESP32S3_LCD_CAM "esp32s3.lcd_cam"
++OBJECT_DECLARE_SIMPLE_TYPE(ESP32S3LcdCamState, ESP32S3_LCD_CAM)
++
++#define ESP32S3_LCD_CAM_CS_OUT "lcd-cs"     /* To the GPIO matrix: LCD_CS (132) */
++#define ESP32S3_LCD_CAM_DC_OUT "lcd-dc"     /* LCD_DC (153) */
++
++struct ESP32S3LcdCamState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    qemu_irq irq;
++    qemu_irq cs;
++    qemu_irq dc;
++    SSIBus *bus;                            /* "lcd": the panel, as on a SPI bus */
++    ESPGdmaState *gdma;
++
++    uint32_t clock, user, misc, ctrl, ctrl1, ctrl2, cmd_val, dly_mode, dout_mode;
++    uint32_t int_ena, int_raw;
++    uint64_t bytes;                         /* Sent to the panel, for tests */
++};
++
++#endif
+diff --git a/include/hw/dma/esp_gdma.h b/include/hw/dma/esp_gdma.h
+index 406711d..17d8bd5 100644
+--- a/include/hw/dma/esp_gdma.h
++++ b/include/hw/dma/esp_gdma.h
+@@ -163,6 +163,7 @@ bool esp_gdma_get_channel_periph(ESPGdmaState *s, GdmaPeripheral periph, int dir
+                                      uint32_t* chan);
+ 
+ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size);
++uint32_t esp_gdma_out_chain_length(ESPGdmaState *s, uint32_t chan);
+ bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size);
+ 
+ 
+diff --git a/tests/qtest/esp32s3-lcd-cam-test.c b/tests/qtest/esp32s3-lcd-cam-test.c
+new file mode 100644
+index 0000000..32a9013
+--- /dev/null
++++ b/tests/qtest/esp32s3-lcd-cam-test.c
+@@ -0,0 +1,199 @@
++/*
++ * QTest for the ESP32-S3's LCD_CAM (its LCD side, the 8080/i80 mode), wired as LilyGO's
++ * T-Display-S3: an ST7789 (170x320 glass at column 35) on LCD_CAM's bus, its CS on GPIO6
++ * and D/C on GPIO7 through the GPIO matrix (LCD_CS 132, LCD_DC 153). Transactions as
++ * ESP-IDF's esp_lcd i80 driver makes them: a command phase, then data from the GDMA,
++ * its length from the descriptors (ALWAYS_OUT) or from CYCLELEN.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "qapi/qmp/qdict.h"
++#include "libqtest.h"
++
++#define LCD_CAM         0x60041000
++#define LCD_USER        (LCD_CAM + 0x14)
++#define LCD_MISC        (LCD_CAM + 0x18)
++#define LCD_CMD_VAL     (LCD_CAM + 0x28)
++#define LC_INT_ENA      (LCD_CAM + 0x64)
++#define LC_INT_RAW      (LCD_CAM + 0x68)
++#define LC_INT_CLR      (LCD_CAM + 0x70)
++
++#define USER_ALWAYS_OUT BIT(13)
++#define USER_8BITS_ORDER BIT(19)
++#define USER_UPDATE     BIT(20)
++#define USER_DOUT       BIT(24)
++#define USER_CMD        BIT(26)
++#define USER_START      BIT(27)
++#define MISC_CD_DATA_SET BIT(28)
++#define INT_TRANS_DONE  BIT(1)
++
++#define GDMA            0x6003F000
++#define GDMA_OUT(ch, r) (GDMA + (ch) * 0xC0 + 0x60 + (r))
++#define LINK            0x20
++#define PERI_SEL        0x48
++#define OUT_LINK_START  BIT(21)
++#define PERI_LCDCAM     5
++
++#define GPIO            0x60004000
++#define IN              (GPIO + 0x3C)
++#define OUT_SEL(n)      (GPIO + 0x554 + 4 * (n))
++
++#define DESC            0x3FCA0000
++#define BUF             0x3FCA0100
++
++#define BOARD \
++    "-machine esp32s3 " \
++    "-device st7789,bus=lcd,id=lcd,width=170,height=320,x-offset=35 " \
++    "-device esp32s3.pin-link,pin=6,dev=lcd,line=ssi-gpio-cs,pull=up " \
++    "-device esp32s3.pin-link,pin=7,dev=lcd,line=dc "
++
++static void board_init(QTestState *qts)
++{
++    qtest_writel(qts, OUT_SEL(6), 132);             /* LCD_CS, enabled by LCD_CAM */
++    qtest_writel(qts, OUT_SEL(7), 153);             /* LCD_DC */
++    /* D/C: low for commands and idle, high for data (esp_lcd's dc_levels) */
++    qtest_writel(qts, LCD_MISC, MISC_CD_DATA_SET);
++    qtest_writel(qts, GDMA_OUT(0, PERI_SEL), PERI_LCDCAM);
++}
++
++/* One transaction: cmd, then n bytes from memory through the GDMA (n 0: none) */
++static void lcd_tx(QTestState *qts, uint8_t cmd, const uint8_t *data, size_t n, uint32_t flags)
++{
++    uint32_t user = USER_CMD | USER_UPDATE | USER_START | flags;
++    if (n) {
++        g_assert_cmpuint(n, <, 4096);
++        qtest_memwrite(qts, BUF, data, n);
++        qtest_writel(qts, DESC, BIT(31) | BIT(30) | (n << 12) | n);     /* owner, EOF */
++        qtest_writel(qts, DESC + 4, BUF);
++        qtest_writel(qts, DESC + 8, 0);
++        qtest_writel(qts, GDMA_OUT(0, LINK), (DESC & 0xFFFFF) | OUT_LINK_START);
++        user |= USER_DOUT;
++        if (!(flags & USER_ALWAYS_OUT)) {
++            user |= n - 1;                          /* CYCLELEN: n bytes, one a cycle */
++        }
++    }
++    qtest_writel(qts, LC_INT_CLR, INT_TRANS_DONE);
++    qtest_writel(qts, LCD_CMD_VAL, cmd);
++    qtest_writel(qts, LCD_USER, user);
++    g_assert_cmphex(qtest_readl(qts, LC_INT_RAW) & INT_TRANS_DONE, ==, INT_TRANS_DONE);
++    g_assert_cmphex(qtest_readl(qts, LCD_USER) & USER_START, ==, 0);
++    g_assert_cmphex(qtest_readl(qts, IN) & BIT(6), ==, BIT(6));     /* CS released */
++}
++
++static void lcd_param(QTestState *qts, uint8_t cmd, const uint8_t *p, size_t n)
++{
++    lcd_tx(qts, cmd, p, n, 0);
++}
++
++/* The panel's glass, from QMP screendump (PPM, P6) */
++static uint8_t *screendump(QTestState *qts, int *w, int *h)
++{
++    g_autofree char *path = g_strdup_printf("%s/qtest-lcdcam-%d.ppm", g_get_tmp_dir(), getpid());
++    QDict *resp = qtest_qmp(qts, "{'execute': 'screendump', 'arguments': {'filename': %s, 'device': 'lcd'}}",
++                            path);
++    g_assert(qdict_haskey(resp, "return"));
++    qobject_unref(resp);
++    gchar *data;
++    gsize len;
++    g_assert(g_file_get_contents(path, &data, &len, NULL));
++    unlink(path);
++    int maxval, off;
++    g_assert_cmpint(sscanf(data, "P6 %d %d %d%n", w, h, &maxval, &off), ==, 3);
++    /* Exactly its rows: 170 isn't a multiple of 4, so padded rows would show here */
++    g_assert_cmpuint(len, ==, off + 1 + (size_t)*w * *h * 3);
++    uint8_t *px = g_memdup2(data + off + 1, (size_t)*w * *h * 3);
++    g_free(data);
++    return px;
++}
++
++static uint32_t pixel(const uint8_t *px, int w, int x, int y)
++{
++    const uint8_t *p = px + (y * w + x) * 3;
++    return p[0] << 16 | p[1] << 8 | p[2];
++}
++
++static void panel_on(QTestState *qts)
++{
++    static const uint8_t colmod[] = { 0x55 };       /* 16 bits a pixel */
++    lcd_tx(qts, 0x11, NULL, 0, 0);                  /* SLPOUT */
++    lcd_param(qts, 0x3A, colmod, 1);
++    lcd_tx(qts, 0x21, NULL, 0, 0);                  /* INVON: an IPS panel's colors */
++    lcd_tx(qts, 0x29, NULL, 0, 0);                  /* DISPON */
++}
++
++/* A 2x2 window at the glass's top left (RAM column 35), then four pixels */
++static void window(QTestState *qts)
++{
++    static const uint8_t caset[] = { 0, 35, 0, 36 }, raset[] = { 0, 0, 0, 1 };
++    lcd_param(qts, 0x2A, caset, 4);
++    lcd_param(qts, 0x2B, raset, 4);
++}
++
++static void check_square(QTestState *qts)
++{
++    int w, h;
++    g_autofree uint8_t *px = screendump(qts, &w, &h);
++    g_assert_cmpint(w, ==, 170);
++    g_assert_cmpint(h, ==, 320);
++    g_assert_cmphex(pixel(px, w, 0, 0), ==, 0xFF0000);
++    g_assert_cmphex(pixel(px, w, 1, 0), ==, 0x00FF00);
++    g_assert_cmphex(pixel(px, w, 0, 1), ==, 0x0000FF);
++    g_assert_cmphex(pixel(px, w, 1, 1), ==, 0xFFFFFF);
++    g_assert_cmphex(pixel(px, w, 2, 0), ==, 0x000000);
++    g_assert_cmphex(pixel(px, w, 169, 319), ==, 0x000000);
++}
++
++/* Commands with parameters by CYCLELEN, pixels by the descriptors' length (ALWAYS_OUT) */
++static void test_pixels(void)
++{
++    QTestState *qts = qtest_init(BOARD);
++    board_init(qts);
++    panel_on(qts);
++    window(qts);
++    static const uint8_t px[] = { 0xF8, 0x00, 0x07, 0xE0, 0x00, 0x1F, 0xFF, 0xFF };
++    lcd_tx(qts, 0x2C, px, sizeof(px), USER_ALWAYS_OUT);
++    check_square(qts);
++    qtest_quit(qts);
++}
++
++/* 8BITS_ORDER swaps each pair of bytes: little-endian pixels from memory, as LVGL keeps
++ * them, reach the panel high byte first */
++static void test_byte_order(void)
++{
++    QTestState *qts = qtest_init(BOARD);
++    board_init(qts);
++    panel_on(qts);
++    window(qts);
++    static const uint8_t px[] = { 0x00, 0xF8, 0xE0, 0x07, 0x1F, 0x00, 0xFF, 0xFF };
++    lcd_tx(qts, 0x2C, px, sizeof(px), USER_ALWAYS_OUT | USER_8BITS_ORDER);
++    check_square(qts);
++    qtest_quit(qts);
++}
++
++/* The done interrupt reaches the interrupt matrix's status only when enabled */
++static void test_interrupt(void)
++{
++    QTestState *qts = qtest_init(BOARD);
++    board_init(qts);
++    lcd_tx(qts, 0x00, NULL, 0, 0);                  /* NOP */
++    g_assert_cmphex(qtest_readl(qts, LCD_CAM + 0x6C) & INT_TRANS_DONE, ==, 0);
++    qtest_writel(qts, LC_INT_ENA, INT_TRANS_DONE);
++    g_assert_cmphex(qtest_readl(qts, LCD_CAM + 0x6C) & INT_TRANS_DONE, ==, INT_TRANS_DONE);
++    qtest_writel(qts, LC_INT_CLR, INT_TRANS_DONE);
++    g_assert_cmphex(qtest_readl(qts, LCD_CAM + 0x6C) & INT_TRANS_DONE, ==, 0);
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/lcd-cam/pixels", test_pixels);
++    qtest_add_func("/esp32s3/lcd-cam/byte-order", test_byte_order);
++    qtest_add_func("/esp32s3/lcd-cam/interrupt", test_interrupt);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 25fc4f9..34f1cc1 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+
