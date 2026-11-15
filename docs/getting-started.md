@@ -90,10 +90,11 @@ node.qmp("qom-set", path="/machine/peripheral/ball_click", property="pressed", v
 
 ## The Python API (`firmware/boards.py`)
 
-`boot(board, flash, workdir, name="node", hci=None, extra=(), **opts)` starts QEMU and
+`boot(board, flash, workdir, name="node", hci=None, wifi=None, extra=(), **opts)` starts QEMU and
 returns a `Node`. `board` is a name from `BOARDS` or `"kicad:<design>"`; `opts` go to the
 board (`card=`, `sd=`, `air=`); `uart1=`/`uart2=` put those UARTs on TCP ports, `hci=`
-connects UART1 to a Bluetooth controller; `extra` adds QEMU arguments (`["-gdb", "tcp::1234"]`).
+connects UART1 to a Bluetooth controller; `wifi=True` gives the S3 an access point (below);
+`extra` adds QEMU arguments (`["-gdb", "tcp::1234"]`).
 Each node gets its own copy of the flash, so its NVS is its own.
 
 | `Node` | |
@@ -108,6 +109,16 @@ Each node gets its own copy of the flash, so its NVS is its own.
 | `noise(name, ber=, nack=)`, `glitch(name, rate=, pulse=)` | Errors on board wires |
 | `stop()` | Ends QEMU |
 
+## Wi-Fi
+
+`boot(..., wifi=True)` puts an access point in the air: "Open Wifi" (open, channel 4),
+and five more networks to scan. A station that connects gets an address by DHCP from
+QEMU's user-mode network and reaches the host as 10.0.2.2 (a server on the host's
+127.0.0.1 answers there). `wifi={"ssid": "MyNet"}` renames the open network, for
+firmware with its SSID built in; `wifi={"hostfwd": ["udp::5600-:5600"]}` forwards a
+host port to the board, for traffic the host starts. Only open networks: firmware set up
+for a WPA2 password won't connect.
+
 ## Debugging
 
 `boot(..., extra=["-gdb", "tcp::1234"])` (or `-s` on the command line) opens QEMU's GDB
@@ -119,6 +130,6 @@ registers, memory). A backtrace from a panic decodes with
 ## What doesn't work yet
 
 LCD_CAM's RGB mode and camera, the ADC's inputs (conversions finish but read mid-scale),
-LEDC's waveforms, RMT, Wi-Fi frames (Wi-Fi starts and scans, but finds no networks), and
+LEDC's waveforms, RMT, WPA2 networks (Wi-Fi connects to open ones only), and
 its own Bluetooth controller (firmware runs its host stack
 over HCI to a virtual controller instead). See [Boards](boards.md#whats-emulated).

@@ -25,6 +25,7 @@ in `BASE`; `build.sh [dir]` fetches it, applies them and builds `qemu-system-xte
 | 0016 | `screendump` writes a screen's rows exactly (a width whose bytes weren't a multiple of 4, as 170, came out sheared) |
 | 0017 | LCD_CAM's LCD side (S3): 8080/i80 parallel displays on its bus `lcd` (the same panels as on SPI): command, dummy and data phases, data from the GDMA (as long as the descriptors, ALWAYS_OUT, or CYCLELEN), byte and bit order, D/C levels, CS and D/C through the GPIO matrix (132, 153), the done interrupt. Not its RGB mode, nor the camera side |
 | 0018 | LEDC keeps what's written (its frequency reads divided by a divider of 0) |
+| 0019 | Wi-Fi frames (S3), with `-nic user,model=esp32_wifi`: the MAC's transmit and receive DMA, and an access point emulated in QEMU (beacons, probes, open authentication, association) bridged to QEMU's network: DHCP, the host at 10.0.2.2, `hostfwd=` back in. Its open network is "Open Wifi" on channel 4 (`-global esp32_wifi.ssid=` renames it), with five more to scan. With no eFuse file, the chip's MAC is the NIC's. From Martin Johnson's ESP32 emulation ([a159x36/qemu](https://github.com/a159x36/qemu)) and Clemens Kolbitsch's QEMU WLAN emulation (MIT), with the receive registers ESP-IDF 5.4 follows. Open networks only: no WPA2 |
 
 ## Wiring a board
 

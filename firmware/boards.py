@@ -390,13 +390,33 @@ def _uart_arg(listen=None, connect=None):
     return "null"
 
 
-def boot(board, flash, workdir, name="node", hci=None, uart1=None, uart2=None, extra=(), **opts):
+def _wifi_args(wifi):
+    """-nic for an access point (patch 0019): wifi=True, or a dict: ssid (the open
+    network's name, "Open Wifi" by default), mac (the chip's), hostfwd (a list of
+    "udp::HOSTPORT-:GUESTPORT" / "tcp::..." to reach the board from the host)."""
+    if not wifi:
+        return ["-nic", "none"]
+    opts = wifi if isinstance(wifi, dict) else {}
+    nic = "user,model=esp32_wifi"
+    if opts.get("mac"):
+        nic += ",mac=" + opts["mac"]
+    for fwd in opts.get("hostfwd", ()):
+        nic += ",hostfwd=" + fwd
+    args = ["-nic", nic]
+    if opts.get("ssid"):
+        args += ["-global", "esp32_wifi.ssid=" + opts["ssid"]]
+    return args
+
+
+def boot(board, flash, workdir, name="node", hci=None, uart1=None, uart2=None, wifi=None,
+         extra=(), **opts):
     """Boot flash (a merged image) on a board. UART0 goes to <workdir>/<name>.log, the
     USB serial (plugged in) to <name>-usb.log. UART1 and UART2: uart1=/uart2= a TCP port
     QEMU listens on, for a test to connect to (Node.uart(n)); or hci: a TCP port UART1
     connects to (a virtual Bluetooth controller); else nothing on them. TCP serial ports
     are nodelay: a protocol's few bytes each way would otherwise wait 25-50 ms each on
-    Nagle and delayed ACKs."""
+    Nagle and delayed ACKs. wifi: an access point for the S3's Wi-Fi (_wifi_args); its
+    network is QEMU's user-mode one (DHCP; the host is 10.0.2.2)."""
     if board.startswith("kicad:"):
         machine, devices = from_kicad(board[len("kicad:"):], **opts)
     else:
@@ -412,7 +432,7 @@ def boot(board, flash, workdir, name="node", hci=None, uart1=None, uart2=None, e
         while size < len(data):
             size *= 2                          # QEMU wants the whole chip: 4, 8 or 16 MB
         dst.write(data + b"\xff" * (size - len(data)))
-    args = [QEMU, "-machine", machine, "-display", "none", "-monitor", "none", "-nic", "none",
+    args = [QEMU, "-machine", machine, "-display", "none", "-monitor", "none"] + _wifi_args(wifi) + [
             "-drive", "file=%s,if=mtd,format=raw" % img,
             "-serial", "file:" + log,
             "-serial", _uart_arg(uart1, hci),

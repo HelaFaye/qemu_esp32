@@ -48,7 +48,8 @@ Next:
   transmissions are packets on the air, seen by CAD and colliding with real ones, so
   listen-before-talk and retries are exercised.
 - **Bluetooth and Wi-Fi.** The same environment for vbt's virtual link (latency and loss
-  from distance and interference) and, once Wi-Fi is emulated, for it.
+  from distance and interference) and for Wi-Fi, whose frames now pass through an access
+  point in QEMU (patch 0019): loss, delay and signal strength per frame there.
 - **Replays.** Record the air (every packet, its time, strength and fate) and replay it, so
   a failure seen once can be run again exactly.
 

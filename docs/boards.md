@@ -15,7 +15,7 @@ Python, on the command line, or read from a KiCad design.
 | RTC_CNTL | Its interrupts and brown-out detector, with the supply a run-time setting |
 | LCD_CAM | Its LCD side: 8080 parallel displays (bus `lcd`), data by GDMA, CS and D/C through the matrix |
 | LEDC | Its registers keep what's written; no waveform on the pins |
-| Wi-Fi start-up | The PHY's calibrations and the MAC's reset complete: `esp_wifi_start()` returns and a station starts; no frames move, so a scan finds nothing |
+| Wi-Fi | Start-up completes (the PHY's calibrations, the MAC's reset). With an access point (`boot(..., wifi=True)`, or `-nic user,model=esp32_wifi`) frames move: a scan finds its networks, a station connects to the open one, gets an address by DHCP and reaches the host (10.0.2.2) over QEMU's network. Without one, a scan finds nothing |
 | SAR ADC | Conversions finish, reading mid-scale whatever the pin (no per-channel model yet) |
 | (Espressif's) | CPUs, flash, PSRAM (`-m`), UART, GDMA, crypto, timers, SDMMC, TWAI, RGB framebuffer |
 
@@ -30,7 +30,7 @@ Python, on the command line, or read from a KiCad design.
 | Board-level | `power-domain` (parts on a switched supply), `bus-noise` (errors on wires), `pin-glitch` (pulses on an input) |
 
 Not yet: LCD_CAM's RGB mode and camera, the ADC's inputs (a voltage per pin), LEDC's
-waveforms (a PWM backlight is always lit), RMT, Wi-Fi frames (an access point, a network), its Bluetooth controller, SX127x radios, and the classic ESP32's and C3's peripherals beyond
+waveforms (a PWM backlight is always lit), RMT, WPA2 networks and Wi-Fi's own access point mode (the board as the AP), its Bluetooth controller, SX127x radios, and the classic ESP32's and C3's peripherals beyond
 Espressif's. Each device's properties and lines: the
 [device reference](../patches/espressif-qemu/README.md).
 

@@ -1,7 +1,7 @@
 From b82de4e14d3543cf162e538a0deca39b9a81df00 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Sun, 15 Nov 2026 00:02:45 +0000
-Subject: [PATCH 15/18] esp32s3: Wi-Fi starts (PHY calibrations, MAC reset);
+Subject: [PATCH 15/19] esp32s3: Wi-Fi starts (PHY calibrations, MAC reset);
  ADC conversions finish
 
 What Wi-Fi start-up polls, found by halting a stuck start-up and reading the

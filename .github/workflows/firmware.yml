@@ -225,7 +225,7 @@ jobs:
           path: ${{ runner.temp }}/qemu
       - name: Build the Wi-Fi start-up app
         run: firmware/wifi-start/build.sh "$RUNNER_TEMP/wifi"
-      - name: Wi-Fi starts and scans
+      - name: Wi-Fi starts and scans; with an access point, connects, gets an address, reaches the host
         env:
           QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
           QEMU_BIOS: ${{ runner.temp }}/qemu/bios
