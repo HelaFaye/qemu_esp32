@@ -20,6 +20,7 @@ CHECKS = [
     ("touch (GT911)", r"Init GT911 Sensor success", 30),
     ("keyboard", r"Keyboard registered", 30),
     ("LoRa (SX1262)", r"Start Radio success", 60),
+    ("Wi-Fi starts", r"WiFi client started", 60),
 ]
 FATAL = r"Guru Meditation|abort\(\) was called|Backtrace:"
 
@@ -59,8 +60,18 @@ def main():
         time.sleep(0.5)
         n.qmp("qom-set", path="/machine/peripheral/touch", property="pressed", value=False)
         time.sleep(3)
-        n.screendump(os.path.join(work, "screen-after-input.ppm"))
+        w2, h2, px2 = n.screendump(os.path.join(work, "screen-after-input.ppm"))
         save_png(os.path.join(work, "screen-after-input.ppm"), os.path.join(work, "screen-after-input.png"))
+        # Its loop: each key reaches it, its radio sends, its screen answers
+        log = n.log()
+        keys = re.findall(r"Key pressed : (0x[0-9a-f]+)", log)
+        typed = "".join(chr(int(k, 16)) for k in keys)
+        print("%-16s %s" % ("keys reach it", "ok: " + typed if "hello" in typed else "MISSING (%r)" % typed))
+        ok &= "hello" in typed
+        print("%-16s %s" % ("radio sends", "ok: set TX" if "set TX" in log else "MISSING"))
+        ok &= "set TX" in log
+        print("%-16s %s" % ("screen answers", "ok" if px2 != px else "MISSING (unchanged)"))
+        ok &= px2 != px
     finally:
         n.stop()
     log = n.log()

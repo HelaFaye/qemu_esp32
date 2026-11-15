@@ -13,6 +13,8 @@ Python, on the command line, or read from a KiCad design.
 | I2C0, I2C1 | Command lists, FIFOs, ACK checks, interrupts, SCL timing |
 | USB Serial/JTAG | The CDC serial side; start-of-frame packets while plugged in (what HWCDC checks) |
 | RTC_CNTL | Its interrupts and brown-out detector, with the supply a run-time setting |
+| Wi-Fi start-up | The PHY's calibrations and the MAC's reset complete: `esp_wifi_start()` returns and a station starts; no frames move, so a scan finds nothing |
+| SAR ADC | Conversions finish, reading mid-scale whatever the pin (no per-channel model yet) |
 | (Espressif's) | CPUs, flash, PSRAM (`-m`), UART, GDMA, crypto, timers, SDMMC, TWAI, RGB framebuffer |
 
 | Parts | |
@@ -25,8 +27,8 @@ Python, on the command line, or read from a KiCad design.
 | Radio | `sx1262` `sx1261` `sx1268` (LoRa between QEMUs, [`radio/`](../radio/README.md)); Bluetooth through [`bluetooth/`](../bluetooth/README.md) |
 | Board-level | `power-domain` (parts on a switched supply), `bus-noise` (errors on wires), `pin-glitch` (pulses on an input) |
 
-Not yet: the S3's LCD_CAM (8080 parallel displays), ADC, LEDC/PWM, RMT, Wi-Fi, its
-Bluetooth controller, SX127x radios, and the classic ESP32's and C3's peripherals beyond
+Not yet: the S3's LCD_CAM (8080 parallel displays), the ADC's inputs (a voltage per pin),
+LEDC/PWM, RMT, Wi-Fi frames (an access point, a network), its Bluetooth controller, SX127x radios, and the classic ESP32's and C3's peripherals beyond
 Espressif's. Each device's properties and lines: the
 [device reference](../patches/espressif-qemu/README.md).
 

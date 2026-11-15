@@ -118,6 +118,7 @@ registers, memory). A backtrace from a panic decodes with
 
 ## What doesn't work yet
 
-The S3's LCD_CAM (8080 parallel displays), ADC, LEDC, RMT and Wi-Fi (start-up gets as far
-as the PHY's calibration), and its own Bluetooth controller (firmware runs its host stack
+The S3's LCD_CAM (8080 parallel displays), the ADC's inputs (conversions finish but read
+mid-scale), LEDC, RMT, Wi-Fi frames (Wi-Fi starts and scans, but finds no networks), and
+its own Bluetooth controller (firmware runs its host stack
 over HCI to a virtual controller instead). See [Boards](boards.md#whats-emulated).

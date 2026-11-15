@@ -21,6 +21,7 @@ in `BASE`; `build.sh [dir]` fetches it, applies them and builds `qemu-system-xte
 | 0012 | `bus-noise`: errors on parts' wires (`devices=touch:exp`): bit flips on SPI (MOSI and MISO, while selected) and I2C (both ways) at `ber` per bit, `burst` bits at a time, and lost I2C ACKs at `nack`; rates set at run time, `flips`/`nacks` count what was injected, `seed` repeats it. `pin-glitch`: pulses pulling a pin low (open-drain through a `pin-link`), at random (`rate` a second) or on demand (`pulse`) |
 | 0013 | SD cards in SPI mode: an illegal command's error isn't carried into the next command's R1 (ESP-IDF 5.5.1's sdspi probes CMD5/CMD52, then read CMD59 as rejected and failed the mount) |
 | 0014 | `gpio-button` encoders: edges 2 ms apart (`edge-us`), slow enough for firmware that polls its encoder pins each tick |
+| 0015 | Wi-Fi start-up completes: the PHY's TX DC-offset, IQ-estimation and temperature-sensor waits and the MAC's reset read as done, and the analog, SENS, baseband and MAC blocks keep what's written; a station starts and scans (no frames: no networks). SAR ADC conversions finish, reading mid-scale |
 
 ## Wiring a board
 

@@ -19,12 +19,13 @@ patched tree, `tests/qtest/`:
 | `esp32s3-sx1262-test` | Two QEMUs' radios on one air |
 | `esp32s3-usb-serial-jtag-test` | USB Serial/JTAG with and without a host |
 | `esp32s3-brownout-test` | The supply, the brown-out detector, power cuts |
+| `esp32s3-phy-test` | What Wi-Fi start-up polls (calibrations, the MAC's reset), the temperature sensor, ADC conversions |
 
 ```sh
 cd ~/esp-qemu/build
 for t in esp32s3-intmatrix-test esp32s3-gpio-test esp32s3-gpspi-test esp32s3-spi-devices-test \
          esp32s3-i2c-test esp32s3-i2c-devices-test esp32s3-sx1262-test \
-         esp32s3-usb-serial-jtag-test esp32s3-brownout-test; do
+         esp32s3-usb-serial-jtag-test esp32s3-brownout-test esp32s3-phy-test; do
   ninja tests/qtest/$t && QTEST_QEMU_BINARY=./qemu-system-xtensa ./tests/qtest/$t
 done
 ```
@@ -43,14 +44,18 @@ peripherals they use. Details and how to run each: [`firmware/`](../firmware/REA
 |---|---|---|
 | [gbagate](https://github.com/HelaFaye/gbagate) | its touch carrier, devkit and Supermini | ILI9341, XPT2046, SD over SPI with ESP-IDF's sdspi, MCP23017s (a chip reader, and buttons), ST7735, GPIO buttons; the picture read back from the glass, touches and button presses reaching the UI |
 | [meshcore-bare-esp32s3](https://github.com/mytechnotalent/meshcore-bare-esp32s3) | ESP32-S3 + SX1262 | GP-SPI2, GPIO interrupts, the SX1262 and time on air, the air hub; NimBLE over virtual Bluetooth with a phone pairing. Two nodes advertise over LoRa and store each other as contacts |
-| [LilyGO T-Deck](https://github.com/Xinyuan-LilyGO/T-Deck) (factory firmware) | T-Deck | The ST7789 under TFT_eSPI and LVGL, the GT911 and keyboard, RadioLib on the SX1262, PSRAM, USB Serial/JTAG, its peripherals' power switch. Known gap: Wi-Fi start-up stops in the PHY's calibration, so its main loop doesn't run yet |
+| [LilyGO T-Deck](https://github.com/Xinyuan-LilyGO/T-Deck) (factory firmware) | T-Deck | The ST7789 under TFT_eSPI and LVGL, the GT911 and keyboard, RadioLib on the SX1262, PSRAM, USB Serial/JTAG, its peripherals' power switch, Wi-Fi start-up; its main loop: keys typed reach it, its radio sends, its screen answers |
+| [wifi-start](../firmware/wifi-start) (a minimal ESP-IDF app) | DevKitC | Wi-Fi start-up: the PHY's calibrations, the MAC's reset; a station starts and a scan completes |
 
 What the test cases have found, so far (each fixed, with a qtest that reproduces it):
 - QEMU's SD model in SPI mode answered CMD9/CMD10 only from the wrong state and CMD13
   with the SD bus's response (patch 0008), and carried an illegal command's error into
   the next command's R1 (0013): gbagate's card wouldn't mount.
 - The GT911 dropped INT before the host had read the touch (0009): the T-Deck's touch.
-- The S3's PHY calibration waited forever on a peak detector (0009): Wi-Fi start-up.
+- The S3's PHY calibration waited forever on a peak detector (0009), then on a TX
+  DC-offset measurement, the temperature sensor, IQ estimation and the MAC's reset
+  (0015): Wi-Fi start-up, and the T-Deck's whole main loop behind it; then on an ADC
+  conversion (its battery reading, 0015).
 - Encoder edges came faster than firmware polling each tick could follow (0014):
   gbagate's devkit encoder.
 - In gbagate itself, its own QEMU checks found an ST7735 driver sending pixels low byte

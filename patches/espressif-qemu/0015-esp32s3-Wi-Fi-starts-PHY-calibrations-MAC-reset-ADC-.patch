@@ -1,0 +1,208 @@
+From b82de4e14d3543cf162e538a0deca39b9a81df00 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Sun, 15 Nov 2026 00:02:45 +0000
+Subject: [PATCH 15/15] esp32s3: Wi-Fi starts (PHY calibrations, MAC reset);
+ ADC conversions finish
+
+What Wi-Fi start-up polls, found by halting a stuck start-up and reading the
+loop: the TX DC-offset measurement (0x6000E04C, done in bit 24), the
+temperature sensor (SENS_SAR_TSENS_CTRL: ready, 104, about 25 C), IQ
+estimation (0x60006174 bit 16) and the MAC's reset (0x60033D14 bit 0). The
+analog, SENS, baseband and MAC blocks keep what's written, so the PHY's
+read-modify-writes read back. With no frames moving, esp_wifi_start() reaches
+STA_START and a scan finds no networks. SAR ADC1/2 conversions finish at once
+and read mid-scale (no ADC model yet): the T-Deck's battery read no longer
+hangs its loop. Test: esp32s3-phy-test.
+---
+ hw/xtensa/esp32s3.c            | 84 ++++++++++++++++++++++++++++++++++
+ tests/qtest/esp32s3-phy-test.c | 55 ++++++++++++++++++++++
+ tests/qtest/meson.build        |  2 +-
+ 3 files changed, 140 insertions(+), 1 deletion(-)
+ create mode 100644 tests/qtest/esp32s3-phy-test.c
+
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index 2155666..64eb70f 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -579,6 +579,65 @@ static void esp32s3_soc_realize(DeviceState *dev, Error **errp)
+  * ROM (rom_pkdet_vol_start) waits to reach 7, done, when Wi-Fi or Bluetooth starts */
+ #define ESP32S3_I2C_MST_ANA_STATUS_REG 0x6000E050
+ #define ESP32S3_I2C_MST_PKDET_DONE     (7u << 24)
++/* The block these are in (the analog I2C master and its calibration engines): it keeps
++ * what's written, so the PHY's read-modify-writes read back what they set */
++#define ESP32S3_ANA_BLOCK_START        0x6000E000
++#define ESP32S3_ANA_BLOCK_WORDS        64
++/* The TX DC-offset measurement (txdc_cal_v70): written with its start bit (1), it reports
++ * done in bit 24, then the comparator in bits 30-31 (0 here: no analog front end) */
++#define ESP32S3_ANA_TXDC_MEAS_REG      0x6000E04C
++#define ESP32S3_ANA_TXDC_MEAS_DONE     BIT(24)
++/* SENS (the SAR ADCs' and temperature sensor's controls): kept too. The temperature
++ * sensor (SAR_TSENS_CTRL: dump_out 24, ready 8, out 7:0), which the PHY reads during its
++ * calibration, is always ready with 104: about 25 degrees C by ESP-IDF's conversion
++ * (0.4386 * out - 20.52) */
++#define ESP32S3_SENS_BLOCK_START       0x60008800
++#define ESP32S3_SENS_BLOCK_WORDS       128
++#define ESP32S3_SENS_TSENS_CTRL_REG    0x60008850
++#define ESP32S3_SENS_TSENS_READY       BIT(8)
++#define ESP32S3_SENS_TSENS_25C         104
++/* The radio's baseband and front end (0x60006000): kept, so the PHY's set-ups read back */
++#define ESP32S3_BB_BLOCK_START         0x60006000
++#define ESP32S3_BB_BLOCK_WORDS         1024
++/* The Wi-Fi MAC (0x60033000): kept too. No frames move: Wi-Fi starts, and finds nothing */
++#define ESP32S3_MAC_BLOCK_START        0x60033000
++#define ESP32S3_MAC_BLOCK_WORDS        2048
++static uint32_t esp32s3_ana_block[ESP32S3_ANA_BLOCK_WORDS + ESP32S3_SENS_BLOCK_WORDS +
++                                  ESP32S3_BB_BLOCK_WORDS + ESP32S3_MAC_BLOCK_WORDS];
++
++/*
++ * Status bits the PHY's calibrations poll for "done" (found by halting a stuck start-up
++ * and reading the loop). Measurements finish at once here and read as done; their
++ * results read as 0 or what was last written, with no analog front end behind them.
++ */
++static const struct { hwaddr reg; uint32_t done; } esp32s3_phy_done[] = {
++    { 0x60006174, BIT(16) },        /* IQ estimation (rom_iq_est_enable) */
++    { 0x60033d14, BIT(0) },         /* The MAC's reset (hal_init) */
++    { 0x6000880C, BIT(16) },        /* SAR ADC1 conversion (SENS_SAR_MEAS1_CTRL2) */
++    { 0x60008830, BIT(16) },        /* SAR ADC2 conversion (SENS_SAR_MEAS2_CTRL2) */
++};
++
++static bool esp32s3_ana_word(hwaddr a, unsigned *i)
++{
++    if (a >= ESP32S3_ANA_BLOCK_START && a < ESP32S3_ANA_BLOCK_START + 4 * ESP32S3_ANA_BLOCK_WORDS) {
++        *i = (a - ESP32S3_ANA_BLOCK_START) / 4;
++        return true;
++    }
++    if (a >= ESP32S3_SENS_BLOCK_START && a < ESP32S3_SENS_BLOCK_START + 4 * ESP32S3_SENS_BLOCK_WORDS) {
++        *i = ESP32S3_ANA_BLOCK_WORDS + (a - ESP32S3_SENS_BLOCK_START) / 4;
++        return true;
++    }
++    if (a >= ESP32S3_BB_BLOCK_START && a < ESP32S3_BB_BLOCK_START + 4 * ESP32S3_BB_BLOCK_WORDS) {
++        *i = ESP32S3_ANA_BLOCK_WORDS + ESP32S3_SENS_BLOCK_WORDS + (a - ESP32S3_BB_BLOCK_START) / 4;
++        return true;
++    }
++    if (a >= ESP32S3_MAC_BLOCK_START && a < ESP32S3_MAC_BLOCK_START + 4 * ESP32S3_MAC_BLOCK_WORDS) {
++        *i = ESP32S3_ANA_BLOCK_WORDS + ESP32S3_SENS_BLOCK_WORDS + ESP32S3_BB_BLOCK_WORDS +
++             (a - ESP32S3_MAC_BLOCK_START) / 4;
++        return true;
++    }
++    return false;
++}
+ 
+ static uint64_t esp32s3_io_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+@@ -589,6 +648,26 @@ static uint64_t esp32s3_io_read(void *opaque, hwaddr addr, unsigned int size)
+     if (ESP32S3_IO_START_ADDR + addr == ESP32S3_I2C_MST_ANA_STATUS_REG) {
+         return ESP32S3_I2C_MST_PKDET_DONE;
+     }
++    unsigned i;
++    if (esp32s3_ana_word(ESP32S3_IO_START_ADDR + addr, &i)) {
++        uint32_t v = esp32s3_ana_block[i];
++        if (ESP32S3_IO_START_ADDR + addr == ESP32S3_ANA_TXDC_MEAS_REG) {
++            v = (v & ~(BIT(30) | BIT(31))) | ESP32S3_ANA_TXDC_MEAS_DONE;
++        }
++        if (ESP32S3_IO_START_ADDR + addr == ESP32S3_SENS_TSENS_CTRL_REG) {
++            v = (v & ~0xffu) | ESP32S3_SENS_TSENS_READY | ESP32S3_SENS_TSENS_25C;
++        }
++        if (ESP32S3_IO_START_ADDR + addr == 0x6000880C || ESP32S3_IO_START_ADDR + addr == 0x60008830) {
++            /* No ADC model yet: a conversion reads mid-scale (12 bits), whatever the pin */
++            v = (v & ~0xffffu) | 0x800;
++        }
++        for (unsigned k = 0; k < ARRAY_SIZE(esp32s3_phy_done); k++) {
++            if (ESP32S3_IO_START_ADDR + addr == esp32s3_phy_done[k].reg) {
++                v |= esp32s3_phy_done[k].done;
++            }
++        }
++        return v;
++    }
+ #if ESP32S3_IO_WARNING
+     warn_report("[ESP32-S3] Unsupported read to $%08lx, size = %i\n", ESP32S3_IO_START_ADDR + addr, size);
+ #endif
+@@ -598,6 +677,11 @@ static uint64_t esp32s3_io_read(void *opaque, hwaddr addr, unsigned int size)
+ 
+ static void esp32s3_io_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
+ {
++    unsigned i;
++    if (esp32s3_ana_word(ESP32S3_IO_START_ADDR + addr, &i)) {
++        esp32s3_ana_block[i] = value;
++        return;
++    }
+ #if ESP32S3_IO_WARNING
+         warn_report("[ESP32-S3] Unsupported write $%08lx = %08lx\n", ESP32S3_IO_START_ADDR + addr, value);
+ #endif
+diff --git a/tests/qtest/esp32s3-phy-test.c b/tests/qtest/esp32s3-phy-test.c
+new file mode 100644
+index 0000000..31c4747
+--- /dev/null
++++ b/tests/qtest/esp32s3-phy-test.c
+@@ -0,0 +1,55 @@
++/*
++ * QTest for what Wi-Fi and Bluetooth start-up polls on the ESP32-S3 with no radio behind
++ * it: the analog, SENS, baseband and MAC blocks keep what's written; the PHY's
++ * calibrations (peak detector, TX DC offset, IQ estimation), the temperature sensor, the
++ * MAC's reset and SAR ADC conversions read as done.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "libqtest.h"
++
++static void test_kept(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++    const uint32_t regs[] = { 0x6000E000, 0x60008800 + 0x40, 0x60006144, 0x60033c34 };
++    for (unsigned i = 0; i < ARRAY_SIZE(regs); i++) {
++        qtest_writel(qts, regs[i], 0x12345678);
++        g_assert_cmphex(qtest_readl(qts, regs[i]), ==, 0x12345678);
++    }
++    qtest_quit(qts);
++}
++
++static void test_done(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++    /* Peak detector: state 7 */
++    g_assert_cmphex(qtest_readl(qts, 0x6000E050) & (7u << 24), ==, 7u << 24);
++    /* TX DC measurement: started, it's done; the comparator reads 0; the rest kept */
++    qtest_writel(qts, 0x6000E04C, 0x00113cf3);
++    g_assert_cmphex(qtest_readl(qts, 0x6000E04C), ==, 0x00113cf3 | BIT(24));
++    /* Temperature sensor: ready, about 25 C */
++    qtest_writel(qts, 0x60008850, BIT(24));
++    g_assert_cmphex(qtest_readl(qts, 0x60008850), ==, BIT(24) | BIT(8) | 104);
++    /* IQ estimation, the MAC's reset */
++    g_assert_cmphex(qtest_readl(qts, 0x60006174) & BIT(16), ==, BIT(16));
++    qtest_writel(qts, 0x60033d14, BIT(1));
++    g_assert_cmphex(qtest_readl(qts, 0x60033d14), ==, BIT(1) | BIT(0));
++    /* SAR ADC1 and ADC2: done, mid-scale */
++    qtest_writel(qts, 0x6000880C, BIT(17));
++    g_assert_cmphex(qtest_readl(qts, 0x6000880C), ==, BIT(17) | BIT(16) | 0x800);
++    g_assert_cmphex(qtest_readl(qts, 0x60008830) & 0x1ffff, ==, BIT(16) | 0x800);
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/phy/kept", test_kept);
++    qtest_add_func("/esp32s3/phy/done", test_done);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 4db43a4..25fc4f9 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+
