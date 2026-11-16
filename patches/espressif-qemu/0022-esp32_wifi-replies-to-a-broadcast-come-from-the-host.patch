@@ -1,0 +1,90 @@
+From 177b56fc30842d04431a42bef00a486373013def Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 20:13:54 +0000
+Subject: [PATCH 22/22] esp32_wifi: replies to a broadcast come from the host's
+ alias, not loopback
+
+libslirp delivers a reply to a broadcast with the host's loopback
+address, 127.0.0.1, as its source, where a reply to unicast comes from
+the host alias 10.0.2.2. A station that learns its server from that
+reply then sends to 127.0.0.1, its own loopback, and nothing more
+reaches the host. SlimeVR trackers find their server this way (a
+broadcast handshake on port 6969), as do other discovery protocols.
+
+On frames from QEMU's network to the station, give IPv4 UDP packets from
+127.0.0.1 the source 10.0.2.2: recompute the IP header checksum and
+clear the UDP checksum, which is optional in IPv4.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Sb26stwPJiCMHhrBWZ2D9q
+---
+ hw/misc/esp32_wifi_ap.c | 43 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/hw/misc/esp32_wifi_ap.c b/hw/misc/esp32_wifi_ap.c
+index 30a2d4e..14201e9 100644
+--- a/hw/misc/esp32_wifi_ap.c
++++ b/hw/misc/esp32_wifi_ap.c
+@@ -160,9 +160,51 @@ static _Bool Esp32_WLAN_can_receive(NetClientState *ncs)
+     return 1;
+ }
+ 
++/*
++ * A reply to a broadcast comes from QEMU's user-mode network with the host's loopback
++ * address as its source (libslirp passes 127.0.0.1 through for a socket bound to the
++ * broadcast address), where a reply to unicast comes from the host's alias 10.0.2.2.
++ * A station that learns its server from that reply (SlimeVR trackers, and other
++ * discovery-by-broadcast protocols) then sends to 127.0.0.1, its own loopback, and
++ * nothing more reaches the host. Give such IPv4 UDP packets the alias as their source:
++ * the IP header checksum is recomputed, the UDP checksum cleared (optional in IPv4).
++ */
++static const uint8_t *esp32_wlan_fix_loopback_source(const uint8_t *buf, size_t size,
++                                                     uint8_t *copy, size_t copy_size)
++{
++    static const uint8_t loopback[4] = {127, 0, 0, 1};
++    static const uint8_t host_alias[4] = {10, 0, 2, 2};    /* slirp's default host */
++    if (size < 14 + 20 + 8 || size > copy_size || buf[12] != 0x08 || buf[13] != 0x00) {
++        return buf;                                         /* Not IPv4, or too big */
++    }
++    const uint8_t *ip = buf + 14;
++    const size_t ihl = (ip[0] & 0x0f) * 4;
++    if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != 17 || memcmp(ip + 12, loopback, 4) != 0 ||
++        size < 14 + ihl + 8) {
++        return buf;                                         /* Not UDP from 127.0.0.1 */
++    }
++    memcpy(copy, buf, size);
++    uint8_t *cip = copy + 14;
++    memcpy(cip + 12, host_alias, 4);
++    cip[10] = cip[11] = 0;
++    uint32_t sum = 0;
++    for (size_t i = 0; i < ihl; i += 2) {
++        sum += (cip[i] << 8) | cip[i + 1];
++    }
++    while (sum >> 16) {
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++    sum = ~sum & 0xffff;
++    cip[10] = sum >> 8;
++    cip[11] = sum & 0xff;
++    cip[ihl + 6] = cip[ihl + 7] = 0;                        /* UDP checksum: none */
++    return copy;
++}
++
+ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
+                                     const uint8_t *buf, size_t size)
+ {
++    uint8_t fixed[2048];
+     Esp32WifiState *s = qemu_get_nic_opaque(ncs);
+     struct mac80211_frame *frame;
+     if (!Esp32_WLAN_can_receive(ncs)) {
+@@ -180,6 +222,7 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
+      * access points turns it into a 802.11 frame and
+      * forwards it to the wireless device
+      */
++    buf = esp32_wlan_fix_loopback_source(buf, size, fixed, sizeof(fixed));
+     frame = Esp32_WLAN_create_data_packet(s, buf, size);
+     if (frame) {
+         memcpy(s->ap_macaddr,s->associated_ap_macaddr,6);
+-- 
+2.43.0
+

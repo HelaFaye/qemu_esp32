@@ -53,6 +53,13 @@ def esp32s3_devkitc(**_):
     return "esp32s3", []
 
 
+def esp32s3_supermini(**_):
+    """An ESP32-S3 SuperMini on its own (ESP32-S3FH4R2): 4 MB flash, 2 MB quad PSRAM. Its
+    WS2812 LED (GPIO48, Arduino's RGB_BUILTIN) is sent through the RMT, whose frames the
+    RMT keeps (/machine/soc/rmt: last-frame, frames)."""
+    return "esp32s3", ["-m", "2M"]
+
+
 def power_domain(name, *devices, pin=None):
     """Parts on their own supply (patch 0011), after them on the command line: switched
     by the firmware through pin (a regulator's enable) if given, and by a test with
@@ -233,6 +240,7 @@ def from_kicad(path, sd=None, **_):
 
 BOARDS = {
     "esp32s3-devkitc": esp32s3_devkitc,
+    "esp32s3-supermini": esp32s3_supermini,
     "meshcore-bare": meshcore_bare,
     "t-deck": t_deck,
     "t-display-s3": t_display_s3,
