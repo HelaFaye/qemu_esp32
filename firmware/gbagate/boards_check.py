@@ -152,17 +152,8 @@ def run(board, outdir):
             seen = node.count(r"input: 5-way")
             ok &= step(node, "knob", 1, work)                   # encoder -> 5-way + 5 (wraps)
             applied = node.wait_for(r"input: 5-way", 3, after=seen)
-            if applied is None:
-                # gbagate's gate_app.c fills applied_input in on the first change, after
-                # the edit has stored the new mode, so the first change is never applied:
-                # the UI asks for the five-way's keys, the hardware reads the encoder.
-                print("  note gbagate doesn't apply the first change of input "
-                      "(pio/src/gate_app.c applied_input); a second one is")
-                seen = node.count(r"input: 5-way")
-                ok &= step(node, "knob", 1, work)               # 5-way + 4: applied
-                applied = node.wait_for(r"input: 5-way", 3, after=seen)
-            else:
-                print("  note gbagate applies the first change of input now")
+            # The first change must be applied: gbagate before 0da7c4c left it to a
+            # second one (pio/src/gate_app.c seeded applied_input after the edit).
             check("by the encoder, Settings > input to the five-way, applied at once",
                   ok and applied is not None, (re.findall(r"input: .*", node.log()) or ["?"])[-1])
             press(node, "btn_a")                                # Done (A: the encoder's pin)
