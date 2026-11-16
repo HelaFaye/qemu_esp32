@@ -45,7 +45,7 @@ peripherals they use. Details and how to run each: [`firmware/`](../firmware/REA
 
 | Firmware | Board | What it confirms |
 |---|---|---|
-| [gbagate](https://github.com/HelaFaye/gbagate) | its touch carrier, devkit and Supermini | ILI9341, XPT2046, SD over SPI with ESP-IDF's sdspi, MCP23017s (a chip reader, and buttons), ST7735, GPIO buttons; the picture read back from the glass, touches and button presses reaching the UI |
+| [gbagate](https://github.com/HelaFaye/gbagate) | its touch carrier, devkit and Supermini | ILI9341, XPT2046, SD over SPI with ESP-IDF's sdspi, MCP23017s (a chip reader, and buttons), ST7735, GPIO buttons, its encoder; the picture read back from the glass, touches, turns and button presses reaching the UI; on the devkit, Settings switching it from the encoder to its switches |
 | [meshcore-bare-esp32s3](https://github.com/mytechnotalent/meshcore-bare-esp32s3) | ESP32-S3 + SX1262 | GP-SPI2, GPIO interrupts, the SX1262 and time on air, the air hub; NimBLE over virtual Bluetooth with a phone pairing. Two nodes advertise over LoRa and store each other as contacts |
 | [LilyGO T-Deck](https://github.com/Xinyuan-LilyGO/T-Deck) (factory firmware) | T-Deck | The ST7789 under TFT_eSPI and LVGL, the GT911 and keyboard, RadioLib on the SX1262, PSRAM, USB Serial/JTAG, its peripherals' power switch, Wi-Fi start-up; its main loop: keys typed reach it, its radio sends, its screen answers |
 | [LilyGO T-Display-S3](https://github.com/Xinyuan-LilyGO/T-Display-S3) (factory firmware) | T-Display-S3 | LCD_CAM and the GDMA under ESP-IDF's esp_lcd i80 driver, LVGL, octal PSRAM, LEDC, Wi-Fi start-up; its UI on the glass, its KEY button turning its pages |
@@ -69,7 +69,11 @@ What the test cases have found, so far (each fixed, with a qtest that reproduces
 - Encoder edges came faster than firmware polling each tick could follow (0014):
   gbagate's devkit encoder.
 - In gbagate itself, its own QEMU checks found an ST7735 driver sending pixels low byte
-  first, and no board mounting its SD card.
+  first, and no board mounting its SD card. On the devkit, the first change of Settings >
+  input isn't applied (`pio/src/gate_app.c` fills `applied_input` in after the edit has
+  stored the new mode): the UI asks for the five-way's keys while the hardware reads only
+  the encoder, so the board can't leave Settings and the change is never saved. Reported
+  to gbagate; `boards_check.py` notes it and goes on with a second change, which applies.
 
 And the stress demos, each against a small target firmware of its own
 ([`faults/`](../faults/README.md)): a glitch campaign on a PIN check, power cuts during

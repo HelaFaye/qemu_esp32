@@ -99,7 +99,7 @@ Each node gets its own copy of the flash, so its NVS is its own.
 
 | `Node` | |
 |---|---|
-| `log()`, `wait_for(regex, timeout)`, `count(regex)` | Serial output (UART0 and USB) |
+| `log()`, `wait_for(regex, timeout, after=)`, `count(regex)` | Serial output (UART0 and USB); `after=count(...)` waits for the next match |
 | `uart(n)` | A socket on UART n, given `boot(..., uartN=port)` |
 | `qemu_output()` | What QEMU itself printed (why it didn't start) |
 | `qmp(command, **args)` | Any QMP command; its result |

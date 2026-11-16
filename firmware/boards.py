@@ -276,14 +276,16 @@ class Node:
                 pass
         return out
 
-    def wait_for(self, pattern, timeout=60):
-        """The first match of a regex in the serial log, or None after timeout."""
+    def wait_for(self, pattern, timeout=60, after=0):
+        """The first match of a regex in the serial log, or None after timeout; with
+        after=n, the next one once there are more than n (n from count(), before what
+        should cause it)."""
         rx = re.compile(pattern)
         end = time.time() + timeout
         while time.time() < end:
-            m = rx.search(self.log())
-            if m:
-                return m
+            found = list(rx.finditer(self.log()))
+            if len(found) > after:
+                return found[after]
             if self.proc.poll() is not None:
                 break
             time.sleep(0.2)
