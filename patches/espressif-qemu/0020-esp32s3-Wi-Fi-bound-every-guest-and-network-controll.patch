@@ -1,0 +1,429 @@
+From cb5f97da86c27a2dde2e01c4f0f048cc14815117 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 20:19:00 +0000
+Subject: [PATCH] esp32s3 Wi-Fi: bound every guest- and network-controlled
+ length
+
+Patch 0019's MAC and access point copied lengths from the guest and the
+network without bounds (found by an audit, 16 November):
+
+- TX DMA: a descriptor's 12-bit length (up to 4095) was read into a stack
+  mac80211_frame of 2340 wire bytes, and the reads' results were ignored. A
+  frame shorter than the 24-byte header or longer than MAC80211_MAX_WIRE, or
+  one whose descriptor or body cannot be read, is now dropped (logged as a
+  guest error); the frame is zeroed first. Both the S3's and the original
+  ESP32's descriptor paths share esp32_wifi_tx_read().
+- RX DMA: a frame was written whole into the guest's buffer whatever the
+  descriptor's size; one that does not fit is now dropped, and a frame is
+  never copied from beyond the model's own.
+- SSID: a beacon's or probe response's SSID element length (up to 255) was
+  strncpy'd into a 64-byte stack buffer, unterminated. It is taken only when
+  the whole element lies inside the frame and is at most 32 octets
+  (IEEE80211_SSID_MAX), and terminated. The buffer is static: dummy_ap kept
+  pointing at the stack one after the handler returned.
+- Ethernet out: frame_length - 36 wrapped for a short frame, and the
+  unexplained +22 with a cap at the whole 1518-byte array still let the copy
+  run 14 bytes past it. Short frames are dropped; the payload is capped at
+  the 1504 bytes after the Ethernet header; the +22 is gone.
+- Ethernet in: a packet from QEMU's network was copied into the frame's
+  2316-byte body at any size. One shorter than an Ethernet header or longer
+  than the body holds is dropped.
+
+Tests (esp32s3-wifi-test): tx-oversize (a 4095-byte descriptor: dropped, the
+MAC still reports it sent, a good probe after it is answered), tx-short,
+ssid-overlong (SSID lengths 255 in a 20-byte element and 33), and
+rx-small-buffer (a 16-byte buffer is left unfilled and untouched). Against
+0019 alone tx-oversize, tx-short and rx-small-buffer fail and ssid-overlong
+kills QEMU (SIGABRT: the stack protector); with this, all seven pass.
+---
+ hw/misc/esp32_wifi.c            |  75 +++++++++++++++-----
+ hw/misc/esp32_wifi_ap.c         |  56 ++++++++++++---
+ hw/misc/esp32_wlan.h            |   8 +++
+ tests/qtest/esp32s3-wifi-test.c | 121 ++++++++++++++++++++++++++++++++
+ 4 files changed, 232 insertions(+), 28 deletions(-)
+
+diff --git a/hw/misc/esp32_wifi.c b/hw/misc/esp32_wifi.c
+index c040c9a..2a3cfc4 100644
+--- a/hw/misc/esp32_wifi.c
++++ b/hw/misc/esp32_wifi.c
+@@ -73,6 +73,40 @@ static void set_interrupt(Esp32WifiState *s,int e) {
+     qemu_set_irq(s->irq, 1);
+ }
+ 
++/*
++ * The frame a TX descriptor at desc_addr points at, into *frame. The
++ * descriptor's length is the guest's (12 bits, up to 4095): a frame shorter
++ * than an 802.11 header or longer than one can be (MAC80211_MAX_WIRE) is
++ * dropped, as is one whose descriptor or body cannot be read, rather than
++ * copied past the frame. False: nothing to send.
++ */
++static bool esp32_wifi_tx_read(hwaddr desc_addr, mac80211_frame *frame)
++{
++    dma_list_item item;
++    memset(frame, 0, sizeof(*frame));
++    if (address_space_read(&address_space_memory, desc_addr, MEMTXATTRS_UNSPECIFIED,
++                           &item, sizeof(item)) != MEMTX_OK) {
++        qemu_log_mask(LOG_GUEST_ERROR, "esp32_wifi: TX descriptor at 0x%" HWADDR_PRIx
++                      " unreadable\n", desc_addr);
++        return false;
++    }
++    if (item.length < MAC80211_HEADER_BYTES || item.length > MAC80211_MAX_WIRE) {
++        qemu_log_mask(LOG_GUEST_ERROR, "esp32_wifi: TX frame of %u bytes dropped "
++                      "(an 802.11 frame is %zu..%zu)\n", item.length,
++                      (size_t)MAC80211_HEADER_BYTES, (size_t)MAC80211_MAX_WIRE);
++        return false;
++    }
++    if (address_space_read(&address_space_memory, item.address, MEMTXATTRS_UNSPECIFIED,
++                           frame, item.length) != MEMTX_OK) {
++        qemu_log_mask(LOG_GUEST_ERROR, "esp32_wifi: TX frame at 0x%x unreadable\n",
++                      item.address);
++        return false;
++    }
++    frame->frame_length = item.length;
++    frame->next_frame = NULL;
++    return true;
++}
++
+ static void esp32_wifi_write(void *opaque, hwaddr addr, uint64_t value,
+                                  unsigned int size) {
+     Esp32WifiState *s = ESP32_WIFI(opaque);
+@@ -102,17 +136,11 @@ static void esp32_wifi_write(void *opaque, hwaddr addr, uint64_t value,
+             if (value & 0xc0000000) {
+                 // do a DMA transfer to the hardware from esp32 memory
+                 mac80211_frame frame;
+-                dma_list_item item;
+                 unsigned memaddr = (0x3fc00000 | (value & 0xfffff));
+-                address_space_read(&address_space_memory, memaddr,
+-                            MEMTXATTRS_UNSPECIFIED, &item, 12);
+-                address_space_read(&address_space_memory, item.address,
+-                            MEMTXATTRS_UNSPECIFIED, &frame, item.length);
+-                DEBUG(printf("esp32_wifi_outlink %x %x %x\n",memaddr,item.length,*(uint32_t *)(s->macaddr)));
+                 // frame from esp32 to ap
+-                frame.frame_length=item.length;
+-                frame.next_frame=0;
+-                Esp32_WLAN_handle_frame(s, &frame);
++                if (esp32_wifi_tx_read(memaddr, &frame)) {
++                    Esp32_WLAN_handle_frame(s, &frame);
++                }
+                 set_interrupt(s,0x80);
+             }
+     }
+@@ -131,16 +159,11 @@ static void esp32_wifi_write(void *opaque, hwaddr addr, uint64_t value,
+             if (value & 0xc0000000) {
+                 // do a DMA transfer to the hardware from esp32 memory
+                 mac80211_frame frame;
+-                dma_list_item item;
+                 unsigned memaddr = (0x3ff00000 | (value & 0xfffff));
+-                address_space_read(&address_space_memory, memaddr,
+-                            MEMTXATTRS_UNSPECIFIED, &item, 12);
+-                address_space_read(&address_space_memory, item.address,
+-                            MEMTXATTRS_UNSPECIFIED, &frame, item.length);
+                 // frame from esp32 to ap
+-                frame.frame_length=item.length;
+-                frame.next_frame=0;
+-                Esp32_WLAN_handle_frame(s, &frame);
++                if (esp32_wifi_tx_read(memaddr, &frame)) {
++                    Esp32_WLAN_handle_frame(s, &frame);
++                }
+                 set_interrupt(s,0x80);
+             }
+     }
+@@ -156,6 +179,9 @@ static int match_mac_address(uint8_t *a1,uint8_t *a2) {
+ // frame from ap to esp32
+ void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame,int length, int signal_strength) {
+     if(s->dma_inlink_address==0) return;
++    if (length < (int)MAC80211_HEADER_BYTES || length > (int)MAC80211_MAX_WIRE) {
++        return;   /* never more than the frame holds */
++    }
+     uint8_t *header;
+     if(!s->iss3) {
+     	header=malloc(sizeof(wifi_pkt_rx_ctrl_t)+length);
+@@ -212,7 +238,20 @@ void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame,int length, int si
+ 	}
+     // do a DMA transfer from the hardware to esp32 memory
+     dma_list_item item;
+-    address_space_read(&address_space_memory, s->dma_inlink_address, MEMTXATTRS_UNSPECIFIED, &item, 12);
++    if (address_space_read(&address_space_memory, s->dma_inlink_address,
++                           MEMTXATTRS_UNSPECIFIED, &item, sizeof(item)) != MEMTX_OK) {
++        qemu_log_mask(LOG_GUEST_ERROR, "esp32_wifi: RX descriptor unreadable\n");
++        free(header);
++        return;
++    }
++    /* The guest's buffer is item.size bytes: a frame that does not fit is
++     * dropped (as the MAC would), not written past it. */
++    if ((unsigned)length > item.size) {
++        qemu_log_mask(LOG_GUEST_ERROR, "esp32_wifi: RX frame of %d bytes dropped: "
++                      "the buffer holds %u\n", length, item.size);
++        free(header);
++        return;
++    }
+     address_space_write(&address_space_memory, item.address, MEMTXATTRS_UNSPECIFIED, header, length);
+     item.length=length;
+     item.eof=1;
+diff --git a/hw/misc/esp32_wifi_ap.c b/hw/misc/esp32_wifi_ap.c
+index 30a2d4e..3366aec 100644
+--- a/hw/misc/esp32_wifi_ap.c
++++ b/hw/misc/esp32_wifi_ap.c
+@@ -180,7 +180,13 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
+      * access points turns it into a 802.11 frame and
+      * forwards it to the wireless device
+      */
+-    frame = Esp32_WLAN_create_data_packet(s, buf, size);
++    /* An Ethernet frame (14-byte header) whose payload fits a frame's body
++     * with its 8-byte LLC/SNAP + EtherType and the FCS; anything else is
++     * dropped here rather than copied past the frame. */
++    if (size < 14 || size - 12 + 6 > sizeof(((mac80211_frame *)0)->data_and_fcs) - 4) {
++        return size;
++    }
++    frame = Esp32_WLAN_create_data_packet(s, buf, (int)size);
+     if (frame) {
+         memcpy(s->ap_macaddr,s->associated_ap_macaddr,6);
+         if(s->ap_state==Esp32_WLAN__STATE_STA_ASSOCIATED) {
+@@ -250,11 +256,33 @@ static void send_single_frame(Esp32WifiState *s, struct mac80211_frame *frame, s
+     
+     Esp32_WLAN_insert_frame(s, reply);
+ }
++/*
++ * The SSID element of a beacon or probe response (fixed fields: 8-byte
++ * timestamp, 2-byte interval, 2-byte capabilities; then element 0, its
++ * length, the SSID), into out (IEEE80211_SSID_MAX + 1 bytes, NUL-terminated).
++ * False for a frame without a whole SSID element of at most 32 octets.
++ */
++static bool esp32_wlan_ssid(const mac80211_frame *frame, char *out)
++{
++    const unsigned body = frame->frame_length > 24 ? frame->frame_length - 24 : 0;
++    if (body < 14 || frame->data_and_fcs[12] != 0) {
++        return false;
++    }
++    const unsigned len = frame->data_and_fcs[13];
++    if (len > IEEE80211_SSID_MAX || 14 + len > body) {
++        return false;
++    }
++    memcpy(out, frame->data_and_fcs + 14, len);
++    out[len] = '\0';
++    return true;
++}
++
+ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
+ {
+     struct mac80211_frame *reply = NULL;
+     static access_point_info dummy_ap={0};
+-    char ssid[64];
++    /* static: dummy_ap keeps pointing at it after this returns */
++    static char ssid[IEEE80211_SSID_MAX + 1];
+     unsigned long ethernet_frame_size;
+     unsigned char ethernet_frame[1518];
+     if(DEBUG) 
+@@ -269,7 +297,9 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
+         switch(frame->frame_control.sub_type) {
+             case IEEE80211_TYPE_MGT_SUBTYPE_BEACON:
+                 if(s->ap_state==Esp32_WLAN__STATE_NOT_AUTHENTICATED || s->ap_state==Esp32_WLAN__STATE_AUTHENTICATED) {
+-                    strncpy(ssid,(char *)frame->data_and_fcs+14,frame->data_and_fcs[13]);
++                    if (!esp32_wlan_ssid(frame, ssid)) {
++                        break;
++                    }
+                     if(DEBUG) printf("beacon from %s\n",ssid);
+                     dummy_ap.ssid=ssid;
+                     s->ap_state=Esp32_WLAN__STATE_STA_NOT_AUTHENTICATED;
+@@ -277,8 +307,10 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
+                 }
+                 break;
+             case IEEE80211_TYPE_MGT_SUBTYPE_PROBE_RESP:
++                if (!esp32_wlan_ssid(frame, ssid)) {
++                    break;
++                }
+                 ap_info=&dummy_ap;
+-                strncpy(ssid,(char *)frame->data_and_fcs+14,frame->data_and_fcs[13]);
+                 if(DEBUG) printf("probe resp from %s\n",ssid);
+                 dummy_ap.ssid=ssid;
+                 s->ap_state=Esp32_WLAN__STATE_STA_NOT_AUTHENTICATED;
+@@ -395,13 +427,17 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
+                 }
+             }
+ 
+-            // add packet content
++            /* add packet content: the body after the 24-byte header and the
++             * 8-byte LLC/SNAP + EtherType, less the 4-byte FCS. A frame too
++             * short to have them is dropped (frame_length is unsigned: the
++             * subtraction must not wrap), and the payload is capped to what
++             * fits after the 14-byte Ethernet header. */
++            if (frame->frame_length < 24 + 8 + 4) {
++                return;
++            }
+             ethernet_frame_size = frame->frame_length - 24 - 4 - 8;
+-
+-            // for some reason, the packet is 22 bytes too small (??)
+-            ethernet_frame_size += 22;
+-            if (ethernet_frame_size > sizeof(ethernet_frame)) {
+-                ethernet_frame_size = sizeof(ethernet_frame);
++            if (ethernet_frame_size > sizeof(ethernet_frame) - 14) {
++                ethernet_frame_size = sizeof(ethernet_frame) - 14;
+             }
+             memcpy(&ethernet_frame[14], &frame->data_and_fcs[8], ethernet_frame_size);
+             // add size of ethernet header
+diff --git a/hw/misc/esp32_wlan.h b/hw/misc/esp32_wlan.h
+index 92af317..449b493 100644
+--- a/hw/misc/esp32_wlan.h
++++ b/hw/misc/esp32_wlan.h
+@@ -86,6 +86,8 @@ typedef uint8_t macaddr_t[6];
+ 
+ #define BROADCAST (uint8_t[]){0xff,0xff,0xff,0xff,0xff,0xff}
+ 
++#define IEEE80211_SSID_MAX 32   /* octets, IEEE 802.11-2020 9.4.2.2 */
++
+ typedef struct mac80211_frame {
+     struct mac80211_frame_control {
+         unsigned    protocol_version    : 2;
+@@ -112,6 +114,12 @@ typedef struct mac80211_frame {
+     struct mac80211_frame *next_frame;
+ }  QEMU_PACKED mac80211_frame;
+ 
++/* A frame as it is on the air: the 24-byte header and at most 2312 bytes of
++ * body plus the 4-byte FCS -- what fits from frame_control to the end of
++ * data_and_fcs. Nothing longer may be copied into a mac80211_frame. */
++#define MAC80211_HEADER_BYTES offsetof(mac80211_frame, data_and_fcs)
++#define MAC80211_MAX_WIRE (MAC80211_HEADER_BYTES + sizeof(((mac80211_frame *)0)->data_and_fcs))
++
+ typedef struct access_point_info {
+     const char *ssid;
+     int channel;
+diff --git a/tests/qtest/esp32s3-wifi-test.c b/tests/qtest/esp32s3-wifi-test.c
+index 8ebfd5e..5ad1950 100644
+--- a/tests/qtest/esp32s3-wifi-test.c
++++ b/tests/qtest/esp32s3-wifi-test.c
+@@ -147,11 +147,132 @@ static void test_other_channel(void)
+     qtest_quit(qts);
+ }
+ 
++/* A frame from a TX descriptor, as test_probe sends one */
++static void tx(QTestState *qts, const uint8_t *frame, size_t n, unsigned desc_len)
++{
++    if (n) {
++        qtest_memwrite(qts, TX_BUF, frame, n);
++    }
++    qtest_writel(qts, TX_DESC, BIT(31) | BIT(30) | (desc_len << 12) | desc_len);
++    qtest_writel(qts, TX_DESC + 4, TX_BUF);
++    qtest_writel(qts, TX_DESC + 8, 0);
++    qtest_writel(qts, TX_LINK, (TX_DESC & 0xfffff) | BIT(30));
++}
++
++static size_t probe_request(uint8_t *req)
++{
++    memset(req, 0, 64);
++    req[0] = 0x40;
++    memcpy(req + 4, bcast, 6);
++    memcpy(req + 10, sta, 6);
++    memcpy(req + 16, bcast, 6);
++    size_t n = 24;
++    req[n++] = 0;
++    req[n++] = 9;
++    memcpy(req + n, "Open Wifi", 9);
++    return n + 9;
++}
++
++/*
++ * A descriptor's length is the guest's, up to 4095: longer than any 802.11
++ * frame (2340 bytes with its FCS). It is dropped, not copied past the
++ * model's frame (patch 0019 read it into a stack frame unchecked); the MAC
++ * still reports the descriptor done, and a good frame after it is answered.
++ */
++static void test_tx_oversize(void)
++{
++    QTestState *qts = radio_on_channel_4();
++    rx_desc(qts, DESC0, BUF0, DESC1);
++    rx_desc(qts, DESC1, BUF1, 0);
++    qtest_writel(qts, RX_BASE, DESC0);
++
++    uint8_t big[4095];
++    size_t n = probe_request(big);
++    memset(big + n, 0x41, sizeof big - n);
++    tx(qts, big, sizeof big, 4095);
++    g_assert_cmphex(qtest_readl(qts, INT_STATUS) & 0x80, ==, 0x80);
++    qtest_writel(qts, INT_CLR, qtest_readl(qts, INT_STATUS));
++    qtest_clock_step(qts, 5 * 1000 * 1000);
++    g_assert_cmphex(qtest_readl(qts, DESC0) & BIT(30), ==, 0);       /* not answered */
++
++    uint8_t req[64];
++    n = probe_request(req);
++    tx(qts, req, n, n);
++    qtest_clock_step(qts, 5 * 1000 * 1000);
++    g_assert_cmphex(qtest_readl(qts, DESC0) & BIT(30), ==, BIT(30)); /* this one is */
++    qtest_quit(qts);
++}
++
++/* Shorter than an 802.11 header: dropped */
++static void test_tx_short(void)
++{
++    QTestState *qts = radio_on_channel_4();
++    rx_desc(qts, DESC0, BUF0, 0);
++    qtest_writel(qts, RX_BASE, DESC0);
++    uint8_t req[64];
++    probe_request(req);
++    tx(qts, req, 10, 10);
++    qtest_clock_step(qts, 5 * 1000 * 1000);
++    g_assert_cmphex(qtest_readl(qts, DESC0) & BIT(30), ==, 0);
++    qtest_quit(qts);
++}
++
++/*
++ * A beacon from the guest whose SSID element says 255 octets, in a frame
++ * that holds 20, and one that says 33 (802.11 allows 32): patch 0019 copied
++ * that many into a 64-byte stack buffer. Both are ignored.
++ */
++static void test_ssid_overlong(void)
++{
++    QTestState *qts = radio_on_channel_4();
++    rx_desc(qts, DESC0, BUF0, 0);
++    qtest_writel(qts, RX_BASE, DESC0);
++    for (int pass = 0; pass < 2; pass++) {
++        uint8_t b[24 + 12 + 2 + 40] = { 0x80 };                     /* Beacon */
++        memcpy(b + 4, bcast, 6);
++        memcpy(b + 10, sta, 6);
++        memcpy(b + 16, sta, 6);
++        b[24 + 12] = 0;                                              /* SSID */
++        b[24 + 13] = pass ? 33 : 255;
++        memset(b + 24 + 14, 'A', 40);
++        tx(qts, b, pass ? sizeof b : 24 + 14 + 20, pass ? sizeof b : 24 + 14 + 20);
++        g_assert_cmphex(qtest_readl(qts, INT_STATUS) & 0x80, ==, 0x80);
++        qtest_writel(qts, INT_CLR, qtest_readl(qts, INT_STATUS));
++    }
++    qtest_quit(qts);
++}
++
++/*
++ * A receive descriptor whose buffer is too small for the frame: the frame is
++ * dropped, not written past the buffer (patch 0019 wrote it whole).
++ */
++static void test_rx_small_buffer(void)
++{
++    QTestState *qts = radio_on_channel_4();
++    qtest_writel(qts, DESC0, BIT(31) | (16 << 12) | 16);
++    qtest_writel(qts, DESC0 + 4, BUF0);
++    qtest_writel(qts, DESC0 + 8, 0);
++    uint8_t canary[64];
++    memset(canary, 0xA5, sizeof canary);
++    qtest_memwrite(qts, BUF0, canary, sizeof canary);
++    qtest_writel(qts, RX_BASE, DESC0);
++    qtest_clock_step(qts, 200 * 1000 * 1000);                       /* beacons come */
++    g_assert_cmphex(qtest_readl(qts, DESC0) & BIT(30), ==, 0);
++    uint8_t after[64];
++    qtest_memread(qts, BUF0, after, sizeof after);
++    g_assert_cmpmem(after, sizeof after, canary, sizeof canary);
++    qtest_quit(qts);
++}
++
+ int main(int argc, char **argv)
+ {
+     g_test_init(&argc, &argv, NULL);
+     qtest_add_func("/esp32s3/wifi/beacon", test_beacon);
+     qtest_add_func("/esp32s3/wifi/probe", test_probe);
+     qtest_add_func("/esp32s3/wifi/other-channel", test_other_channel);
++    qtest_add_func("/esp32s3/wifi/tx-oversize", test_tx_oversize);
++    qtest_add_func("/esp32s3/wifi/tx-short", test_tx_short);
++    qtest_add_func("/esp32s3/wifi/ssid-overlong", test_ssid_overlong);
++    qtest_add_func("/esp32s3/wifi/rx-small-buffer", test_rx_small_buffer);
+     return g_test_run();
+ }
+-- 
+2.43.0
+
