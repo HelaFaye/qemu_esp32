@@ -233,6 +233,41 @@ jobs:
           chmod +x "$QEMU_XTENSA"
           python3 firmware/wifi-start/check.py "$RUNNER_TEMP/wifi/flash.bin" "$RUNNER_TEMP/wifi/run"
 
+  slimevr:
+    needs: qemu
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-arduino-slimevr-${{ hashFiles('firmware/slimevr/COMMIT') }}
+      - name: Tools
+        run: |
+          pip install -q platformio esptool
+          sudo apt-get update && sudo apt-get install -y libglib2.0-0 libpixman-1-0 libgcrypt20 libslirp0
+      - uses: actions/download-artifact@v4
+        with:
+          name: qemu-xtensa
+          path: ${{ runner.temp }}/qemu
+      - name: Build the SlimeVR tracker (ESP32-S3 SuperMini, Arduino-ESP32 3.3)
+        run: firmware/slimevr/build.sh "$RUNNER_TEMP/slimevr"
+      - name: It boots, joins Wi-Fi and connects to a stand-in server
+        env:
+          QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
+          QEMU_BIOS: ${{ runner.temp }}/qemu/bios
+        run: |
+          chmod +x "$QEMU_XTENSA"
+          python3 firmware/slimevr/check.py "$RUNNER_TEMP/slimevr/flash.bin" "$RUNNER_TEMP/slimevr/run"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: slimevr-logs
+          path: ${{ runner.temp }}/slimevr/run
+
   fault-injection:
     needs: qemu
     runs-on: ubuntu-24.04

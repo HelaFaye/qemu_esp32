@@ -86,6 +86,7 @@ The boards here, each from its project's own pin definitions:
 | Board | |
 |---|---|
 | `esp32s3-devkitc` | The chip alone |
+| `esp32s3-supermini` | An ESP32-S3 SuperMini alone: 4 MB flash, 2 MB PSRAM; its WS2812 LED goes through the RMT |
 | `meshcore-bare` | A DevKitC and an SX1262 module |
 | `t-display-s3` | LilyGO T-Display-S3: a 170x320 ST7789 on LCD_CAM's 8-bit bus, octal PSRAM, its LCD's supply on GPIO15, buttons on 0 and 14 |
 | `t-deck` | LilyGO T-Deck: ST7789, GT911, keyboard, SX1262, SD, trackball, PSRAM; peripherals powered by GPIO10 |

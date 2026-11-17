@@ -1,0 +1,619 @@
+From b2c4763740bd923f8f24a2957440fe7fe26badca Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 20:13:53 +0000
+Subject: [PATCH 22/23] esp32s3: RMT transmit channels
+
+The RMT was an unimplemented region, so ESP-IDF's rmt_tx driver waited
+forever for TX_END. Arduino-ESP32 3.x sends neopixelWrite() and
+digitalWrite() on an RGB_BUILTIN LED (as on ESP32-S3 SuperMini and DevKitC
+boards) through it, so such firmware stopped at its first LED write.
+
+esp32s3.rmt keeps what is written to its registers and channel memory
+(RMTMEM); TX_START sends a channel's symbols in virtual time (a tick is
+an APB cycle times DIV_CNT), raising TX_THR_EVENT every TX_LIM symbols so
+a driver can refill a ping-pong buffer, and TX_END at the end marker;
+continuous mode repeats. Its interrupt goes to the matrix as
+ETS_RMT_INTR_SOURCE. Pins are not driven; the bits sent (a long high is
+a 1, as WS2812 LEDs read them) are kept as hex in the device's
+last-frame property, with a frames count, for tests. Not modelled: the
+receive channels, the carrier, loop counting, DMA.
+
+esp32s3-rmt-test sends an LED's three bytes and reads them back, and
+checks the threshold and end interrupts on a wrapping transmission.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Sb26stwPJiCMHhrBWZ2D9q
+---
+ hw/misc/esp32s3_rmt.c          | 318 +++++++++++++++++++++++++++++++++
+ hw/misc/meson.build            |   1 +
+ hw/xtensa/esp32s3.c            |  21 ++-
+ include/hw/misc/esp32s3_rmt.h  |  51 ++++++
+ tests/qtest/esp32s3-rmt-test.c | 107 +++++++++++
+ tests/qtest/meson.build        |   2 +-
+ 6 files changed, 490 insertions(+), 10 deletions(-)
+ create mode 100644 hw/misc/esp32s3_rmt.c
+ create mode 100644 include/hw/misc/esp32s3_rmt.h
+ create mode 100644 tests/qtest/esp32s3-rmt-test.c
+
+diff --git a/hw/misc/esp32s3_rmt.c b/hw/misc/esp32s3_rmt.c
+new file mode 100644
+index 0000000..d58cc42
+--- /dev/null
++++ b/hw/misc/esp32s3_rmt.c
+@@ -0,0 +1,318 @@
++/*
++ * ESP32-S3 RMT (remote control transceiver): the transmit side
++ *
++ * Enough of the RMT for ESP-IDF's rmt_tx driver (and Arduino's rmtWrite, behind
++ * neopixelWrite and digitalWrite on an RGB_BUILTIN LED) to send and finish: the
++ * registers keep what is written, the channel memory (RMTMEM) holds symbols, and a
++ * transmission started with TX_START walks its symbols in virtual time, raising
++ * TX_THR_EVENT every TX_LIM symbols (so a driver can refill a ping-pong buffer) and
++ * TX_END at the end marker (a zero duration). The pin is not driven; what was sent is
++ * kept, decoded, in the `last-frame` property.
++ *
++ * Timing: a tick is one APB cycle (80 MHz) times the channel's DIV_CNT. The group
++ * clock divider (RMT_SYS_CONF) is ignored, so durations are approximate.
++ *
++ * Not modelled: receive channels, carrier, loop counting, DMA access.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qapi/error.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/misc/esp32s3_rmt.h"
++
++#define R_CH0CONF0      (0x20 / 4)  /* TX channels 0-3: CHnCONF0 */
++#define R_INT_RAW       (0x70 / 4)
++#define R_INT_ST        (0x74 / 4)
++#define R_INT_ENA       (0x78 / 4)
++#define R_INT_CLR       (0x7c / 4)
++#define R_CH0_TX_LIM    (0xa0 / 4)
++#define R_DATE          (0xcc / 4)
++
++#define CONF0_TX_START      (1u << 0)
++#define CONF0_MEM_RD_RST    (1u << 1)
++#define CONF0_TX_CONTI      (1u << 3)
++#define CONF0_MEM_WRAP      (1u << 4)
++#define CONF0_TX_STOP       (1u << 7)
++#define CONF0_DIV_SHIFT     8
++#define CONF0_MEM_SIZE_SHIFT 16
++
++#define INT_TX_END(ch)  (1u << (ch))
++#define INT_TX_ERR(ch)  (1u << (4 + (ch)))
++#define INT_TX_THR(ch)  (1u << (8 + (ch)))
++
++#define APB_NS_PER_TICK 12.5
++
++static void esp32s3_rmt_update_irq(ESP32S3RmtState *s)
++{
++    qemu_set_irq(s->irq, (s->int_raw & s->int_ena) != 0);
++}
++
++static uint32_t conf0(ESP32S3RmtState *s, int ch)
++{
++    return s->regs[R_CH0CONF0 + ch];
++}
++
++static void esp32s3_rmt_finish_frame(ESP32S3RmtState *s, ESP32S3RmtTx *tx)
++{
++    const uint32_t bytes = tx->bits / 8;
++    GString *hex = g_string_new(NULL);
++    for (uint32_t i = 0; i < bytes && i < ESP32S3_RMT_FRAME_MAX; i++) {
++        g_string_append_printf(hex, "%02x", tx->frame[i]);
++    }
++    g_free(s->last_frame);
++    s->last_frame = g_string_free(hex, false);
++    s->frames++;
++}
++
++/* Send symbols from where the channel is until an event: the end marker, the
++ * threshold, or the end of its memory. Raise the event when the time they take
++ * has passed. */
++static void esp32s3_rmt_run(ESP32S3RmtState *s, int ch)
++{
++    ESP32S3RmtTx *tx = &s->tx[ch];
++    const uint32_t c0 = conf0(s, ch);
++    uint32_t blocks = (c0 >> CONF0_MEM_SIZE_SHIFT) & 0xf;
++    uint32_t div = (c0 >> CONF0_DIV_SHIFT) & 0xff;
++    const uint32_t lim = s->regs[R_CH0_TX_LIM + ch] & 0x1ff;
++    if (blocks == 0) {
++        blocks = 1;
++    }
++    if (div == 0) {
++        div = 256;
++    }
++    uint32_t words = blocks * ESP32S3_RMT_WORDS_PER_BLOCK;
++    if (ch * ESP32S3_RMT_WORDS_PER_BLOCK + words > ARRAY_SIZE(s->mem)) {
++        words = ARRAY_SIZE(s->mem) - ch * ESP32S3_RMT_WORDS_PER_BLOCK;
++    }
++
++    uint64_t ticks = 0;
++    tx->pending = 0;
++    tx->finished = false;
++    for (;;) {
++        if (tx->pos >= words) {
++            if (c0 & CONF0_MEM_WRAP) {
++                tx->pos = 0;
++            } else {
++                /* Ran off the end of its memory with no end marker */
++                tx->pending = INT_TX_ERR(ch);
++                tx->finished = true;
++                break;
++            }
++        }
++        const uint32_t w = s->mem[ch * ESP32S3_RMT_WORDS_PER_BLOCK + tx->pos++];
++        const uint32_t d0 = w & 0x7fff, d1 = (w >> 16) & 0x7fff;
++        if (d0 == 0 || d1 == 0) {
++            ticks += d0;                  /* An end marker may carry one last level */
++            tx->pending = INT_TX_END(ch);
++            tx->finished = true;
++            break;
++        }
++        ticks += d0 + d1;
++        if (tx->bits < ESP32S3_RMT_FRAME_MAX * 8) {
++            if (d0 > d1) {
++                tx->frame[tx->bits / 8] |= 0x80 >> (tx->bits % 8);
++            }
++            tx->bits++;
++        }
++        tx->sent++;
++        if (lim && (tx->sent % lim) == 0) {
++            tx->pending = INT_TX_THR(ch);
++            break;
++        }
++        if (tx->sent > 1000000) {         /* A runaway: no end marker in sight */
++            tx->pending = INT_TX_ERR(ch);
++            tx->finished = true;
++            break;
++        }
++    }
++    const int64_t ns = (int64_t) (ticks * div * APB_NS_PER_TICK) + 1;
++    timer_mod(&tx->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns);
++}
++
++static void esp32s3_rmt_timer_ch(ESP32S3RmtState *s, int ch)
++{
++    ESP32S3RmtTx *tx = &s->tx[ch];
++    if (!tx->active) {
++        return;
++    }
++    s->int_raw |= tx->pending;
++    if (tx->finished) {
++        tx->active = false;
++        esp32s3_rmt_finish_frame(s, tx);
++        if ((conf0(s, ch) & CONF0_TX_CONTI) && (tx->pending & INT_TX_END(ch))) {
++            /* Continuous mode: send the same symbols again */
++            tx->active = true;
++            tx->pos = 0;
++            tx->bits = 0;
++            memset(tx->frame, 0, sizeof(tx->frame));
++            esp32s3_rmt_update_irq(s);
++            esp32s3_rmt_run(s, ch);
++            return;
++        }
++    }
++    esp32s3_rmt_update_irq(s);
++    if (tx->active) {
++        esp32s3_rmt_run(s, ch);         /* Past the threshold: carry on */
++    }
++}
++
++#define RMT_TIMER_CB(n) \
++    static void esp32s3_rmt_timer##n(void *opaque) { esp32s3_rmt_timer_ch(opaque, n); }
++RMT_TIMER_CB(0)
++RMT_TIMER_CB(1)
++RMT_TIMER_CB(2)
++RMT_TIMER_CB(3)
++static void (*const timer_cb[ESP32S3_RMT_TX_CHANNELS])(void *) = {
++    esp32s3_rmt_timer0, esp32s3_rmt_timer1, esp32s3_rmt_timer2, esp32s3_rmt_timer3,
++};
++
++static void esp32s3_rmt_start(ESP32S3RmtState *s, int ch)
++{
++    ESP32S3RmtTx *tx = &s->tx[ch];
++    timer_del(&tx->timer);
++    tx->active = true;
++    tx->pos = 0;
++    tx->sent = 0;
++    tx->bits = 0;
++    memset(tx->frame, 0, sizeof(tx->frame));
++    esp32s3_rmt_run(s, ch);
++}
++
++static uint64_t esp32s3_rmt_read(void *opaque, hwaddr addr, unsigned size)
++{
++    ESP32S3RmtState *s = ESP32S3_RMT(opaque);
++    if (addr >= ESP32S3_RMT_MEM_OFFSET) {
++        const hwaddr i = (addr - ESP32S3_RMT_MEM_OFFSET) / 4;
++        return i < ARRAY_SIZE(s->mem) ? s->mem[i] : 0;
++    }
++    const hwaddr r = addr / 4;
++    switch (r) {
++    case R_INT_RAW:
++        return s->int_raw;
++    case R_INT_ST:
++        return s->int_raw & s->int_ena;
++    case R_INT_ENA:
++        return s->int_ena;
++    case R_INT_CLR:
++        return 0;
++    case R_DATE:
++        return 0x2101181;               /* RMT_DATE's reset value */
++    default:
++        return r < ARRAY_SIZE(s->regs) ? s->regs[r] : 0;
++    }
++}
++
++static void esp32s3_rmt_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++    ESP32S3RmtState *s = ESP32S3_RMT(opaque);
++    if (addr >= ESP32S3_RMT_MEM_OFFSET) {
++        const hwaddr i = (addr - ESP32S3_RMT_MEM_OFFSET) / 4;
++        if (i < ARRAY_SIZE(s->mem)) {
++            s->mem[i] = value;
++        }
++        return;
++    }
++    const hwaddr r = addr / 4;
++    switch (r) {
++    case R_INT_RAW:
++    case R_INT_ST:
++        break;                          /* Read-only */
++    case R_INT_ENA:
++        s->int_ena = value;
++        esp32s3_rmt_update_irq(s);
++        break;
++    case R_INT_CLR:
++        s->int_raw &= ~value;
++        esp32s3_rmt_update_irq(s);
++        break;
++    case R_CH0CONF0 ... R_CH0CONF0 + ESP32S3_RMT_TX_CHANNELS - 1: {
++        const int ch = r - R_CH0CONF0;
++        /* TX_START, MEM_RD_RST and TX_STOP act and read back as 0 */
++        s->regs[r] = value & ~(CONF0_TX_START | CONF0_MEM_RD_RST | CONF0_TX_STOP);
++        if (value & CONF0_MEM_RD_RST) {
++            s->tx[ch].pos = 0;
++        }
++        if (value & CONF0_TX_STOP) {
++            timer_del(&s->tx[ch].timer);
++            s->tx[ch].active = false;
++        }
++        if (value & CONF0_TX_START) {
++            esp32s3_rmt_start(s, ch);
++        }
++        break;
++    }
++    default:
++        if (r < ARRAY_SIZE(s->regs)) {
++            s->regs[r] = value;
++        }
++        break;
++    }
++}
++
++static const MemoryRegionOps esp32s3_rmt_ops = {
++    .read = esp32s3_rmt_read,
++    .write = esp32s3_rmt_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 4,
++};
++
++static char *esp32s3_rmt_get_last_frame(Object *obj, Error **errp)
++{
++    ESP32S3RmtState *s = ESP32S3_RMT(obj);
++    return g_strdup(s->last_frame ? s->last_frame : "");
++}
++
++static void esp32s3_rmt_reset(DeviceState *dev)
++{
++    ESP32S3RmtState *s = ESP32S3_RMT(dev);
++    for (int ch = 0; ch < ESP32S3_RMT_TX_CHANNELS; ch++) {
++        timer_del(&s->tx[ch].timer);
++        s->tx[ch].active = false;
++    }
++    memset(s->regs, 0, sizeof(s->regs));
++    s->int_raw = 0;
++    s->int_ena = 0;
++    qemu_irq_lower(s->irq);
++}
++
++static void esp32s3_rmt_init(Object *obj)
++{
++    ESP32S3RmtState *s = ESP32S3_RMT(obj);
++    memory_region_init_io(&s->iomem, obj, &esp32s3_rmt_ops, s, TYPE_ESP32S3_RMT, 0x1000);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
++    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
++    for (int ch = 0; ch < ESP32S3_RMT_TX_CHANNELS; ch++) {
++        timer_init_ns(&s->tx[ch].timer, QEMU_CLOCK_VIRTUAL, timer_cb[ch], s);
++    }
++    object_property_add_str(obj, "last-frame", esp32s3_rmt_get_last_frame, NULL);
++    object_property_add_uint32_ptr(obj, "frames", &s->frames, OBJ_PROP_FLAG_READ);
++}
++
++static void esp32s3_rmt_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    device_class_set_legacy_reset(dc, esp32s3_rmt_reset);
++}
++
++static const TypeInfo esp32s3_rmt_info = {
++    .name = TYPE_ESP32S3_RMT,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(ESP32S3RmtState),
++    .instance_init = esp32s3_rmt_init,
++    .class_init = esp32s3_rmt_class_init,
++};
++
++static void esp32s3_rmt_register_types(void)
++{
++    type_register_static(&esp32s3_rmt_info);
++}
++
++type_init(esp32s3_rmt_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index d1916cd..0bcb7eb 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -267,6 +267,7 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files(
+   'esp32c3_jtag.c',
+   'esp32s3_rtc_cntl.c',
+   'esp32s3_rng.c',
++  'esp32s3_rmt.c',
+   'esp32s3_pms.c',
+   'esp_hmac.c',
+   'esp32s3_hmac.c'
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index e42fb8b..6c68232 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -49,6 +49,7 @@
+ #include "hw/misc/esp32s3_cache.h"
+ #include "hw/char/esp32s3_uart.h"
+ #include "hw/misc/esp32s3_rng.h"
++#include "hw/misc/esp32s3_rmt.h"
+ 
+ #include "hw/nvram/esp32s3_efuse.h"
+ #include "hw/xtensa/esp32s3_clk.h"
+@@ -131,6 +132,7 @@ typedef struct Esp32s3SocState {
+     ESP32S3LcdCamState lcd_cam;         /* LCD_CAM's LCD side (i80) */
+     ESP32S3I2CState i2c[2];
+     Esp32s3RngState rng;
++    ESP32S3RmtState rmt;                /* RMT: the transmit side */
+     Esp32S3TWAIState twai;
+ 
+     Esp32s3RtcCntlState rtc_cntl;
+@@ -857,14 +859,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(Esp32s3MachineState, ESP32S3_MACHINE)
+ 
+ // -----------------------------------------------
+ 
+-static void esp32s3_soc_add_unimp_device(MemoryRegion *dest, const char* name, hwaddr dport_base_addr, size_t size)
+-{
+-    create_unimplemented_device(name, dport_base_addr, size);
+-    char * name_apb = g_strdup_printf("%s-apb", name);
+-    create_unimplemented_device(name_apb, dport_base_addr + APB_REG_BASE, size);
+-    g_free(name_apb);
+-}
+-
+ static void esp32s3_machine_init(MachineState *machine)
+ {
+     DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
+@@ -911,6 +905,7 @@ static void esp32s3_machine_init(MachineState *machine)
+     object_initialize_child(OBJECT(ss), "i2c0", &ss->i2c[0], TYPE_ESP32S3_I2C);
+     object_initialize_child(OBJECT(ss), "i2c1", &ss->i2c[1], TYPE_ESP32S3_I2C);
+     object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
++    object_initialize_child(OBJECT(ss), "rmt", &ss->rmt, TYPE_ESP32S3_RMT);
+ 
+     object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
+ 
+@@ -1215,7 +1210,15 @@ static void esp32s3_machine_init(MachineState *machine)
+         memory_region_add_subregion_overlap(sys_mem, esp32s3_memmap[ESP32S3_MEMREGION_FRAMEBUF].base, &ss->rgb.vram, 0);
+     }
+ 
+-    esp32s3_soc_add_unimp_device(sys_mem, "esp32s3.rmt", DR_REG_RMT_BASE, 0x1000);
++    /* RMT: transmissions finish (ESP-IDF's rmt_tx waits for TX_END; Arduino's
++     * RGB_BUILTIN LED and neopixelWrite go through it) */
++    {
++        sysbus_realize(SYS_BUS_DEVICE(&ss->rmt), &error_fatal);
++        memory_region_add_subregion_overlap(sys_mem, DR_REG_RMT_BASE,
++                                            sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->rmt), 0), 0);
++        sysbus_connect_irq(SYS_BUS_DEVICE(&ss->rmt), 0,
++                           qdev_get_gpio_in(DEVICE(&ss->intmatrix), ETS_RMT_INTR_SOURCE));
++    }
+ 
+     
+     esp32s3_machine_init_sd(ss);
+diff --git a/include/hw/misc/esp32s3_rmt.h b/include/hw/misc/esp32s3_rmt.h
+new file mode 100644
+index 0000000..c1d0eb0
+--- /dev/null
++++ b/include/hw/misc/esp32s3_rmt.h
+@@ -0,0 +1,51 @@
++/*
++ * ESP32-S3 RMT (remote control transceiver): the transmit side
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#pragma once
++
++#include "hw/sysbus.h"
++#include "qemu/timer.h"
++
++#define TYPE_ESP32S3_RMT "esp32s3.rmt"
++#define ESP32S3_RMT(obj) OBJECT_CHECK(ESP32S3RmtState, (obj), TYPE_ESP32S3_RMT)
++
++#define ESP32S3_RMT_TX_CHANNELS     4
++#define ESP32S3_RMT_CHANNELS        8
++#define ESP32S3_RMT_WORDS_PER_BLOCK 48      /* SOC_RMT_MEM_WORDS_PER_CHANNEL */
++#define ESP32S3_RMT_REGS_SIZE       0xd0
++#define ESP32S3_RMT_MEM_OFFSET      0x800   /* RMTMEM, 0x60016800 */
++#define ESP32S3_RMT_FRAME_MAX       256     /* Decoded bytes kept per transmission */
++
++typedef struct ESP32S3RmtTx {
++    bool active;
++    uint32_t pos;           /* Word being sent, relative to the channel's memory */
++    uint32_t sent;          /* Symbols sent in this transmission */
++    uint32_t bits;          /* Decoded bits so far */
++    uint8_t frame[ESP32S3_RMT_FRAME_MAX];
++    QEMUTimer timer;
++    uint32_t pending;       /* Interrupt bits to raise when the timer fires */
++    bool finished;          /* The transmission ends when the timer fires */
++} ESP32S3RmtTx;
++
++typedef struct ESP32S3RmtState {
++    SysBusDevice parent_obj;
++    MemoryRegion iomem;
++    qemu_irq irq;
++
++    uint32_t regs[ESP32S3_RMT_REGS_SIZE / 4];
++    uint32_t mem[ESP32S3_RMT_CHANNELS * ESP32S3_RMT_WORDS_PER_BLOCK];
++    uint32_t int_raw;
++    uint32_t int_ena;
++    ESP32S3RmtTx tx[ESP32S3_RMT_TX_CHANNELS];
++
++    /* For tests: what the last finished transmission carried, decoded as
++     * WS2812-style bits (a symbol whose high time is longer than its low time is a 1),
++     * most significant bit first, as hex; and how many transmissions have finished. */
++    char *last_frame;
++    uint32_t frames;
++} ESP32S3RmtState;
+diff --git a/tests/qtest/esp32s3-rmt-test.c b/tests/qtest/esp32s3-rmt-test.c
+new file mode 100644
+index 0000000..c84b346
+--- /dev/null
++++ b/tests/qtest/esp32s3-rmt-test.c
+@@ -0,0 +1,107 @@
++/*
++ * QTest for the ESP32-S3 RMT's transmit side: symbols written to RMTMEM and started with
++ * TX_START are sent in virtual time; TX_END is raised at the end marker, TX_THR_EVENT
++ * every TX_LIM symbols, and the bits sent (WS2812 timing: a long high is a 1) are kept
++ * in the device's `last-frame` property.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/bitops.h"
++#include "libqtest.h"
++#include "qapi/qmp/qdict.h"
++
++#define RMT_BASE        0x60016000
++#define RMT_MEM         0x60016800
++#define CH0CONF0        (RMT_BASE + 0x20)
++#define INT_RAW         (RMT_BASE + 0x70)
++#define INT_ENA         (RMT_BASE + 0x78)
++#define INT_CLR         (RMT_BASE + 0x7c)
++#define CH0_TX_LIM      (RMT_BASE + 0xa0)
++#define DATE            (RMT_BASE + 0xcc)
++
++/* One WS2812 bit at 80 ticks per microsecond: a 1 is 0.8 us high, 0.45 us low */
++static uint32_t symbol(bool one)
++{
++    const uint32_t high = one ? 64 : 32, low = one ? 36 : 68;
++    return high | BIT(15) | (low << 16);
++}
++
++static void write_byte(QTestState *qts, uint32_t *word, uint8_t byte)
++{
++    for (int b = 7; b >= 0; b--) {
++        qtest_writel(qts, RMT_MEM + 4 * (*word)++, symbol(byte & BIT(b)));
++    }
++}
++
++static char *last_frame(QTestState *qts)
++{
++    QDict *r = qtest_qmp(qts, "{'execute': 'qom-get', 'arguments': "
++                              "{'path': '/machine/soc/rmt', 'property': 'last-frame'}}");
++    char *hex = g_strdup(qdict_get_str(r, "return"));
++    qobject_unref(r);
++    return hex;
++}
++
++static void test_frame(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++    g_assert_cmphex(qtest_readl(qts, DATE), !=, 0);
++
++    /* G, R, B for one LED, then the end marker */
++    uint32_t w = 0;
++    write_byte(qts, &w, 0x10);
++    write_byte(qts, &w, 0xff);
++    write_byte(qts, &w, 0x01);
++    qtest_writel(qts, RMT_MEM + 4 * w, 0);
++
++    qtest_writel(qts, INT_ENA, BIT(0));
++    qtest_writel(qts, CH0CONF0, (1u << 16) | (1u << 8) | BIT(0));   /* 1 block, div 1, start */
++    g_assert_cmphex(qtest_readl(qts, CH0CONF0) & BIT(0), ==, 0);    /* TX_START reads 0 */
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & BIT(0), ==, 0);     /* Not yet: it takes time */
++
++    qtest_clock_step(qts, 100000);                                   /* 24 bits take ~30 us */
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & BIT(0), ==, BIT(0));
++    g_autofree char *hex = last_frame(qts);
++    g_assert_cmpstr(hex, ==, "10ff01");
++
++    qtest_writel(qts, INT_CLR, BIT(0));
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & BIT(0), ==, 0);
++    qtest_quit(qts);
++}
++
++static void test_threshold(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++    /* A whole block of 1s with no end marker, wrapping: the driver would refill it at
++     * each threshold. Here nothing refills it, so it keeps going until stopped. */
++    for (uint32_t w = 0; w < 48; w++) {
++        qtest_writel(qts, RMT_MEM + 4 * w, symbol(true));
++    }
++    qtest_writel(qts, CH0_TX_LIM, 24);
++    qtest_writel(qts, INT_ENA, BIT(0) | BIT(8));
++    qtest_writel(qts, CH0CONF0, BIT(4) | (1u << 16) | (1u << 8) | BIT(0));  /* wrap, start */
++    qtest_clock_step(qts, 100000);
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & BIT(8), ==, BIT(8));
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & BIT(0), ==, 0);
++
++    /* The driver's last refill puts the end marker in; the channel finishes there */
++    qtest_writel(qts, INT_CLR, BIT(8));
++    for (uint32_t w = 0; w < 48; w++) {
++        qtest_writel(qts, RMT_MEM + 4 * w, 0);
++    }
++    qtest_clock_step(qts, 100000);
++    g_assert_cmphex(qtest_readl(qts, INT_RAW) & BIT(0), ==, BIT(0));
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/rmt/frame", test_frame);
++    qtest_add_func("/esp32s3/rmt/threshold", test_threshold);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index c0d609a..5e372c1 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test', 'esp32s3-wifi-test', 'esp32s3-mmu-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test', 'esp32s3-wifi-test', 'esp32s3-rmt-test', 'esp32s3-mmu-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+

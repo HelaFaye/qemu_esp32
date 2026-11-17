@@ -21,6 +21,8 @@ patched tree, `tests/qtest/`:
 | `esp32s3-brownout-test` | The supply, the brown-out detector, power cuts |
 | `esp32s3-phy-test` | What Wi-Fi start-up polls (calibrations, the MAC's reset), the temperature sensor, ADC conversions; LEDC's registers |
 | `esp32s3-wifi-test` | The Wi-Fi MAC and access point: a beacon received, the receive registers ESP-IDF follows, a reload, a probe answered, nothing off channel |
+| `esp32s3-rmt-test` | The RMT's transmit side: an LED's three bytes sent and read back, the threshold and end interrupts on a wrapping transmission |
+| `esp32s3-mmu-test` | One flash page at two virtual pages: unmapping one leaves the other readable |
 | `esp32s3-lcd-cam-test` | LCD_CAM: an ST7789 on its parallel bus, commands and pixels by GDMA, byte order, the done interrupt; the glass read back exactly |
 
 ```sh
@@ -28,7 +30,7 @@ cd ~/esp-qemu/build
 for t in esp32s3-intmatrix-test esp32s3-gpio-test esp32s3-gpspi-test esp32s3-spi-devices-test \
          esp32s3-i2c-test esp32s3-i2c-devices-test esp32s3-sx1262-test \
          esp32s3-usb-serial-jtag-test esp32s3-brownout-test esp32s3-phy-test \
-         esp32s3-lcd-cam-test esp32s3-wifi-test; do
+         esp32s3-lcd-cam-test esp32s3-wifi-test esp32s3-rmt-test esp32s3-mmu-test; do
   ninja tests/qtest/$t && QTEST_QEMU_BINARY=./qemu-system-xtensa ./tests/qtest/$t
 done
 ```
@@ -50,6 +52,7 @@ peripherals they use. Details and how to run each: [`firmware/`](../firmware/REA
 | [LilyGO T-Deck](https://github.com/Xinyuan-LilyGO/T-Deck) (factory firmware) | T-Deck | The ST7789 under TFT_eSPI and LVGL, the GT911 and keyboard, RadioLib on the SX1262, PSRAM, USB Serial/JTAG, its peripherals' power switch, Wi-Fi start-up; its main loop: keys typed reach it, its radio sends, its screen answers |
 | [LilyGO T-Display-S3](https://github.com/Xinyuan-LilyGO/T-Display-S3) (factory firmware) | T-Display-S3 | LCD_CAM and the GDMA under ESP-IDF's esp_lcd i80 driver, LVGL, octal PSRAM, LEDC, Wi-Fi start-up; its UI on the glass, its KEY button turning its pages |
 | [wifi-start](../firmware/wifi-start) (a minimal ESP-IDF app) | DevKitC | Wi-Fi: start-up (the PHY's calibrations, the MAC's reset), then with an access point a scan, a connection, DHCP and a UDP round trip with the host |
+| [SlimeVR tracker](https://github.com/HelaFaye/SlimeVR-Tracker-ESP) (BOARD_ESP32S3_SUPERMINI, Arduino-ESP32 3.3) | SuperMini | esp_image_verify() over the running app, the RMT behind its RGB LED, LittleFS, Wi-Fi by built-in credentials, DHCP, discovery by UDP broadcast and a session with a stand-in server |
 
 What the test cases have found, so far (each fixed, with a qtest that reproduces it):
 - QEMU's SD model in SPI mode answered CMD9/CMD10 only from the wrong state and CMD13
@@ -66,6 +69,18 @@ What the test cases have found, so far (each fixed, with a qtest that reproduces
 - With frames moving, ESP-IDF 5.4's receive path followed descriptor registers the
   ported MAC left at 0, and panicked; the access point only reached one fixed station
   MAC, and the chip's was 00:00:00:00:00:00 (0019).
+- The SlimeVR tracker found three gaps, each fixed here with a qtest where one can show it:
+  - Every Arduino-ESP32 3.x sketch that sized or hashed itself (`ESP.getSketchSize()`,
+    `getSketchMD5()`, OTA) jumped to 0xdeadbeef. Unmapping esp_image_verify()'s second
+    view of the running app's flash cleared the page both views shared (0021).
+  - Writing an RGB_BUILTIN LED hung `setup()`: the RMT was unimplemented, so its
+    transmissions never ended (0022).
+  - Discovery by broadcast learned 127.0.0.1 as the server: libslirp's reply to a
+    broadcast carries the host's loopback address (0023).
+
+  It also found three bugs in the tracker itself, fixed there: a boot loop from linking
+  the legacy I2C driver beside Arduino 3.x's Wire, a background I2C scan that never
+  worked, and built-in Wi-Fi credentials that were never tried.
 - Encoder edges came faster than firmware polling each tick could follow (0014):
   gbagate's devkit encoder.
 - In gbagate itself, its own QEMU checks found an ST7735 driver sending pixels low byte
