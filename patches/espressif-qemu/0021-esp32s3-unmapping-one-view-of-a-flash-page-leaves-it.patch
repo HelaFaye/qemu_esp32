@@ -1,7 +1,7 @@
 From 9fa55f91376265ca8a1b88bb4dc1da675c741d5e Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 16 Nov 2026 20:13:53 +0000
-Subject: [PATCH 21/26] esp32s3: unmapping one view of a flash page leaves its
+Subject: [PATCH 21/27] esp32s3: unmapping one view of a flash page leaves its
  other views alone
 
 The MMU model holds flash in one buffer by physical address, shared by

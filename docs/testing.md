@@ -57,7 +57,7 @@ peripherals they use. Details and how to run each: [`firmware/`](../firmware/REA
 | [LilyGO T-Deck](https://github.com/Xinyuan-LilyGO/T-Deck) (factory firmware) | T-Deck | The ST7789 under TFT_eSPI and LVGL, the GT911 and keyboard, RadioLib on the SX1262, PSRAM, USB Serial/JTAG, its peripherals' power switch, Wi-Fi start-up; its main loop: keys typed reach it, its radio sends, its screen answers |
 | [LilyGO T-Display-S3](https://github.com/Xinyuan-LilyGO/T-Display-S3) (factory firmware) | T-Display-S3 | LCD_CAM and the GDMA under ESP-IDF's esp_lcd i80 driver, LVGL, octal PSRAM, LEDC, Wi-Fi start-up; its UI on the glass, its KEY button turning its pages |
 | [wifi-start](../firmware/wifi-start) (a minimal ESP-IDF app) | DevKitC | Wi-Fi: start-up (the PHY's calibrations, the MAC's reset), then with an access point a scan, a connection, DHCP and a UDP round trip with the host |
-| [SlimeVR tracker](https://github.com/HelaFaye/SlimeVR-Tracker-ESP) (BOARD_ESP32S3_SUPERMINI, Arduino-ESP32 3.3) | SuperMini | esp_image_verify() over the running app, the RMT behind its RGB LED, LittleFS, Wi-Fi by built-in credentials, DHCP, discovery by UDP broadcast and a session with a stand-in server |
+| [SlimeVR tracker](https://github.com/HelaFaye/SlimeVR-Tracker-ESP) (BOARD_ESP32S3_SUPERMINI, Arduino-ESP32 3.3) | SuperMini | esp_image_verify() over the running app, the RMT behind its RGB LED, LittleFS, Wi-Fi by built-in credentials, DHCP, discovery by UDP broadcast and a session with a stand-in server; two ICM-45686 IMUs: found, calibrated at rest, and turned, each sensor's reported rotation following the IMU's true attitude within 5 degrees |
 
 What the test cases have found, so far (each fixed, with a qtest that reproduces it):
 - QEMU's SD model in SPI mode answered CMD9/CMD10 only from the wrong state and CMD13
@@ -74,7 +74,7 @@ What the test cases have found, so far (each fixed, with a qtest that reproduces
 - With frames moving, ESP-IDF 5.4's receive path followed descriptor registers the
   ported MAC left at 0, and panicked; the access point only reached one fixed station
   MAC, and the chip's was 00:00:00:00:00:00 (0019).
-- The SlimeVR tracker found three gaps, each fixed here with a qtest where one can show it:
+- The SlimeVR tracker found four gaps, each fixed here with a qtest where one can show it:
   - Every Arduino-ESP32 3.x sketch that sized or hashed itself (`ESP.getSketchSize()`,
     `getSketchMD5()`, OTA) jumped to 0xdeadbeef. Unmapping esp_image_verify()'s second
     view of the running app's flash cleared the page both views shared (0021).
@@ -82,6 +82,10 @@ What the test cases have found, so far (each fixed, with a qtest that reproduces
     transmissions never ended (0022).
   - Discovery by broadcast learned 127.0.0.1 as the server: libslirp's reply to a
     broadcast carries the host's loopback address (0023).
+  - With IMUs, it gave both up at once: the ICM-45686 model's FIFO started filling at the
+    first read, not at power-up, so that read found nothing after the sensor timeout had
+    passed. Then turns came out 16 times too fast: the model applied the 20-bit values'
+    sensitivities to their top 16 bits (0027).
 
   It also found three bugs in the tracker itself, fixed there: a boot loop from linking
   the legacy I2C driver beside Arduino 3.x's Wire, a background I2C scan that never

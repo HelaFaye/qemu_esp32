@@ -1,7 +1,7 @@
 From 5899081a48c60df8d50eb7fc16a743693c671497 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Sun, 15 Nov 2026 09:35:23 +0000
-Subject: [PATCH 17/26] esp32s3: LCD_CAM's LCD side (8080/i80 parallel
+Subject: [PATCH 17/27] esp32s3: LCD_CAM's LCD side (8080/i80 parallel
  displays)
 
 LCD_CAM in i80 mode, as ESP-IDF's esp_lcd i80 driver uses it: a transaction

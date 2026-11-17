@@ -1,0 +1,175 @@
+From 128c8f7c54b20a0b71bf487cd76a1124097749e8 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Tue, 17 Nov 2026 22:17:44 +0000
+Subject: [PATCH 27/27] icm45686: 20-bit scale, a FIFO that fills from
+ power-up, attitude to check against
+
+SlimeVR's tracker, with two of these on its SuperMini, showed two bugs:
+- The sensitivities (16384 LSB/g, 131.072 LSB/dps) are the 20-bit values'.
+  The model applied them to the top 16 bits, so it sent 16 times the
+  motion: a turn at 45 degrees a second read as 720.
+- The frames' clock started at the first FIFO read, not at power-up.
+  SlimeVR's first read came about 1 s after it enabled the FIFO and found
+  it empty. Its sensor timeout (2 s, counted from 0) had already passed, so
+  it gave up on both IMUs.
+The qtest no longer starts the clock with an early read. It checks the
+values at full 20 bits, as the driver assembles them.
+
+New read-only properties: attitude-w/x/y/z, the model's attitude in
+millionths, to check a fusion's output against; and fifo-frames.
+---
+ hw/misc/icm45686.c                     | 36 +++++++++++++++++++++++---
+ tests/qtest/esp32s3-i2c-devices-test.c | 25 +++++++++++++-----
+ 2 files changed, 50 insertions(+), 11 deletions(-)
+
+diff --git a/hw/misc/icm45686.c b/hw/misc/icm45686.c
+index cfd6c88..68fe9c5 100644
+--- a/hw/misc/icm45686.c
++++ b/hw/misc/icm45686.c
+@@ -18,7 +18,10 @@
+  * The motion is set at run time: gyro-x, gyro-y, gyro-z (the body's rotation rate, in
+  * millidegrees a second); the attitude is integrated from it, and the accelerometer reads
+  * gravity's reaction (+1 g up) in the body's frame: flat and still, (0, 0, +1 g).
+- * temperature-mc: millidegrees C (25000).
++ * temperature-mc: millidegrees C (25000). Read-only: attitude-w, -x, -y, -z (the attitude,
++ * body to world, in millionths), to check what a fusion reports against; fifo-frames.
++ * Frames come from power-up, as on the chip: the FIFO fills from when it's enabled,
++ * whether or not it's read.
+  *
+  *   -device icm45686,bus=i2c0,address=0x68,id=imu
+  *   qom-set /machine/peripheral/imu gyro-z 90000          (90 degrees a second)
+@@ -62,8 +65,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ICM45686State, ICM45686)
+ #define IREG_I2CM_STATUS    0xA218
+ #define I2CM_DONE           0x02
+ 
+-#define ACCEL_LSB_PER_G     (16384.0 * 16)          /* 20 bits */
+-#define GYRO_LSB_PER_DPS    (131.072 * 16)
++#define ACCEL_LSB_PER_G     16384.0                 /* At 20 bits: +-32 g */
++#define GYRO_LSB_PER_DPS    131.072                 /* At 20 bits: +-4000 dps */
+ 
+ struct ICM45686State {
+     I2CSlave parent_obj;
+@@ -247,6 +250,7 @@ static uint8_t read_byte(ICM45686State *s, uint8_t a)
+ 
+ static void write_byte(ICM45686State *s, uint8_t a, uint8_t b)
+ {
++    catch_up(s);                                     /* Frames so far, as configured so far */
+     switch (a) {
+     case REG_DEVICE_CONFIG:
+         if ((b & 0x03) == 0x03) {
+@@ -312,7 +316,8 @@ static void icm_reset(DeviceState *dev)
+     ICM45686State *s = ICM45686(dev);
+     soft_reset(s);
+     s->ptr = 0;
+-    s->next_frame_ns = 0;
++    /* Its clock runs from power-up: a FIFO fills from when it's enabled, read or not */
++    s->next_frame_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + FRAME_NS;
+     s->frame_count = 0;
+     s->q[0] = 1;
+     s->q[1] = s->q[2] = s->q[3] = 0;
+@@ -333,6 +338,24 @@ static void set_i32(Object *obj, Visitor *v, const char *name, void *opaque, Err
+     }
+ }
+ 
++/* The attitude, a quaternion's component (w, x, y, z), in millionths: read-only */
++static void get_attitude(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
++{
++    ICM45686State *s = ICM45686(obj);
++    catch_up(s);
++    int32_t value = (int32_t)lround(s->q[(intptr_t)opaque] * 1e6);
++    visit_type_int32(v, name, &value, errp);
++}
++
++/* Frames waiting in the FIFO: read-only */
++static void get_fifo_frames(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
++{
++    ICM45686State *s = ICM45686(obj);
++    catch_up(s);
++    uint32_t value = s->fifo_frames;
++    visit_type_uint32(v, name, &value, errp);
++}
++
+ static void icm_init(Object *obj)
+ {
+     ICM45686State *s = ICM45686(obj);
+@@ -342,6 +365,11 @@ static void icm_init(Object *obj)
+     }
+     s->temperature_mc = 25000;
+     object_property_add(obj, "temperature-mc", "int32", get_i32, set_i32, NULL, &s->temperature_mc);
++    static const char *const att[4] = { "attitude-w", "attitude-x", "attitude-y", "attitude-z" };
++    for (intptr_t i = 0; i < 4; i++) {
++        object_property_add(obj, att[i], "int32", get_attitude, NULL, NULL, (void *)i);
++    }
++    object_property_add(obj, "fifo-frames", "uint32", get_fifo_frames, NULL, NULL, NULL);
+ }
+ 
+ static void icm_class_init(ObjectClass *klass, void *data)
+diff --git a/tests/qtest/esp32s3-i2c-devices-test.c b/tests/qtest/esp32s3-i2c-devices-test.c
+index 258f304..b51ddb7 100644
+--- a/tests/qtest/esp32s3-i2c-devices-test.c
++++ b/tests/qtest/esp32s3-i2c-devices-test.c
+@@ -383,6 +383,15 @@ static int16_t le16(const uint8_t *p)
+     return (int16_t)(p[0] | p[1] << 8);
+ }
+ 
++/* A 20-bit value as SlimeVR's driver assembles it: the top 16 bits, then the nibble in
++ * byte 17 + axis (accel high, gyro low) */
++static int32_t hires(const uint8_t f[20], int axis, bool accel)
++{
++    int32_t top = le16(f + (accel ? 1 : 7) + 2 * axis);
++    uint8_t nib = f[17 + axis];
++    return top * 16 | (accel ? nib >> 4 : nib & 0xF);
++}
++
+ static unsigned imu_count(QTestState *qts)
+ {
+     uint8_t r[2];
+@@ -425,19 +434,21 @@ static void test_imu(void)
+     g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x1B }, 1, r, 1));
+     g_assert_cmphex(r[0], ==, 0x09);
+ 
+-    /* 204.8 frames a second: about 20 in 100 ms */
+-    imu_count(qts);
++    /* 204.8 frames a second: about 20 in 100 ms, from when the FIFO was enabled, not
++     * from the first read of its count (SlimeVR's first read comes ~1 s later and
++     * expects frames waiting: with none it gives the sensor up) */
+     qtest_clock_step(qts, 100 * 1000 * 1000);
+     unsigned n = imu_count(qts);
+     g_assert_cmpuint(n, >=, 18);
+     g_assert_cmpuint(n, <=, 23);
+ 
+-    /* Flat and still: +1 g on Z (16384 LSB/g in the top 16 of 20 bits), no rotation */
++    /* Flat and still: +1 g on Z (16384 LSB/g at 20 bits: 1024 in the top 16), no rotation */
+     imu_accel_frame(qts, r);
+     g_assert_cmphex(r[0] & 0x60, ==, 0x60);
+     g_assert_cmpint(le16(r + 1), ==, 0);
+     g_assert_cmpint(le16(r + 3), ==, 0);
+-    g_assert_cmpint(le16(r + 5), ==, 16384);
++    g_assert_cmpint(le16(r + 5), ==, 1024);
++    g_assert_cmpint(hires(r, 2, true), ==, 16384);
+     g_assert_cmpint(le16(r + 11), ==, 0);
+     g_assert_cmpint(le16(r + 13), ==, 0);                                       /* 25 C */
+ 
+@@ -446,7 +457,7 @@ static void test_imu(void)
+     imu_flush(qts);
+     qtest_clock_step(qts, 20 * 1000 * 1000);
+     imu_frame(qts, r);
+-    g_assert_cmpint(abs(le16(r + 11) - 11796), <=, 1);
++    g_assert_cmpint(abs(hires(r, 2, false) - 11796), <=, 1);  /* 131.072 LSB/dps at 20 bits */
+ 
+     /* 90 degrees about X, over a second: gravity moves from Z to Y */
+     qom_set(qts, "/machine/peripheral/imu", "gyro-z", "0");
+@@ -456,8 +467,8 @@ static void test_imu(void)
+     imu_flush(qts);
+     qtest_clock_step(qts, 20 * 1000 * 1000);
+     imu_accel_frame(qts, r);
+-    g_assert_cmpint(abs(le16(r + 3)), >=, 16384 - 200);
+-    g_assert_cmpint(abs(le16(r + 5)), <=, 200);
++    g_assert_cmpint(abs(hires(r, 1, true)), >=, 16384 - 200);
++    g_assert_cmpint(abs(hires(r, 2, true)), <=, 200);
+ 
+     /* Indirect registers keep what's written; the aux I2C master reports done */
+     g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x7C, 0xA2, 0x06, 0x5A }, 4, NULL, 0));
+-- 
+2.43.0
+

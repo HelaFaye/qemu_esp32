@@ -1,7 +1,7 @@
 From 304df52471900e979f423eed3afcb892147c865b Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 16 Nov 2026 20:19:00 +0000
-Subject: [PATCH 20/26] esp32s3 Wi-Fi: bound every guest- and
+Subject: [PATCH 20/27] esp32s3 Wi-Fi: bound every guest- and
  network-controlled length
 
 Patch 0019's MAC and access point copied lengths from the guest and the

@@ -1,7 +1,7 @@
 From c9c313bab38731ec2a9c5b5929b9df4e100e8414 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Tue, 17 Nov 2026 07:11:50 +0000
-Subject: [PATCH 26/26] esp32s3-wifi-test: a data frame too short for its
+Subject: [PATCH 26/27] esp32s3-wifi-test: a data frame too short for its
  LLC/SNAP header and FCS
 
 Associated, a 30-byte data frame: the AP's Ethernet rebuild took its payload

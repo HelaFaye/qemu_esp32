@@ -53,11 +53,18 @@ def esp32s3_devkitc(**_):
     return "esp32s3", []
 
 
-def esp32s3_supermini(**_):
+def esp32s3_supermini(imus=0, **_):
     """An ESP32-S3 SuperMini on its own (ESP32-S3FH4R2): 4 MB flash, 2 MB quad PSRAM. Its
     WS2812 LED (GPIO48, Arduino's RGB_BUILTIN) is sent through the RMT, whose frames the
-    RMT keeps (/machine/soc/rmt: last-frame, frames)."""
-    return "esp32s3", ["-m", "2M"]
+    RMT keeps (/machine/soc/rmt: last-frame, frames).
+
+    imus: how many ICM-45686 IMUs on its I2C (SDA 7, SCL 6), as SlimeVR's SuperMini
+    tracker has them: the first at 0x68 (id imu0), the second at 0x69 (imu1). Their
+    motion is set at run time (gyro-x/-y/-z in mdps, temperature-mc)."""
+    args = ["-m", "2M"]
+    for i in range(imus):
+        args += ["-device", "icm45686,bus=i2c0,address=0x%x,id=imu%d" % (0x68 + i, i)]
+    return "esp32s3", args
 
 
 def power_domain(name, *devices, pin=None):

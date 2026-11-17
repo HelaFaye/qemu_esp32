@@ -33,6 +33,7 @@ in `BASE`; `build.sh [dir]` fetches it, applies them and builds `qemu-system-xte
 | 0024 | `icm45686`: TDK's 6-axis IMU on I2C (0x68/0x69), as SlimeVR's driver uses it: its FIFO at 204.8 Hz in the 20-bit format (accel at 102.4 Hz), +-32 g and +-4000 dps; the motion set at run time (`gyro-x`/`-y`/`-z` in mdps; the attitude integrates and gravity follows it; `temperature-mc`); the indirect registers, and its aux I2C master reporting done with no magnetometer |
 | 0025 | USB Serial/JTAG: SERIAL_IN_EMPTY is the IN FIFO's state, raised while it's empty, not only once on a flush (Arduino's USB CDC waited on it for its next write) |
 | 0026 | Wi-Fi (0020): a qtest of a data frame too short for its LLC/SNAP header and FCS, whose Ethernet payload (frame_length - 36) wrapped: against 0019 alone it kills QEMU |
+| 0027 | `icm45686` (0024): the sensitivities are the 20-bit values' (it sent 16 times the motion), and its FIFO fills from power-up, not from the first read (SlimeVR's first read found nothing and gave the IMU up). Read-only `attitude-w`/`-x`/`-y`/`-z` (millionths) and `fifo-frames`, to check a fusion against |
 
 ## Wiring a board
 

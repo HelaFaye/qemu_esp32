@@ -1,7 +1,7 @@
 From 8273f54e7aa60d907ee60b5cd491b6c18b605029 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Tue, 17 Nov 2026 02:21:18 +0000
-Subject: [PATCH 25/26] usb-serial-jtag: SERIAL_IN_EMPTY is the IN FIFO's state
+Subject: [PATCH 25/27] usb-serial-jtag: SERIAL_IN_EMPTY is the IN FIFO's state
 
 On the chip, SERIAL_IN_EMPTY is set while the IN FIFO is empty: from reset,
 and again at once if cleared while it's still empty. The model set it only
