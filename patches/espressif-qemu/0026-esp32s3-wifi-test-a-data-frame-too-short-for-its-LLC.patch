@@ -1,0 +1,71 @@
+From c9c313bab38731ec2a9c5b5929b9df4e100e8414 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Tue, 17 Nov 2026 07:11:50 +0000
+Subject: [PATCH 26/26] esp32s3-wifi-test: a data frame too short for its
+ LLC/SNAP header and FCS
+
+Associated, a 30-byte data frame: the AP's Ethernet rebuild took its payload
+as frame_length - 36, which wrapped. Against patch 0019's model alone the
+test kills QEMU (the stack protector); with the bounds it passes.
+---
+ tests/qtest/esp32s3-wifi-test.c | 38 +++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/tests/qtest/esp32s3-wifi-test.c b/tests/qtest/esp32s3-wifi-test.c
+index 5ad1950..7efd00d 100644
+--- a/tests/qtest/esp32s3-wifi-test.c
++++ b/tests/qtest/esp32s3-wifi-test.c
+@@ -264,6 +264,43 @@ static void test_rx_small_buffer(void)
+     qtest_quit(qts);
+ }
+ 
++/* A management frame's header, from the station: its frame control, to da, of bssid */
++static size_t mgmt(uint8_t *f, uint8_t fc, const uint8_t *da, const uint8_t *bssid)
++{
++    memset(f, 0, 64);
++    f[0] = fc;
++    memcpy(f + 4, da, 6);
++    memcpy(f + 10, sta, 6);
++    memcpy(f + 16, bssid, 6);
++    return 24;
++}
++
++/*
++ * Associated, a data frame of 30 bytes: too short to hold its LLC/SNAP header
++ * and FCS (36). Its Ethernet payload, frame_length - 36, wrapped (unsigned) and
++ * was copied out at the stack frame's size. Dropped; the AP still answers.
++ */
++static void test_short_data(void)
++{
++    QTestState *qts = radio_on_channel_4();
++    rx_desc(qts, DESC0, BUF0, DESC1);
++    rx_desc(qts, DESC1, BUF1, 0);
++    qtest_writel(qts, RX_BASE, DESC0);
++    static const uint8_t ap[6] = { 0x10, 0x01, 0x00, 0xc4, 0x0a, 0x51 };    /* Open Wifi */
++    uint8_t f[64];
++    size_t n = mgmt(f, 0xB0, ap, ap);               /* Authentication, open system */
++    f[n + 2] = 1;
++    tx(qts, f, n + 6, n + 6);
++    n = mgmt(f, 0x00, ap, ap);                      /* Association request */
++    tx(qts, f, n + 4, n + 4);
++    mgmt(f, 0x08, ap, bcast);                       /* Data, to the DS */
++    f[1] = 0x01;
++    tx(qts, f, 30, 30);
++    qtest_clock_step(qts, 20 * 1000 * 1000);        /* Still running, still answering */
++    g_assert_cmphex(qtest_readl(qts, DESC0) & BIT(30), ==, BIT(30));
++    qtest_quit(qts);
++}
++
+ int main(int argc, char **argv)
+ {
+     g_test_init(&argc, &argv, NULL);
+@@ -274,5 +311,6 @@ int main(int argc, char **argv)
+     qtest_add_func("/esp32s3/wifi/tx-short", test_tx_short);
+     qtest_add_func("/esp32s3/wifi/ssid-overlong", test_ssid_overlong);
+     qtest_add_func("/esp32s3/wifi/rx-small-buffer", test_rx_small_buffer);
++    qtest_add_func("/esp32s3/wifi/short-data", test_short_data);
+     return g_test_run();
+ }
+-- 
+2.43.0
+

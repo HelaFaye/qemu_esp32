@@ -90,11 +90,14 @@ node.qmp("qom-set", path="/machine/peripheral/ball_click", property="pressed", v
 
 ## The Python API (`firmware/boards.py`)
 
-`boot(board, flash, workdir, name="node", hci=None, wifi=None, extra=(), **opts)` starts QEMU and
+`boot(board, flash, workdir, name="node", hci=None, wifi=None, no_reboot=False, extra=(), **opts)` starts QEMU and
 returns a `Node`. `board` is a name from `BOARDS` or `"kicad:<design>"`; `opts` go to the
 board (`card=`, `sd=`, `air=`); `uart1=`/`uart2=` put those UARTs on TCP ports, `hci=`
 connects UART1 to a Bluetooth controller; `wifi=True` gives the S3 an access point (below);
-`extra` adds QEMU arguments (`["-gdb", "tcp::1234"]`).
+`no_reboot=True` makes a reset (a panic, the watchdog, `esp_restart()`) end QEMU, so a
+test sees it at once instead of a second boot; `extra` adds QEMU arguments
+(`["-gdb", "tcp::1234"]`). gbagate's boards take `pins=`: its board.h, read with
+`gbagate_pins(src, board)`, which runs the C preprocessor over it.
 Each node gets its own copy of the flash, so its NVS is its own.
 
 | `Node` | |
@@ -102,7 +105,7 @@ Each node gets its own copy of the flash, so its NVS is its own.
 | `log()`, `wait_for(regex, timeout, after=)`, `count(regex)` | Serial output (UART0 and USB); `after=count(...)` waits for the next match |
 | `uart(n)` | A socket on UART n, given `boot(..., uartN=port)` |
 | `qemu_output()` | What QEMU itself printed (why it didn't start) |
-| `qmp(command, **args)` | Any QMP command; its result |
+| `qmp(command, **args)` | Any QMP command; its result. One connection, kept open (reopened once if QEMU dropped it) |
 | `screendump(path, device)` | A display's picture |
 | `set_vdd(mv)`, `brownout(mv, s)`, `power_cut(s)` | The chip's supply ([stress testing](stress-testing.md)) |
 | `part_power(domain, on)` | Parts on their own supply |

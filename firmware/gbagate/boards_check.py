@@ -24,7 +24,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
-from boards import boot  # noqa: E402
+from boards import boot, gbagate_pins, GBAGATE_PINS  # noqa: E402
 
 IMAGE = {"devkit": "gate", "supermini": "mini", "carrier-touch": "gate"}
 FATAL = re.compile(r"Guru Meditation|abort\(\)|Backtrace:|Task watchdog")
@@ -92,17 +92,47 @@ def step(node, knob, detents, out):
     return True
 
 
-# The touch keys (gbagate's src/touch_pad.h): two 40-pixel strips of five 48-pixel keys
-# either side of the 240x240 UI, on the 320x240 panel; the XPT2046's raw plates run
-# 200..3900 across it (its default calibration, as gbagate's qemu/accurate_boot.py has it).
-LEFT_KEYS = ["LEFT", "L", "UP", "DOWN", "R"]
+# The touch keys: two strips of keys either side of the UI square on the 320x240 panel,
+# as gbagate's src/touch_pad.h lays them out and src/touch_pad.c orders them; the
+# XPT2046's raw plates run 200..3900 across it (tp_cal_default). Read from the checkout
+# when there is one (touch_layout()), else these, which they were at COMMIT.
+TOUCH = dict(panel_w=320, panel_h=240, strip_w=40, right_x=280, key_h=48, raw_min=200, raw_max=3900,
+             left=["LEFT", "L", "UP", "DOWN", "R"], right=["RIGHT", "A", "B", "SELECT", "START"])
 
 
-def touch_key(node, name, hold=0.15):
-    x, y = 20, LEFT_KEYS.index(name) * 48 + 24
+def touch_layout(src):
+    """The layout from a gbagate checkout: touch_pad.h's TP_ constants (through the C
+    preprocessor) and touch_pad.c's key table; TOUCH's if either can't be read."""
+    try:
+        consts = ["TP_PANEL_W", "TP_PANEL_H", "TP_STRIP_W", "TP_RIGHT_X", "TP_KEY_H"]
+        text = '#include "touch_pad.h"\n' + "".join("v %s %s\n" % (c.lower(), c) for c in consts)
+        out = subprocess.run(["cc", "-E", "-P", "-I", os.path.join(src, "src"), "-x", "c", "-"],
+                             input=text, capture_output=True, text=True, check=True).stdout
+        v = {f[1].upper(): int(eval(f[2], {}, {})) for f in (l.split(None, 2) for l in out.splitlines())
+             if len(f) == 3 and f[0] == "v"}
+        table = open(os.path.join(src, "src", "touch_pad.c")).read()
+        sides = re.findall(r"\[TP_(LEFT|RIGHT)\]\s*=\s*\{(.*?)\}\s*,\s*(?=\[TP_|\})", table, re.S)
+        keys = {side: re.findall(r"\{\s*BTN_(\w+)", body) for side, body in sides}
+        cal = re.search(r"x_min\s*=\s*(\d+);.*?x_max\s*=\s*(\d+);", table, re.S)
+        return dict(panel_w=v["TP_PANEL_W"], panel_h=v["TP_PANEL_H"], strip_w=v["TP_STRIP_W"],
+                    right_x=v["TP_RIGHT_X"], key_h=v["TP_KEY_H"],
+                    raw_min=int(cal.group(1)) if cal else TOUCH["raw_min"],
+                    raw_max=int(cal.group(2)) if cal else TOUCH["raw_max"],
+                    left=keys["LEFT"], right=keys["RIGHT"])
+    except Exception as e:                      # An older or reorganized checkout
+        print("  note the touch layout from the checkout: %s; using the built-in one" % e)
+        return dict(TOUCH)
+
+
+def touch_key(node, name, hold=0.15, layout=TOUCH):
+    t = layout
+    side = "left" if name in t["left"] else "right"
+    x = (t["strip_w"] // 2) if side == "left" else t["right_x"] + t["strip_w"] // 2
+    y = t[side].index(name) * t["key_h"] + t["key_h"] // 2
+    span = t["raw_max"] - t["raw_min"]
     p = "/machine/peripheral/touch"
-    node.qmp("qom-set", path=p, property="x", value=200 + 3700 * x // 319)
-    node.qmp("qom-set", path=p, property="y", value=200 + 3700 * y // 239)
+    node.qmp("qom-set", path=p, property="x", value=t["raw_min"] + span * x // (t["panel_w"] - 1))
+    node.qmp("qom-set", path=p, property="y", value=t["raw_min"] + span * y // (t["panel_h"] - 1))
     node.qmp("qom-set", path=p, property="pressed", value=True)
     time.sleep(hold)
     node.qmp("qom-set", path=p, property="pressed", value=False)
@@ -128,7 +158,17 @@ def run(board, outdir):
         check("an image to boot", False, image)
         return
     card = make_card(os.path.join(work, "sd.img"), os.path.join(outdir, "src", "rom", "tester.gba"))
-    node = boot("gbagate-" + board, image, work, name="gbagate", card=card)
+    src = os.path.join(outdir, "src")
+    pins, layout = None, TOUCH
+    if os.path.exists(os.path.join(src, "port", "esp32s3", "board.h")):
+        pins = gbagate_pins(src, board)            # board.h's, as built: no copy to drift
+        moved = {k: (v, pins.get(k)) for k, v in GBAGATE_PINS[board].items() if pins.get(k) != v}
+        if moved:
+            print("  note board.h moved %s (boards.py had them as the first); using board.h's" %
+                  ", ".join("%s %s->%s" % (k, a, b) for k, (a, b) in moved.items()))
+        layout = touch_layout(src)
+    p = dict(GBAGATE_PINS[board], **(pins or {}))
+    node = boot("gbagate-" + board, image, work, name="gbagate", card=card, pins=pins)
     try:
         up = node.wait_for(r"tasks started for the %s image" % IMAGE[board], 60)
         check("every task starts", up is not None)
@@ -138,7 +178,8 @@ def run(board, outdir):
         w, h, rgb = screen(node, os.path.join(work, "boot.ppm"))
         check("a %dx%d picture" % (w, h), len(set(rgb[i:i + 3] for i in range(0, len(rgb), 3))) > 3)
         if board == "devkit":
-            check("its encoder comes up on 15/16, switch 35", "encoder on A=15 B=16 SW=35" in log,
+            enc = "encoder on A=%d B=%d SW=%d" % (p["ENC_A"], p["ENC_B"], p["ENC_SW"])
+            check("its encoder comes up (%s)" % enc[11:], enc in log,
                   (re.findall(r"buttons: .*", log) or ["no buttons line"])[0])
             check("a turn of the encoder changes the screen", changes_screen(node, "knob", work, "turn", turn))
             # The menu: Link ... GBA Memory, Settings, Diagnostics, wrapping; a detent
@@ -165,10 +206,11 @@ def run(board, outdir):
             check('a press of "down" on the expander changes the screen',
                   changes_screen(node, "btn_down", work, "down"))
         elif board == "carrier-touch":
-            check("it finds its XPT2046 on CS 16, IRQ 17", "XPT2046 on CS=16 IRQ=17" in log,
+            xpt = "XPT2046 on CS=%d IRQ=%d" % (p["TOUCH_CS"], p["TOUCH_IRQ"])
+            check("it finds its %s" % xpt, xpt in log,
                   (re.findall(r"touch.*", log) or ["no touch line"])[0])
             check("a touch on DOWN moves the menu",
-                  changes_screen(node, "DOWN", work, "touch", lambda n, k: touch_key(n, k)))
+                  changes_screen(node, "DOWN", work, "touch", lambda n, k: touch_key(n, k, layout=layout)))
         log = node.log()
         bad = FATAL.search(log)
         check("no panic, abort or watchdog", bad is None, bad.group(0) if bad else "")

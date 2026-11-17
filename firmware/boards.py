@@ -122,6 +122,53 @@ def t_deck(air=None, sd=None, **_):
 # link partner (a GBA), infrared. Its keys, as ui_input.h numbers them:
 GBAGATE_KEYS = ["up", "down", "left", "right", "a", "b", "select", "l", "r", "start"]
 
+# Each board's pins, as board.h has them (its PIN_ names without PIN_). A test with a
+# gbagate checkout passes gbagate_pins()'s instead (pins=), so a pin board.h moves
+# moves here too; these are what it had at COMMIT.
+GBAGATE_PINS = {
+    "devkit": dict(LCD_CS=14, LCD_DC=21, SD_CS=10, ENC_A=15, ENC_B=16, ENC_SW=35,
+                   BTN_UP=15, BTN_DOWN=16, BTN_LEFT=17, BTN_RIGHT=18, BTN_A=35, BTN_B=36,
+                   BTN_SELECT=37, BTN_START=38, BTN_L=39, BTN_R=40),
+    "supermini": dict(LCD_CS=10, LCD_DC=48, SD_CS=3),
+    "carrier-touch": dict(LCD_CS=10, LCD_DC=9, LCD_BL=21, SD_CS=15, EXP_INT=36,
+                          TOUCH_CS=16, TOUCH_IRQ=17),
+    "carrier-knob": dict(LCD_CS=10, LCD_DC=9, LCD_BL=21, SD_CS=15, EXP_INT=36,
+                         ENC_A=16, ENC_B=17, ENC_SW=33, BTN_A=34, BTN_B=35),
+}
+GBAGATE_MACROS = {"devkit": "BOARD_DEVKIT", "supermini": "BOARD_SUPERMINI",
+                  "carrier-touch": "BOARD_CARRIER_TOUCH", "carrier-knob": "BOARD_CARRIER_KNOB"}
+
+
+def gbagate_pins(src, board):
+    """board's pins from a gbagate checkout's port/esp32s3/board.h, through the C
+    preprocessor (as gbagate's own qemu/accurate_boot.py reads them): every PIN_ name it
+    defines for the board, without the PIN_; a pin the board doesn't have (-1) left out."""
+    import re
+    import subprocess
+    inc = os.path.join(src, "port", "esp32s3")
+    names = sorted(set(re.findall(r"#define\s+PIN_([A-Z0-9_]+)", open(os.path.join(inc, "board.h")).read())))
+    text = "#define %s 1\n#include \"board.h\"\n" % GBAGATE_MACROS[board]
+    text += "".join("#ifdef PIN_%s\npin %s PIN_%s\n#endif\n" % (n, n, n) for n in names)
+    out = subprocess.run(["cc", "-E", "-P", "-I", inc, "-x", "c", "-"], input=text,
+                         capture_output=True, text=True, check=True).stdout
+    pins = {}
+    for line in out.splitlines():
+        f = line.split(None, 2)
+        if len(f) == 3 and f[0] == "pin":
+            try:
+                v = int(eval(f[2], {}, {}))     # The preprocessor's arithmetic, e.g. (-1)
+            except Exception:
+                continue
+            if v >= 0:
+                pins[f[1]] = v
+    return pins
+
+
+def _pins(board, pins):
+    p = dict(GBAGATE_PINS[board])
+    p.update(pins or {})
+    return p
+
 
 def _gbagate_st7735(cs, dc):
     """The 1.44" 128x128 ST7735 module (BGR, its glass at 2,3)."""
@@ -142,46 +189,49 @@ def encoder(name, a, b):
     return ["-device", "gpio-button,encoder=on,pin=%d,pin-b=%d,id=%s" % (a, b, name)]
 
 
-def gbagate_devkit(card=None, input="encoder", **_):
+def gbagate_devkit(card=None, input="encoder", pins=None, **_):
     """gbagate on a 44-pin ESP32-S3 DevKitC: the ST7735 (CS 14, D/C 21), a micro SD
     (CS 10), and its input: an encoder on 15/16 ("knob") with its switch on 35 (btn_a),
     gbagate's default (settings.c), plus the other switches; or input="buttons", all ten
     switches to ground on their own pins (up 15, down 16, left 17, right 18, A 35, B 36,
-    select 37, start 38, L 39, R 40), ids btn_<key>."""
-    args = ["-m", "8M"] + _gbagate_st7735(14, 21) + _sd(10, card, n=1)       # 16 MB flash, 8 MB PSRAM
-    pins = dict(up=15, down=16, left=17, right=18, a=35, b=36, select=37, start=38, l=39, r=40)
+    select 37, start 38, L 39, R 40), ids btn_<key>. pins: board.h's (gbagate_pins())."""
+    p = _pins("devkit", pins)
+    args = ["-m", "8M"] + _gbagate_st7735(p["LCD_CS"], p["LCD_DC"]) + _sd(p["SD_CS"], card, n=1)
+    keys = {k: p["BTN_" + k.upper()] for k in GBAGATE_KEYS}                   # 16 MB flash, 8 MB PSRAM
     if input == "encoder":
-        args += encoder("knob", 15, 16)
-        pins = {k: v for k, v in pins.items() if k not in ("up", "down")}
-    for key, pin in pins.items():
+        args += encoder("knob", p["ENC_A"], p["ENC_B"])
+        keys = {k: v for k, v in keys.items() if v not in (p["ENC_A"], p["ENC_B"])}
+    for key, pin in keys.items():
         args += button("btn_" + key, pin)
     return "esp32s3", args
 
 
-def gbagate_supermini(card=None, **_):
+def gbagate_supermini(card=None, pins=None, **_):
     """gbagate on an ESP32-S3 Supermini (14 usable pins): the ST7735 (CS 10, D/C 48), a
     micro SD (CS 3), and its switches on an MCP23017 at 0x21 on I2C0 (SDA 1, SCL 2), one
     per input in ui_input.h's order (GPA0 up ... GPB1 start), polled: ids btn_<key>."""
-    args = ["-m", "2M"] + _gbagate_st7735(10, 48) + _sd(3, card, n=1)        # 4 MB flash, 2 MB PSRAM
-    args += ["-device", "mcp23017,bus=i2c0,address=0x21,id=buttons"]
+    p = _pins("supermini", pins)
+    args = ["-m", "2M"] + _gbagate_st7735(p["LCD_CS"], p["LCD_DC"]) + _sd(p["SD_CS"], card, n=1)
+    args += ["-device", "mcp23017,bus=i2c0,address=0x21,id=buttons"]          # 4 MB flash, 2 MB PSRAM
     for n, key in enumerate(GBAGATE_KEYS):
         args += ["-device", "gpio-button,dev=buttons,line=in,n=%d,id=btn_%s" % (n, key)]
     return "esp32s3", args
 
 
-def _gbagate_carrier(card):
+def _gbagate_carrier(card, p):
     """What both carriers have (doc/CARRIER.md): an ILI9341 320x240 (CS 10, D/C 9,
     backlight 21; its reset on 18 is a pin the model doesn't have), a micro SD (CS 15),
     and the Battle Chip board's two MCP23017s on I2C0 (SDA 1, SCL 2) with their
     interrupts on GPIO36, shared (open drain)."""
     args = ["-m", "2M"]                                                       # On a Supermini: 2 MB PSRAM
     args += ["-device", "ili9341,bus=spi2,id=lcd"]
-    args += link(10, "lcd", "ssi-gpio-cs", pull="up") + link(9, "lcd", "dc") + link(21, "lcd", "backlight")
-    args += _sd(15, card)
+    args += link(p["LCD_CS"], "lcd", "ssi-gpio-cs", pull="up") + link(p["LCD_DC"], "lcd", "dc") + \
+        link(p["LCD_BL"], "lcd", "backlight")
+    args += _sd(p["SD_CS"], card)
     args += ["-device", "mcp23017,bus=i2c0,address=0x20,id=exp0",
              "-device", "mcp23017,bus=i2c0,address=0x21,id=exp1"]
-    args += link(36, "exp0", "inta", out=True, open_drain=True, pull="up")
-    args += link(36, "exp1", "inta", out=True, open_drain=True, pull="up")
+    args += link(p["EXP_INT"], "exp0", "inta", out=True, open_drain=True, pull="up")
+    args += link(p["EXP_INT"], "exp1", "inta", out=True, open_drain=True, pull="up")
     return args
 
 
@@ -199,23 +249,26 @@ def t_display_s3(**_):
     return "esp32s3", args
 
 
-def gbagate_carrier_touch(card=None, **_):
+def gbagate_carrier_touch(card=None, pins=None, **_):
     """gbagate's touch carrier: the carrier (above), and an XPT2046 on the panel (CS 16,
     PENIRQ 17). Its own check, which also presses the touch and reads the glass, is
     firmware/gbagate/check.sh."""
-    args = _gbagate_carrier(card)
+    p = _pins("carrier-touch", pins)
+    args = _gbagate_carrier(card, p)
     args += ["-device", "xpt2046,bus=spi2,cs=1,id=touch"]
-    args += link(16, "touch", "ssi-gpio-cs", pull="up")
-    args += link(17, "touch", "penirq", out=True, open_drain=True, pull="up")
+    args += link(p["TOUCH_CS"], "touch", "ssi-gpio-cs", pull="up")
+    args += link(p["TOUCH_IRQ"], "touch", "penirq", out=True, open_drain=True, pull="up")
     return "esp32s3", args
 
 
-def gbagate_carrier_knob(card=None, **_):
+def gbagate_carrier_knob(card=None, pins=None, **_):
     """gbagate's knob carrier: the carrier (above), and the panel module's encoder (16,
     17) with its switch (33) and two keys (A 34, B 35). gbagate doesn't build it yet (its
     keys have no switch map)."""
-    args = _gbagate_carrier(card)
-    args += encoder("knob", 16, 17) + button("btn_enc", 33) + button("btn_a", 34) + button("btn_b", 35)
+    p = _pins("carrier-knob", pins)
+    args = _gbagate_carrier(card, p)
+    args += encoder("knob", p["ENC_A"], p["ENC_B"]) + button("btn_enc", p["ENC_SW"]) + \
+        button("btn_a", p["BTN_A"]) + button("btn_b", p["BTN_B"])
     return "esp32s3", args
 
 
@@ -256,6 +309,7 @@ class Node:
         self.name, self.proc, self.log_path = name, proc, log_path
         self.qmp_path = qmp_path or log_path[:-4] + "-qmp.sock"
         self.uart_ports = {}
+        self._qmp = None
 
     def uart(self, n, timeout=30):
         """A socket on UART n (boot(..., uartN=port)): what the firmware writes to it
@@ -311,24 +365,50 @@ class Node:
             return ""
 
     def qmp(self, command, **arguments):
-        """One QMP command on the node's monitor socket; its "return"."""
+        """One QMP command on the node's monitor socket; its "return". The connection
+        stays open between commands (a test that captures the screen or presses a key
+        at every step makes many), and is opened again if QEMU dropped it."""
         import json
-        import socket
-        sock = socket.socket(socket.AF_UNIX)
-        sock.connect(self.qmp_path)
-        f = sock.makefile("rw")
-        f.readline()                                    # Greeting
-        for msg in ({"execute": "qmp_capabilities"}, {"execute": command, "arguments": arguments}):
-            f.write(json.dumps(msg) + "\n")
-            f.flush()
-            while True:
-                r = json.loads(f.readline())
-                if "return" in r or "error" in r:
-                    break
-        sock.close()
+        for attempt in (0, 1):
+            try:
+                if self._qmp is None:
+                    import socket
+                    sock = socket.socket(socket.AF_UNIX)
+                    sock.connect(self.qmp_path)
+                    f = sock.makefile("rw")
+                    json.loads(f.readline())                 # Greeting
+                    self._qmp = (sock, f)
+                    self._qmp_send("qmp_capabilities", {})
+                r = self._qmp_send(command, arguments)
+                break
+            except (OSError, ValueError):
+                self._qmp_close()
+                if attempt:
+                    raise
         if "error" in r:
             raise RuntimeError(r["error"])
         return r["return"]
+
+    def _qmp_send(self, command, arguments):
+        import json
+        f = self._qmp[1]
+        f.write(json.dumps({"execute": command, "arguments": arguments}) + "\n")
+        f.flush()
+        while True:
+            line = f.readline()
+            if not line:
+                raise OSError("QMP closed")
+            r = json.loads(line)
+            if "return" in r or "error" in r:        # Events in between are skipped
+                return r
+
+    def _qmp_close(self):
+        if self._qmp:
+            try:
+                self._qmp[0].close()
+            except OSError:
+                pass
+        self._qmp = None
 
     def screendump(self, path, device="lcd"):
         """A display's glass as a PPM file; (width, height, rgb bytes)."""
@@ -387,6 +467,7 @@ class Node:
         return self.qmp("qom-get", path=path, property="count")
 
     def stop(self):
+        self._qmp_close()
         if self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
@@ -419,14 +500,16 @@ def _wifi_args(wifi):
 
 
 def boot(board, flash, workdir, name="node", hci=None, uart1=None, uart2=None, wifi=None,
-         extra=(), **opts):
+         no_reboot=False, extra=(), **opts):
     """Boot flash (a merged image) on a board. UART0 goes to <workdir>/<name>.log, the
     USB serial (plugged in) to <name>-usb.log. UART1 and UART2: uart1=/uart2= a TCP port
     QEMU listens on, for a test to connect to (Node.uart(n)); or hci: a TCP port UART1
     connects to (a virtual Bluetooth controller); else nothing on them. TCP serial ports
     are nodelay: a protocol's few bytes each way would otherwise wait 25-50 ms each on
     Nagle and delayed ACKs. wifi: an access point for the S3's Wi-Fi (_wifi_args); its
-    network is QEMU's user-mode one (DHCP; the host is 10.0.2.2)."""
+    network is QEMU's user-mode one (DHCP; the host is 10.0.2.2). no_reboot: a reset
+    (a panic's, the watchdog's, esp_restart()) ends QEMU instead, so a test that
+    expects none fails at once rather than watching the firmware boot again."""
     if board.startswith("kicad:"):
         machine, devices = from_kicad(board[len("kicad:"):], **opts)
     else:
@@ -455,6 +538,8 @@ def boot(board, flash, workdir, name="node", hci=None, uart1=None, uart2=None, w
     args += ["-qmp", "unix:%s,server=on,wait=off" % qmp]
     if QEMU_BIOS:
         args += ["-L", QEMU_BIOS]
+    if no_reboot:
+        args += ["-no-reboot"]
     args += devices + list(extra)                  # e.g. ["-gdb", "tcp::1234"]
     with open(os.path.join(workdir, name + "-qemu.txt"), "w") as f:
         f.write(" ".join(args) + "\n")

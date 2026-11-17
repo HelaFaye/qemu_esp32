@@ -1,7 +1,7 @@
 From d9ec4d589bcdf122f9f2b825a62d377d00824225 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Sat, 14 Nov 2026 18:29:02 +0000
-Subject: [PATCH 14/19] gpio-button: encoder edges 2 ms apart, settable
+Subject: [PATCH 14/26] gpio-button: encoder edges 2 ms apart, settable
  (edge-us)
 
 The edges came 0.5 ms apart, faster than firmware that polls its encoder pins

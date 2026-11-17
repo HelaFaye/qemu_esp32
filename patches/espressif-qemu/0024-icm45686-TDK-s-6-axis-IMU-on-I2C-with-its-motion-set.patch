@@ -1,0 +1,534 @@
+From ba09c599bfd31e344f9e3f57401617a56cf21bd4 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Mon, 16 Nov 2026 15:33:26 +0000
+Subject: [PATCH 24/26] icm45686: TDK's 6-axis IMU on I2C, with its motion set
+ at run time
+
+The ICM-45686 as SlimeVR's softfusion driver (and TDK's) uses it: WHO_AM_I
+(0x72: 0xE9), the soft reset, the sensor and FIFO configuration (kept), and the
+FIFO. FIFO_COUNT (0x12, little-endian, in frames) and FIFO_DATA (0x14, whose
+register pointer stays put across a burst). With the FIFO and both sensors on,
+frames arrive at 204.8 Hz in the 20-byte high-resolution format, with accel in
+every second one (102.4 Hz), at +-32 g and +-4000 dps. A full FIFO drops its
+oldest frame. The indirect registers are kept, and its I2C master (for an
+auxiliary magnetometer) reports each transaction done, with nothing behind it.
+
+The motion is set over QMP: gyro-x/-y/-z (the body's rotation rate, in mdps).
+The attitude integrates from it, and the accelerometer reads gravity's reaction
+in the body frame. temperature-mc sets the temperature.
+
+Test: esp32s3-i2c-devices-test /imu (the configuration, the frame rate, gravity
+flat and still, a rotation rate read back, 90 degrees about X tilting gravity
+from Z to Y, the indirect registers).
+---
+ hw/misc/icm45686.c                     | 371 +++++++++++++++++++++++++
+ hw/misc/meson.build                    |   1 +
+ tests/qtest/esp32s3-i2c-devices-test.c |  99 +++++++
+ 3 files changed, 471 insertions(+)
+ create mode 100644 hw/misc/icm45686.c
+
+diff --git a/hw/misc/icm45686.c b/hw/misc/icm45686.c
+new file mode 100644
+index 0000000..cfd6c88
+--- /dev/null
++++ b/hw/misc/icm45686.c
+@@ -0,0 +1,371 @@
++/*
++ * TDK InvenSense ICM-45686 6-axis IMU on I2C (address 0x68, or 0x69 with AD0 high)
++ *
++ * What a driver uses (SlimeVR's softfusion ICM45 driver, TDK's): WHO_AM_I (0x72: 0xE9),
++ * a soft reset (DEVICE_CONFIG 0x7F), PWR_MGMT0, ACCEL_CONFIG0 and GYRO_CONFIG0 (kept),
++ * FIFO_CONFIG0 and FIFO_CONFIG3, and the FIFO: FIFO_COUNT (0x12, little-endian, in
++ * frames) and FIFO_DATA (0x14, read in bursts; the register pointer stays on it). With
++ * the FIFO and both sensors on, frames come at 204.8 Hz in the 20-byte high-resolution
++ * format: a header (accel 0x40, gyro 0x20, 20-bit 0x10, timestamp 0x08), accel and gyro
++ * (16 bits each, little-endian), temperature, a timestamp, and the 20-bit values' low
++ * nibbles (gyro low, accel high). Accel is new in every second frame (102.4 Hz); in the
++ * others its header bit is clear and it reads -32768. Full scale: +-32 g (16384 LSB/g at
++ * 20 bits) and +-4000 dps (131.072 LSB/dps). In stream mode a full FIFO (8 KB) drops its
++ * oldest frame. The indirect registers (IREG_ADDR 0x7C, IREG_DATA 0x7E) are kept, and its
++ * I2C master (for an auxiliary magnetometer) reports every transaction done with nothing
++ * behind it.
++ *
++ * The motion is set at run time: gyro-x, gyro-y, gyro-z (the body's rotation rate, in
++ * millidegrees a second); the attitude is integrated from it, and the accelerometer reads
++ * gravity's reaction (+1 g up) in the body's frame: flat and still, (0, 0, +1 g).
++ * temperature-mc: millidegrees C (25000).
++ *
++ *   -device icm45686,bus=i2c0,address=0x68,id=imu
++ *   qom-set /machine/peripheral/imu gyro-z 90000          (90 degrees a second)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/timer.h"
++#include <math.h>
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "hw/i2c/i2c.h"
++#include "hw/qdev-properties.h"
++#include "qom/object.h"
++
++#define TYPE_ICM45686 "icm45686"
++OBJECT_DECLARE_SIMPLE_TYPE(ICM45686State, ICM45686)
++
++#define REG_PWR_MGMT0       0x10
++#define REG_FIFO_COUNT      0x12
++#define REG_FIFO_DATA       0x14
++#define REG_ACCEL_CONFIG0   0x1B
++#define REG_GYRO_CONFIG0    0x1C
++#define REG_FIFO_CONFIG0    0x1D
++#define REG_FIFO_CONFIG3    0x21
++#define REG_WHO_AM_I        0x72
++#define REG_IREG_ADDR_H     0x7C
++#define REG_IREG_ADDR_L     0x7D
++#define REG_IREG_DATA       0x7E
++#define REG_DEVICE_CONFIG   0x7F
++
++#define WHO_AM_I_VALUE      0xE9
++#define FRAME_BYTES         20
++#define FIFO_FRAMES         (8192 / FRAME_BYTES)
++#define FRAME_NS            (1000000000.0 / 204.8)
++
++/* The I2C master's status (IPREG_TOP1 0x18 in bank 0xA2): done, no error */
++#define IREG_I2CM_STATUS    0xA218
++#define I2CM_DONE           0x02
++
++#define ACCEL_LSB_PER_G     (16384.0 * 16)          /* 20 bits */
++#define GYRO_LSB_PER_DPS    (131.072 * 16)
++
++struct ICM45686State {
++    I2CSlave parent_obj;
++
++    uint8_t reg[128];
++    uint8_t ireg[0x10000];              /* Indirect: bank << 8 | register */
++    uint16_t ireg_addr;
++    uint8_t ptr;
++    bool addr_next;
++
++    uint8_t fifo[FIFO_FRAMES * FRAME_BYTES];
++    unsigned fifo_head, fifo_frames;    /* In frames */
++    unsigned fifo_byte;                 /* Of the frame at the head, being read */
++    int64_t next_frame_ns;
++    uint64_t frame_count;
++
++    double q[4];                        /* Attitude, body to world: w, x, y, z */
++    int32_t gyro_mdps[3];
++    int32_t temperature_mc;
++};
++
++static void quat_mul(const double a[4], const double b[4], double out[4])
++{
++    double r[4] = {
++        a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
++        a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
++        a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
++        a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0],
++    };
++    memcpy(out, r, sizeof(r));
++}
++
++/* A world vector in the body's frame: conj(q) v q */
++static void world_to_body(const double q[4], const double v[3], double out[3])
++{
++    double qc[4] = { q[0], -q[1], -q[2], -q[3] };
++    double p[4] = { 0, v[0], v[1], v[2] }, t[4];
++    quat_mul(qc, p, t);
++    quat_mul(t, q, t);
++    out[0] = t[1];
++    out[1] = t[2];
++    out[2] = t[3];
++}
++
++static void integrate(ICM45686State *s, double dt)
++{
++    double w[3], n = 0;
++    for (int i = 0; i < 3; i++) {
++        w[i] = s->gyro_mdps[i] / 1000.0 * M_PI / 180.0;
++        n += w[i] * w[i];
++    }
++    n = sqrt(n);
++    if (n == 0) {
++        return;
++    }
++    double h = n * dt / 2, k = sin(h) / n;
++    double dq[4] = { cos(h), w[0] * k, w[1] * k, w[2] * k };
++    quat_mul(s->q, dq, s->q);                /* Body-frame rates: q dq */
++    double m = sqrt(s->q[0] * s->q[0] + s->q[1] * s->q[1] + s->q[2] * s->q[2] + s->q[3] * s->q[3]);
++    for (int i = 0; i < 4; i++) {
++        s->q[i] /= m;
++    }
++}
++
++static void put20(uint8_t *hi, uint8_t *nib, bool high_nibble, double v)
++{
++    int32_t x = (int32_t)lround(v);
++    x = MAX(MIN(x, (1 << 19) - 1), -(1 << 19) + 16);
++    int16_t top = x >> 4;
++    hi[0] = top & 0xFF;
++    hi[1] = (uint16_t)top >> 8;
++    *nib = high_nibble ? (*nib & 0x0F) | (x & 0xF) << 4 : (*nib & 0xF0) | (x & 0xF);
++}
++
++static void push_frame(ICM45686State *s)
++{
++    if (s->fifo_frames == FIFO_FRAMES) {             /* Stream mode: drop the oldest */
++        s->fifo_head = (s->fifo_head + 1) % FIFO_FRAMES;
++        s->fifo_frames--;
++        s->fifo_byte = 0;
++    }
++    uint8_t *f = &s->fifo[((s->fifo_head + s->fifo_frames) % FIFO_FRAMES) * FRAME_BYTES];
++    bool accel = (s->frame_count++ & 1) == 0;        /* 102.4 Hz of 204.8 */
++    memset(f, 0, FRAME_BYTES);
++    f[0] = (accel ? 0x40 : 0) | 0x20 | 0x10 | 0x08;
++    const double up[3] = { 0, 0, 1 };
++    double a[3];
++    world_to_body(s->q, up, a);
++    for (int i = 0; i < 3; i++) {
++        if (accel) {
++            put20(&f[1 + 2 * i], &f[17 + i], true, a[i] * ACCEL_LSB_PER_G);
++        } else {
++            f[1 + 2 * i] = 0x00;
++            f[2 + 2 * i] = 0x80;                     /* -32768: no new sample */
++        }
++        put20(&f[7 + 2 * i], &f[17 + i], false, s->gyro_mdps[i] / 1000.0 * GYRO_LSB_PER_DPS);
++    }
++    int16_t t = (int16_t)lround((s->temperature_mc - 25000) * 128.0 / 1000.0);
++    f[13] = t & 0xFF;
++    f[14] = (uint16_t)t >> 8;
++    uint16_t ts = (uint16_t)(s->frame_count * 5);   /* ~4.9 ms a frame, in ms-ish ticks */
++    f[15] = ts & 0xFF;
++    f[16] = ts >> 8;
++    s->fifo_frames++;
++}
++
++static bool streaming(ICM45686State *s)
++{
++    return (s->reg[REG_FIFO_CONFIG3] & 0x07) == 0x07 &&      /* FIFO, accel, gyro in it */
++           (s->reg[REG_PWR_MGMT0] & 0x0F) != 0 &&
++           (s->reg[REG_FIFO_CONFIG0] >> 6) != 0;             /* Not bypass */
++}
++
++/* Frames up to now; the attitude moves on whether or not they're kept */
++static void catch_up(ICM45686State *s)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    if (!s->next_frame_ns) {
++        s->next_frame_ns = now + FRAME_NS;
++        return;
++    }
++    int guard = 0;
++    while (s->next_frame_ns <= now) {
++        if (++guard > FIFO_FRAMES * 4) {             /* Long idle: skip ahead */
++            integrate(s, (now - s->next_frame_ns) / 1e9);
++            s->next_frame_ns = now + FRAME_NS;
++            break;
++        }
++        integrate(s, FRAME_NS / 1e9);
++        if (streaming(s)) {
++            push_frame(s);
++        }
++        s->next_frame_ns += FRAME_NS;
++    }
++}
++
++static uint8_t fifo_read_byte(ICM45686State *s)
++{
++    if (!s->fifo_frames) {
++        return 0xFF;
++    }
++    uint8_t b = s->fifo[s->fifo_head * FRAME_BYTES + s->fifo_byte];
++    if (++s->fifo_byte == FRAME_BYTES) {
++        s->fifo_byte = 0;
++        s->fifo_head = (s->fifo_head + 1) % FIFO_FRAMES;
++        s->fifo_frames--;
++    }
++    return b;
++}
++
++static void soft_reset(ICM45686State *s)
++{
++    memset(s->reg, 0, sizeof(s->reg));
++    memset(s->ireg, 0, sizeof(s->ireg));
++    s->ireg_addr = 0;
++    s->fifo_head = s->fifo_frames = s->fifo_byte = 0;
++    s->reg[REG_WHO_AM_I] = WHO_AM_I_VALUE;
++}
++
++static uint8_t read_byte(ICM45686State *s, uint8_t a)
++{
++    switch (a) {
++    case REG_FIFO_COUNT:
++        catch_up(s);
++        return s->fifo_frames & 0xFF;
++    case REG_FIFO_COUNT + 1:
++        return s->fifo_frames >> 8;
++    case REG_FIFO_DATA:
++        catch_up(s);
++        return fifo_read_byte(s);
++    case REG_WHO_AM_I:
++        return WHO_AM_I_VALUE;
++    case REG_IREG_DATA: {
++        uint8_t v = s->ireg_addr == IREG_I2CM_STATUS ? I2CM_DONE : s->ireg[s->ireg_addr];
++        s->ireg_addr++;
++        return v;
++    }
++    }
++    return s->reg[a & 0x7F];
++}
++
++static void write_byte(ICM45686State *s, uint8_t a, uint8_t b)
++{
++    switch (a) {
++    case REG_DEVICE_CONFIG:
++        if ((b & 0x03) == 0x03) {
++            soft_reset(s);
++            return;
++        }
++        break;
++    case REG_IREG_ADDR_H:
++        s->ireg_addr = (s->ireg_addr & 0x00FF) | b << 8;
++        break;
++    case REG_IREG_ADDR_L:
++        s->ireg_addr = (s->ireg_addr & 0xFF00) | b;
++        break;
++    case REG_IREG_DATA:
++        s->ireg[s->ireg_addr] = b;
++        s->ireg_addr++;
++        return;
++    case REG_FIFO_CONFIG0:
++        if ((b >> 6) == 0) {                         /* Bypass: flushed */
++            s->fifo_head = s->fifo_frames = s->fifo_byte = 0;
++        }
++        break;
++    }
++    s->reg[a & 0x7F] = b;
++}
++
++static int icm_event(I2CSlave *i2c, enum i2c_event event)
++{
++    ICM45686State *s = ICM45686(i2c);
++    if (event == I2C_START_SEND || event == I2C_START_SEND_ASYNC) {
++        s->addr_next = true;
++    }
++    return 0;
++}
++
++static int icm_send(I2CSlave *i2c, uint8_t b)
++{
++    ICM45686State *s = ICM45686(i2c);
++    if (s->addr_next) {
++        s->ptr = b & 0x7F;
++        s->addr_next = false;
++        return 0;
++    }
++    write_byte(s, s->ptr, b);
++    if (s->ptr != REG_IREG_DATA) {
++        s->ptr = (s->ptr + 1) & 0x7F;
++    }
++    return 0;
++}
++
++static uint8_t icm_recv(I2CSlave *i2c)
++{
++    ICM45686State *s = ICM45686(i2c);
++    uint8_t v = read_byte(s, s->ptr);
++    if (s->ptr != REG_FIFO_DATA && s->ptr != REG_IREG_DATA) {
++        s->ptr = (s->ptr + 1) & 0x7F;
++    }
++    return v;
++}
++
++static void icm_reset(DeviceState *dev)
++{
++    ICM45686State *s = ICM45686(dev);
++    soft_reset(s);
++    s->ptr = 0;
++    s->next_frame_ns = 0;
++    s->frame_count = 0;
++    s->q[0] = 1;
++    s->q[1] = s->q[2] = s->q[3] = 0;
++}
++
++static void get_i32(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
++{
++    visit_type_int32(v, name, (int32_t *)opaque, errp);
++}
++
++static void set_i32(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
++{
++    ICM45686State *s = ICM45686(obj);
++    int32_t value;
++    if (visit_type_int32(v, name, &value, errp)) {
++        catch_up(s);                    /* The old rate up to now, the new one from now */
++        *(int32_t *)opaque = value;
++    }
++}
++
++static void icm_init(Object *obj)
++{
++    ICM45686State *s = ICM45686(obj);
++    static const char *const axes[3] = { "gyro-x", "gyro-y", "gyro-z" };
++    for (int i = 0; i < 3; i++) {
++        object_property_add(obj, axes[i], "int32", get_i32, set_i32, NULL, &s->gyro_mdps[i]);
++    }
++    s->temperature_mc = 25000;
++    object_property_add(obj, "temperature-mc", "int32", get_i32, set_i32, NULL, &s->temperature_mc);
++}
++
++static void icm_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    device_class_set_legacy_reset(dc, icm_reset);
++    k->event = icm_event;
++    k->send = icm_send;
++    k->recv = icm_recv;
++}
++
++static const TypeInfo icm_info = {
++    .name = TYPE_ICM45686,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(ICM45686State),
++    .instance_init = icm_init,
++    .class_init = icm_class_init,
++};
++
++static void icm_register_types(void)
++{
++    type_register_static(&icm_info);
++}
++
++type_init(icm_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 0bcb7eb..0c56efe 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -355,3 +355,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
+ system_ss.add(when: 'CONFIG_SX126X', if_true: files('sx126x.c'))
+ system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('power_domain.c', 'bus_noise.c', 'pin_glitch.c'))
++system_ss.add(when: 'CONFIG_ESP_BOARD_PERIPHERALS', if_true: files('icm45686.c'))
+diff --git a/tests/qtest/esp32s3-i2c-devices-test.c b/tests/qtest/esp32s3-i2c-devices-test.c
+index e0ae347..258f304 100644
+--- a/tests/qtest/esp32s3-i2c-devices-test.c
++++ b/tests/qtest/esp32s3-i2c-devices-test.c
+@@ -372,6 +372,104 @@ static void test_buttons_and_encoder(void)
+     qtest_quit(qts);
+ }
+ 
++/* The ICM-45686, as SlimeVR's softfusion driver sets it up and reads it */
++static void imu_frame(QTestState *qts, uint8_t f[20])
++{
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x14 }, 1, f, 20));          /* FIFO_DATA */
++}
++
++static int16_t le16(const uint8_t *p)
++{
++    return (int16_t)(p[0] | p[1] << 8);
++}
++
++static unsigned imu_count(QTestState *qts)
++{
++    uint8_t r[2];
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x12 }, 1, r, 2));
++    return r[0] | r[1] << 8;
++}
++
++static void imu_flush(QTestState *qts)
++{
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x1D, 0x00 }, 2, NULL, 0));      /* Bypass */
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x1D, 0x5F }, 2, NULL, 0));      /* Stream */
++}
++
++/* The next frame with a new accel sample (every second one) */
++static void imu_accel_frame(QTestState *qts, uint8_t f[20])
++{
++    for (int i = 0; i < 3; i++) {
++        imu_frame(qts, f);
++        if (f[0] & 0x40) {
++            return;
++        }
++    }
++    g_assert_not_reached();
++}
++
++static void test_imu(void)
++{
++    QTestState *qts = board("-device icm45686,bus=i2c0,address=0x68,id=imu");
++    uint8_t r[20];
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x72 }, 1, r, 1));           /* WHO_AM_I */
++    g_assert_cmphex(r[0], ==, 0xE9);
++    g_assert_false(i2c_xfer(qts, 0x69, (uint8_t[]){ 0x72 }, 1, r, 1));          /* Not at 0x69 */
++
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x7F, 0x03 }, 2, NULL, 0));      /* Reset */
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x1C, 0x08 }, 2, NULL, 0));      /* Gyro */
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x1B, 0x09 }, 2, NULL, 0));      /* Accel */
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x1D, 0x5F }, 2, NULL, 0));      /* Stream */
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x21, 0x0F }, 2, NULL, 0));      /* FIFO on */
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x10, 0x0F }, 2, NULL, 0));      /* Sensors on */
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x1B }, 1, r, 1));
++    g_assert_cmphex(r[0], ==, 0x09);
++
++    /* 204.8 frames a second: about 20 in 100 ms */
++    imu_count(qts);
++    qtest_clock_step(qts, 100 * 1000 * 1000);
++    unsigned n = imu_count(qts);
++    g_assert_cmpuint(n, >=, 18);
++    g_assert_cmpuint(n, <=, 23);
++
++    /* Flat and still: +1 g on Z (16384 LSB/g in the top 16 of 20 bits), no rotation */
++    imu_accel_frame(qts, r);
++    g_assert_cmphex(r[0] & 0x60, ==, 0x60);
++    g_assert_cmpint(le16(r + 1), ==, 0);
++    g_assert_cmpint(le16(r + 3), ==, 0);
++    g_assert_cmpint(le16(r + 5), ==, 16384);
++    g_assert_cmpint(le16(r + 11), ==, 0);
++    g_assert_cmpint(le16(r + 13), ==, 0);                                       /* 25 C */
++
++    /* 90 degrees a second about Z: 90 * 131.072 LSB/dps in the gyro's top 16 bits */
++    qom_set(qts, "/machine/peripheral/imu", "gyro-z", "90000");
++    imu_flush(qts);
++    qtest_clock_step(qts, 20 * 1000 * 1000);
++    imu_frame(qts, r);
++    g_assert_cmpint(abs(le16(r + 11) - 11796), <=, 1);
++
++    /* 90 degrees about X, over a second: gravity moves from Z to Y */
++    qom_set(qts, "/machine/peripheral/imu", "gyro-z", "0");
++    qom_set(qts, "/machine/peripheral/imu", "gyro-x", "90000");
++    qtest_clock_step(qts, 1000 * 1000 * 1000);
++    qom_set(qts, "/machine/peripheral/imu", "gyro-x", "0");
++    imu_flush(qts);
++    qtest_clock_step(qts, 20 * 1000 * 1000);
++    imu_accel_frame(qts, r);
++    g_assert_cmpint(abs(le16(r + 3)), >=, 16384 - 200);
++    g_assert_cmpint(abs(le16(r + 5)), <=, 200);
++
++    /* Indirect registers keep what's written; the aux I2C master reports done */
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x7C, 0xA2, 0x06, 0x5A }, 4, NULL, 0));
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x7C, 0xA2, 0x06 }, 3, NULL, 0));
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x7E }, 1, r, 1));
++    g_assert_cmphex(r[0], ==, 0x5A);
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x7C, 0xA2, 0x18 }, 3, NULL, 0));
++    g_assert_true(i2c_xfer(qts, 0x68, (uint8_t[]){ 0x7E }, 1, r, 1));
++    g_assert_cmphex(r[0], ==, 0x02);
++    qtest_quit(qts);
++}
++
+ int main(int argc, char **argv)
+ {
+     g_test_init(&argc, &argv, NULL);
+@@ -384,5 +482,6 @@ int main(int argc, char **argv)
+     qtest_add_func("/esp32s3/i2c-devices/power_domain_pin", test_power_domain_pin);
+     qtest_add_func("/esp32s3/i2c-devices/bus_noise", test_bus_noise);
+     qtest_add_func("/esp32s3/i2c-devices/pin_glitch", test_pin_glitch);
++    qtest_add_func("/esp32s3/i2c-devices/imu", test_imu);
+     return g_test_run();
+ }
+-- 
+2.43.0
+

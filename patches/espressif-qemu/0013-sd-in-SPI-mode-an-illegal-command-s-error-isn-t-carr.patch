@@ -1,7 +1,7 @@
 From d2626101db0de38764dd4b3f33b4af9265d730c4 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Sat, 14 Nov 2026 18:29:02 +0000
-Subject: [PATCH 13/19] sd: in SPI mode, an illegal command's error isn't
+Subject: [PATCH 13/26] sd: in SPI mode, an illegal command's error isn't
  carried to the next
 
 On the SD bus an illegal command gets no response, so ILLEGAL_COMMAND is kept

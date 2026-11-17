@@ -15,12 +15,12 @@ patched tree, `tests/qtest/`:
 | `esp32s3-gpspi-test` | GP-SPI2/3: chip selects, phases, timing, GDMA |
 | `esp32s3-spi-devices-test` | ILI9341, XPT2046, SD; a display's power domain; noise on its wires |
 | `esp32s3-i2c-test` | I2C0/1: transfers, NACKs, long writes |
-| `esp32s3-i2c-devices-test` | SSD1306, touch, keyboard, MCP23017, buttons and encoders; power domains; bus noise; pin glitches |
+| `esp32s3-i2c-devices-test` | SSD1306, touch, keyboard, MCP23017, buttons and encoders, the ICM-45686 IMU's FIFO and motion; power domains; bus noise; pin glitches |
 | `esp32s3-sx1262-test` | Two QEMUs' radios on one air |
-| `esp32s3-usb-serial-jtag-test` | USB Serial/JTAG with and without a host |
+| `esp32s3-usb-serial-jtag-test` | USB Serial/JTAG with and without a host; IN_EMPTY while the FIFO is empty |
 | `esp32s3-brownout-test` | The supply, the brown-out detector, power cuts |
 | `esp32s3-phy-test` | What Wi-Fi start-up polls (calibrations, the MAC's reset), the temperature sensor, ADC conversions; LEDC's registers |
-| `esp32s3-wifi-test` | The Wi-Fi MAC and access point: a beacon received, the receive registers ESP-IDF follows, a reload, a probe answered, nothing off channel |
+| `esp32s3-wifi-test` | The Wi-Fi MAC and access point: a beacon received, the receive registers ESP-IDF follows, a reload, a probe answered, nothing off channel; malformed input: transmit lengths from 0 to 4095, an SSID element too long for its frame, a frame larger than the guest's buffer, short data frames |
 | `esp32s3-rmt-test` | The RMT's transmit side: an LED's three bytes sent and read back, the threshold and end interrupts on a wrapping transmission |
 | `esp32s3-mmu-test` | One flash page at two virtual pages: unmapping one leaves the other readable |
 | `esp32s3-lcd-cam-test` | LCD_CAM: an ST7789 on its parallel bus, commands and pixels by GDMA, byte order, the done interrupt; the glass read back exactly |
@@ -34,6 +34,11 @@ for t in esp32s3-intmatrix-test esp32s3-gpio-test esp32s3-gpspi-test esp32s3-spi
   ninja tests/qtest/$t && QTEST_QEMU_BINARY=./qemu-system-xtensa ./tests/qtest/$t
 done
 ```
+
+The device models also run clean under AddressSanitizer and UBSan: configure a second build
+with `--enable-asan --enable-ubsan` and run the same tests with
+`ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1`. Do this
+for a change to anything that parses what the guest or the network gives it.
 
 The Python tools have their own: `python3 -m pytest radio/ faults/ kicad/`.
 
