@@ -1,7 +1,7 @@
-From f8400bfea3541872114338cda623ba1a85490a98 Mon Sep 17 00:00:00 2001
+From b2c4763740bd923f8f24a2957440fe7fe26badca Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 16 Nov 2026 20:13:53 +0000
-Subject: [PATCH 21/22] esp32s3: RMT transmit channels
+Subject: [PATCH 22/23] esp32s3: RMT transmit channels
 
 The RMT was an unimplemented region, so ESP-IDF's rmt_tx driver waited
 forever for TX_END. Arduino-ESP32 3.x sends neopixelWrite() and

@@ -120,13 +120,13 @@ jobs:
         run: |
           chmod +x "$QEMU_XTENSA"
           firmware/gbagate/check.sh "$RUNNER_TEMP/gbagate"
-      - name: Its full boards (devkit and Supermini buttons, SD on every board)
+      - name: Its full boards (devkit, Supermini and touch carrier; their inputs, SD on each)
         if: always()
         shell: bash
         env:
           QEMU_XTENSA: ${{ runner.temp }}/qemu/qemu-system-xtensa
           QEMU_BIOS: ${{ runner.temp }}/qemu/bios
-        run: python3 firmware/gbagate/boards_check.py "$RUNNER_TEMP/gbagate" devkit supermini
+        run: python3 firmware/gbagate/boards_check.py "$RUNNER_TEMP/gbagate" devkit supermini carrier-touch
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -6,8 +6,13 @@ its buttons where board.h puts them:
 - every board: all its tasks start, the card mounts, there's a picture, no panic, no
   reset;
 - devkit: its encoder comes up (gbagate's default input), and a turn changes the screen;
+  then, by the encoder alone, Settings > input goes to the five-way, which applies at
+  once, and its switches work: B leaves Settings;
 - supermini: it finds its button expander (0x21 on I2C), and a press of "down" on the
-  expander changes the screen.
+  expander changes the screen;
+- carrier-touch: it finds its XPT2046, and a touch on its DOWN key moves the menu. (The
+  board has the Battle Chip reader's two expanders too, but the gate image has no chip
+  reader to look for them: that's the full image's.)
 
     boards_check.py OUTDIR [board ...]      (OUTDIR: build.sh's; default: devkit supermini)
 """
@@ -59,6 +64,50 @@ def turn(node, knob, detents=1):
     node.qmp("qom-set", path="/machine/peripheral/" + knob, property="turn", value=detents)
 
 
+def settled(node, path, quiet=0.4, limit=3.0):
+    """The screen once it has stopped changing (two captures `quiet` apart agree)."""
+    last = node.screendump(path)[2]
+    end = time.time() + limit
+    while time.time() < end:
+        time.sleep(quiet)
+        now = node.screendump(path)[2]
+        if now == last:
+            return now
+        last = now
+    return last
+
+
+def step(node, knob, detents, out):
+    """Move the cursor one detent at a time, each seen to move it once the screen has
+    settled (a detent can be missed; one seen late must not be turned again)."""
+    path = os.path.join(out, "step.ppm")
+    for _ in range(abs(detents)):
+        before = settled(node, path)
+        for _ in range(4):
+            turn(node, knob, 1 if detents > 0 else -1)
+            if settled(node, path) != before:
+                break
+        else:
+            return False
+    return True
+
+
+# The touch keys (gbagate's src/touch_pad.h): two 40-pixel strips of five 48-pixel keys
+# either side of the 240x240 UI, on the 320x240 panel; the XPT2046's raw plates run
+# 200..3900 across it (its default calibration, as gbagate's qemu/accurate_boot.py has it).
+LEFT_KEYS = ["LEFT", "L", "UP", "DOWN", "R"]
+
+
+def touch_key(node, name, hold=0.15):
+    x, y = 20, LEFT_KEYS.index(name) * 48 + 24
+    p = "/machine/peripheral/touch"
+    node.qmp("qom-set", path=p, property="x", value=200 + 3700 * x // 319)
+    node.qmp("qom-set", path=p, property="y", value=200 + 3700 * y // 239)
+    node.qmp("qom-set", path=p, property="pressed", value=True)
+    time.sleep(hold)
+    node.qmp("qom-set", path=p, property="pressed", value=False)
+
+
 def changes_screen(node, button, out, name, act=press):
     before = screen(node, os.path.join(out, name + "-before.ppm"))
     act(node, button)
@@ -92,11 +141,34 @@ def run(board, outdir):
             check("its encoder comes up on 15/16, switch 35", "encoder on A=15 B=16 SW=35" in log,
                   (re.findall(r"buttons: .*", log) or ["no buttons line"])[0])
             check("a turn of the encoder changes the screen", changes_screen(node, "knob", work, "turn", turn))
+            # The menu: Link ... GBA Memory, Settings, Diagnostics, wrapping; a detent
+            # forward moves up. The turn above went from Link to Diagnostics.
+            ok = step(node, "knob", 1, work)                    # Settings
+            press(node, "btn_a")                                # The encoder's switch
+            time.sleep(0.8)
+            ok &= step(node, "knob", -7, work)                  # theme ... wrap, input
+            press(node, "btn_a")                                # Edit
+            time.sleep(0.5)
+            seen = node.count(r"input: 5-way")
+            ok &= step(node, "knob", 1, work)                   # encoder -> 5-way + 5 (wraps)
+            applied = node.wait_for(r"input: 5-way", 3, after=seen)
+            # The first change must be applied: gbagate before 0da7c4c left it to a
+            # second one (pio/src/gate_app.c seeded applied_input after the edit).
+            check("by the encoder, Settings > input to the five-way, applied at once",
+                  ok and applied is not None, (re.findall(r"input: .*", node.log()) or ["?"])[-1])
+            press(node, "btn_a")                                # Done (A: the encoder's pin)
+            time.sleep(0.8)
+            check("and its switches work: B leaves Settings", changes_screen(node, "btn_b", work, "back"))
         elif board == "supermini":
             check("it finds its button expander", "on an expander at 0x21" in log,
                   (re.findall(r"buttons_mcp.*", log) or ["no buttons_mcp line"])[0])
             check('a press of "down" on the expander changes the screen',
                   changes_screen(node, "btn_down", work, "down"))
+        elif board == "carrier-touch":
+            check("it finds its XPT2046 on CS 16, IRQ 17", "XPT2046 on CS=16 IRQ=17" in log,
+                  (re.findall(r"touch.*", log) or ["no touch line"])[0])
+            check("a touch on DOWN moves the menu",
+                  changes_screen(node, "DOWN", work, "touch", lambda n, k: touch_key(n, k)))
         log = node.log()
         bad = FATAL.search(log)
         check("no panic, abort or watchdog", bad is None, bad.group(0) if bad else "")
