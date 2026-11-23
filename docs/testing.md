@@ -23,6 +23,7 @@ patched tree, `tests/qtest/`:
 | `esp32s3-wifi-test` | The Wi-Fi MAC and access point: a beacon received, the receive registers ESP-IDF follows, a reload, a probe answered, nothing off channel; malformed input: transmit lengths from 0 to 4095, an SSID element too long for its frame, a frame larger than the guest's buffer, short data frames |
 | `esp32s3-rmt-test` | The RMT's transmit side: an LED's three bytes sent and read back, the threshold and end interrupts on a wrapping transmission |
 | `esp32s3-mmu-test` | One flash page at two virtual pages: unmapping one leaves the other readable |
+| `esp32s3-i2spi-test` | An I2SPI chain and ICM-45686s: identity reads, sensor power, one-hot arming, the strobe and software chip selects, malformed frames, an empty cable, a mis-flashed node, a two-select fight seen; the FIFO's packets |
 | `esp32s3-lcd-cam-test` | LCD_CAM: an ST7789 on its parallel bus, commands and pixels by GDMA, byte order, the done interrupt; the glass read back exactly |
 
 ```sh
@@ -30,7 +31,8 @@ cd ~/esp-qemu/build
 for t in esp32s3-intmatrix-test esp32s3-gpio-test esp32s3-gpspi-test esp32s3-spi-devices-test \
          esp32s3-i2c-test esp32s3-i2c-devices-test esp32s3-sx1262-test \
          esp32s3-usb-serial-jtag-test esp32s3-brownout-test esp32s3-phy-test \
-         esp32s3-lcd-cam-test esp32s3-wifi-test esp32s3-rmt-test esp32s3-mmu-test; do
+         esp32s3-lcd-cam-test esp32s3-wifi-test esp32s3-rmt-test esp32s3-mmu-test \
+         esp32s3-i2spi-test; do
   ninja tests/qtest/$t && QTEST_QEMU_BINARY=./qemu-system-xtensa ./tests/qtest/$t
 done
 ```
@@ -57,7 +59,7 @@ peripherals they use. Details and how to run each: [`firmware/`](../firmware/REA
 | [LilyGO T-Deck](https://github.com/Xinyuan-LilyGO/T-Deck) (factory firmware) | T-Deck | The ST7789 under TFT_eSPI and LVGL, the GT911 and keyboard, RadioLib on the SX1262, PSRAM, USB Serial/JTAG, its peripherals' power switch, Wi-Fi start-up; its main loop: keys typed reach it, its radio sends, its screen answers |
 | [LilyGO T-Display-S3](https://github.com/Xinyuan-LilyGO/T-Display-S3) (factory firmware) | T-Display-S3 | LCD_CAM and the GDMA under ESP-IDF's esp_lcd i80 driver, LVGL, octal PSRAM, LEDC, Wi-Fi start-up; its UI on the glass, its KEY button turning its pages |
 | [wifi-start](../firmware/wifi-start) (a minimal ESP-IDF app) | DevKitC | Wi-Fi: start-up (the PHY's calibrations, the MAC's reset), then with an access point a scan, a connection, DHCP and a UDP round trip with the host |
-| [SlimeVR tracker](https://github.com/HelaFaye/SlimeVR-Tracker-ESP) (BOARD_ESP32S3_SUPERMINI, Arduino-ESP32 3.3) | SuperMini | esp_image_verify() over the running app, the RMT behind its RGB LED, LittleFS, Wi-Fi by built-in credentials, DHCP, discovery by UDP broadcast and a session with a stand-in server; two ICM-45686 IMUs: found, calibrated at rest, and turned, each sensor's reported rotation following the IMU's true attitude within 5 degrees |
+| [SlimeVR tracker](https://github.com/HelaFaye/SlimeVR-Tracker-ESP) | SuperMini; ICM-45686s on I2C, or on SPI behind I2SPI chains | Tested in its own repository, which clones this one (`qemu/` there): it boots, finds its IMUs, joins Wi-Fi and streams rotations that follow the IMUs to a stand-in server; and its sensors on I2SPI chains in nine configurations and faults |
 
 What the test cases have found, so far (each fixed, with a qtest that reproduces it):
 - QEMU's SD model in SPI mode answered CMD9/CMD10 only from the wrong state and CMD13
@@ -90,6 +92,11 @@ What the test cases have found, so far (each fixed, with a qtest that reproduces
   It also found three bugs in the tracker itself, fixed there: a boot loop from linking
   the legacy I2C driver beside Arduino 3.x's Wire, a background I2C scan that never
   worked, and built-in Wi-Fi credentials that were never tried.
+- With its IMUs on I2SPI chains (0028), the tracker found a bug of its own: a chain with
+  no strobe conductor (software chip selects) never told its nodes to leave strobe mode,
+  so the nodes dropped every SET_CS and every sensor on the chain read as absent. Fixed
+  in the tracker, with a scenario in its host simulation, which had never run a chain
+  without a strobe.
 - Encoder edges came faster than firmware polling each tick could follow (0014):
   gbagate's devkit encoder.
 - In gbagate itself, its own QEMU checks found an ST7735 driver sending pixels low byte

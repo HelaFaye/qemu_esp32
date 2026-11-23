@@ -1,0 +1,1242 @@
+From d92db31fa94c7986d0a9c5a8bd793d776053a52d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 23 Nov 2026 10:02:54 +0000
+Subject: [PATCH] icm45686-spi and i2spi-chain: SlimeVR's IMUs on I2SPI chains
+
+icm45686-spi is 0024's ICM-45686 on SPI: the chip (registers, FIFO,
+motion, attitude) moves into a core both types share, and the SPI side
+adds framing (register byte, bit 7 to read; bursts as on I2C) and
+"fights": bytes moved while another icm45686-spi was selected too. Both
+types gain "frames-read", the FIFO frames a host has read.
+
+i2spi-chain is an I2SPI chain (SPI data, I2C selection; docs/I2SPI.md in
+HelaFaye/SlimeVR-Tracker-ESP): protocol v3 nodes behind one I2C address,
+each channel gating an SPI part's chip select with the shared strobe, or
+by SET_CS in software mode; identity reads; sensor power that starts off
+and resets its parts when it comes on. "nodes", "links", "version" and
+"misflash" set up a chain and its faults; "fights", "armed", "frames",
+"arms" and "powered" read it back.
+
+The qtest covers identity, power gating, one-hot arming, the strobe and
+software chip selects, malformed frames, an empty cable, a mis-flashed
+node, a deliberate two-select fight, and the FIFO over SPI.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Sb26stwPJiCMHhrBWZ2D9q
+---
+ hw/misc/i2spi_chain.c            | 471 +++++++++++++++++++++++++++++++
+ hw/misc/icm45686.c               | 183 ++++++++++--
+ hw/misc/meson.build              |   2 +-
+ tests/qtest/esp32s3-i2spi-test.c | 341 ++++++++++++++++++++++
+ tests/qtest/meson.build          |   2 +-
+ 5 files changed, 973 insertions(+), 26 deletions(-)
+ create mode 100644 hw/misc/i2spi_chain.c
+ create mode 100644 tests/qtest/esp32s3-i2spi-test.c
+
+diff --git a/hw/misc/i2spi_chain.c b/hw/misc/i2spi_chain.c
+new file mode 100644
+index 0000000..5068b37
+--- /dev/null
++++ b/hw/misc/i2spi_chain.c
+@@ -0,0 +1,471 @@
++/*
++ * An I2SPI chain (SPI data, I2C selection; SlimeVR's docs/I2SPI.md, protocol v3): up
++ * to 15 nodes behind one I2C address. Each node owns channels; a channel gates an SPI
++ * part's chip select with the shared CS_STROBE line, CS = CS_STROBE OR NOT armed, or
++ * with SET_CS in software mode. Nodes power their sensors through a switch that starts
++ * off, and a part whose node switches it on is reset as it would be by its supply.
++ *
++ *   -device i2spi-chain,bus=i2c0,address=0x13,id=chain,nodes=1:2/3,links=0x10=imu1:0x11=imu2:0x30=imu3  (icm45686-spi parts)
++ *   -device esp32s3.pin-link,pin=10,dev=chain,line=strobe,pull=up
++ *
++ * nodes:   the nodes present, by id and "/"-separated, each with its channel count
++ *          (":n", default 1).
++ *          A node left out is absent: it neither answers nor gates.
++ * links:   target=device pairs, target = (node << 4) | channel, device = an SSI part's
++ *          id; its "ssi-gpio-cs" follows the channel.
++ * version: the protocol version the nodes report (default 3).
++ * misflash: "position=id": the node at a position answers IDENTIFY for that position
++ *          but reports another id, as a node flashed with the wrong image does.
++ *
++ * Read back over QOM: "frames" (valid frames), "arms" (ARM frames), "fights" (times two
++ * of this chain's chip selects were asserted together), "armed" (the armed target, 0
++ * for none), "powered" (bit n: node n's sensors are on).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "hw/i2c/i2c.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "hw/ssi/ssi.h"
++#include "qemu/cutils.h"
++#include "qemu/error-report.h"
++#include "qemu/log.h"
++#include "qemu/notify.h"
++#include "sysemu/sysemu.h"
++#include "qom/object.h"
++
++#define TYPE_I2SPI_CHAIN "i2spi-chain"
++OBJECT_DECLARE_SIMPLE_TYPE(I2SPIChainState, I2SPI_CHAIN)
++
++#define MAX_NODES       16      /* Ids 1..15 */
++#define MAX_CHANNELS    16
++#define MAX_LINKS       64
++
++enum {
++    OP_ARM = 0x01, OP_DISARM_ALL = 0x02, OP_POWER_ALL = 0x03,
++    OP_SET_CS = 0x10, OP_SET_MODE = 0x11, OP_SET_SENSOR_POWER = 0x12,
++    OP_SET_SENSOR_RESET = 0x13, OP_IDENTIFY = 0x20, OP_RESET_ALL = 0x7f,
++};
++
++#define IDENTITY_MAGIC  0x5c
++#define ST_ARMED        0x01
++#define ST_STROBE       0x02
++#define ST_POWERED      0x04
++#define ST_HELD         0x08
++
++typedef struct Node {
++    bool present;
++    uint8_t reported_id;
++    uint8_t channels;
++    int armed;              /* Channel, or -1 */
++    bool strobe_mode;
++    bool powered;
++    bool held;
++    bool soft_cs_low;
++} Node;
++
++typedef struct Link {
++    uint8_t target;
++    char *dev_id;
++    DeviceState *dev;
++    qemu_irq cs;
++    int level;              /* -1: not driven yet */
++} Link;
++
++struct I2SPIChainState {
++    I2CSlave parent_obj;
++
++    char *nodes_str;
++    char *links_str;
++    char *misflash_str;
++    uint8_t version;
++
++    Node node[MAX_NODES];
++    Link link[MAX_LINKS];
++    int nlinks;
++    uint8_t identified;     /* Node answering reads, 0 for none */
++
++    uint8_t frame[4];
++    int frame_len;
++    bool sending;
++    int read_pos;
++    bool strobe;            /* Level of CS_STROBE */
++
++    uint32_t frames, arms, fights;
++    uint32_t armed_target, powered_mask;
++
++    Notifier init_done;
++};
++
++static bool link_asserted(I2SPIChainState *s, Link *l)
++{
++    Node *n = &s->node[l->target >> 4];
++    int ch = l->target & 0x0f;
++    if (!n->present || !n->powered || n->held || n->armed != ch) {
++        return false;
++    }
++    return n->strobe_mode ? !s->strobe : n->soft_cs_low;
++}
++
++static void update(I2SPIChainState *s)
++{
++    int asserted = 0;
++
++    s->armed_target = 0;
++    s->powered_mask = 0;
++    for (int id = 1; id < MAX_NODES; id++) {
++        Node *n = &s->node[id];
++        if (n->present && n->armed >= 0) {
++            s->armed_target = id << 4 | n->armed;
++        }
++        if (n->present && n->powered && !n->held) {
++            s->powered_mask |= 1u << id;
++        }
++    }
++    for (int i = 0; i < s->nlinks; i++) {
++        Link *l = &s->link[i];
++        bool on = link_asserted(s, l);
++        asserted += on;
++        if (l->cs && l->level != !on) {
++            l->level = !on;
++            qemu_set_irq(l->cs, l->level);
++        }
++    }
++    if (asserted > 1) {
++        s->fights++;
++    }
++}
++
++/* A node's supply came on: its parts start from power-on */
++static void power_on(I2SPIChainState *s, int id)
++{
++    for (int i = 0; i < s->nlinks; i++) {
++        Link *l = &s->link[i];
++        if ((l->target >> 4) == id && l->dev) {
++            device_cold_reset(l->dev);
++            l->level = -1;
++        }
++    }
++}
++
++static void set_power(I2SPIChainState *s, Node *n, int id, bool on)
++{
++    bool was = n->powered && !n->held;
++    n->powered = on;
++    if (!was && n->powered && !n->held) {
++        power_on(s, id);
++    }
++}
++
++static void node_reset(Node *n)
++{
++    n->armed = -1;
++    n->strobe_mode = true;
++    n->powered = false;
++    n->held = false;
++    n->soft_cs_low = false;
++}
++
++static void apply(I2SPIChainState *s)
++{
++    uint8_t op = s->frame[0], target = s->frame[1], value = s->frame[2];
++    int tid = target >> 4, ch = target & 0x0f;
++    bool known = true;
++
++    for (int id = 1; id < MAX_NODES; id++) {
++        Node *n = &s->node[id];
++        if (!n->present) {
++            continue;
++        }
++        bool mine = tid == id;
++        switch (op) {
++        case OP_ARM:
++            n->armed = (mine && ch < n->channels) ? ch : -1;
++            n->soft_cs_low = false;
++            break;
++        case OP_DISARM_ALL:
++            n->armed = -1;
++            n->soft_cs_low = false;
++            break;
++        case OP_POWER_ALL:
++            set_power(s, n, id, value == 1);
++            break;
++        case OP_RESET_ALL:
++            node_reset(n);
++            break;
++        case OP_SET_CS:
++            if (mine && !n->strobe_mode && n->armed == ch) {
++                n->soft_cs_low = value == 0;
++            }
++            break;
++        case OP_SET_MODE:
++            if (mine) {
++                n->strobe_mode = value == 1;
++            }
++            break;
++        case OP_SET_SENSOR_POWER:
++            if (mine) {
++                set_power(s, n, id, value == 1);
++            }
++            break;
++        case OP_SET_SENSOR_RESET:
++            if (mine) {
++                bool was = n->powered && !n->held;
++                n->held = value == 1;
++                n->powered = !n->held;
++                if (!was && n->powered && !n->held) {
++                    power_on(s, id);
++                }
++            }
++            break;
++        case OP_IDENTIFY:
++            break;
++        default:
++            known = false;
++        }
++    }
++    if (op == OP_IDENTIFY) {
++        s->identified = tid;
++    } else if (op == OP_RESET_ALL) {
++        s->identified = 0;
++    }
++    if (known) {
++        s->frames++;
++        s->arms += op == OP_ARM;
++    }
++    update(s);
++}
++
++static int chain_event(I2CSlave *i2c, enum i2c_event event)
++{
++    I2SPIChainState *s = I2SPI_CHAIN(i2c);
++    bool any = false;
++
++    for (int id = 1; id < MAX_NODES; id++) {
++        any |= s->node[id].present;
++    }
++    switch (event) {
++    case I2C_START_SEND:
++    case I2C_START_SEND_ASYNC:
++        if (!any) {
++            return -1;          /* No node on the cable: nobody ACKs */
++        }
++        s->frame_len = 0;
++        s->sending = true;
++        break;
++    case I2C_START_RECV:
++        if (!any) {
++            return -1;
++        }
++        s->read_pos = 0;
++        s->sending = false;
++        break;
++    case I2C_FINISH:
++        if (s->sending && s->frame_len == 3) {
++            apply(s);
++        }
++        s->sending = false;
++        break;
++    default:
++        break;
++    }
++    return 0;
++}
++
++static int chain_send(I2CSlave *i2c, uint8_t b)
++{
++    I2SPIChainState *s = I2SPI_CHAIN(i2c);
++    if (s->frame_len < (int)sizeof(s->frame)) {
++        s->frame[s->frame_len] = b;
++    }
++    s->frame_len++;             /* A fourth byte spoils the frame */
++    return 0;
++}
++
++static uint8_t chain_recv(I2CSlave *i2c)
++{
++    I2SPIChainState *s = I2SPI_CHAIN(i2c);
++    int id = s->identified;
++    Node *n = id ? &s->node[id] : NULL;
++    int pos = s->read_pos++;
++
++    if (!n || !n->present || pos >= 4) {
++        return 0xff;            /* Bus idle */
++    }
++    switch (pos) {
++    case 0:
++        return IDENTITY_MAGIC;
++    case 1:
++        return s->version;
++    case 2:
++        return n->reported_id;
++    default:
++        return (n->armed >= 0 ? ST_ARMED : 0) | (n->strobe_mode ? ST_STROBE : 0) |
++               (n->powered && !n->held ? ST_POWERED : 0) | (n->held ? ST_HELD : 0);
++    }
++}
++
++static void strobe_in(void *opaque, int n, int level)
++{
++    I2SPIChainState *s = I2SPI_CHAIN(opaque);
++    s->strobe = level != 0;
++    update(s);
++}
++
++static void chain_reset(DeviceState *dev)
++{
++    I2SPIChainState *s = I2SPI_CHAIN(dev);
++    for (int id = 1; id < MAX_NODES; id++) {
++        node_reset(&s->node[id]);
++    }
++    s->identified = 0;
++    s->frame_len = 0;
++    s->sending = false;
++    s->strobe = true;
++    for (int i = 0; i < s->nlinks; i++) {
++        s->link[i].level = -1;
++    }
++    update(s);
++}
++
++/* The parts exist once every -device is in: connect, and deselect them all */
++static void chain_init_done(Notifier *notifier, void *data)
++{
++    I2SPIChainState *s = container_of(notifier, I2SPIChainState, init_done);
++
++    for (int i = 0; i < s->nlinks; i++) {
++        Link *l = &s->link[i];
++        g_autofree char *path = g_strdup_printf("/machine/peripheral/%s", l->dev_id);
++        Object *o = object_resolve_path(path, NULL);
++        if (!o || !object_dynamic_cast(o, TYPE_SSI_PERIPHERAL)) {
++            error_report("i2spi-chain: links: no SPI device '%s'", l->dev_id);
++            exit(1);
++        }
++        l->dev = DEVICE(o);
++        l->cs = qdev_get_gpio_in_named(l->dev, SSI_GPIO_CS, 0);
++        l->level = -1;
++    }
++    update(s);
++}
++
++static void chain_realize(DeviceState *dev, Error **errp)
++{
++    I2SPIChainState *s = I2SPI_CHAIN(dev);
++
++    for (int id = 0; id < MAX_NODES; id++) {
++        s->node[id].reported_id = id;
++    }
++    if (s->nodes_str && *s->nodes_str) {
++        g_auto(GStrv) parts = g_strsplit(s->nodes_str, "/", -1);
++        for (int i = 0; parts[i]; i++) {
++            unsigned long id, ch = 1;
++            const char *end;
++            if (qemu_strtoul(parts[i], &end, 0, &id) < 0 ||
++                (*end && (*end != ':' || qemu_strtoul(end + 1, NULL, 0, &ch) < 0))) {
++                goto bad_nodes;
++            }
++            if (id < 1 || id >= MAX_NODES || ch < 1 || ch > MAX_CHANNELS) {
++                goto bad_nodes;
++            }
++            s->node[id].present = true;
++            s->node[id].channels = ch;
++        }
++    }
++    if (s->misflash_str && *s->misflash_str) {
++        unsigned long pos, id;
++        const char *end;
++        if (qemu_strtoul(s->misflash_str, &end, 0, &pos) < 0 || *end != '=' ||
++            qemu_strtoul(end + 1, NULL, 0, &id) < 0 ||
++            pos < 1 || pos >= MAX_NODES || id > 255) {
++            error_setg(errp, "i2spi-chain: misflash: position=id");
++            return;
++        }
++        s->node[pos].reported_id = id;
++    }
++    if (s->links_str && *s->links_str) {
++        g_auto(GStrv) parts = g_strsplit(s->links_str, ":", -1);
++        for (int i = 0; parts[i]; i++) {
++            char *eq = strchr(parts[i], '=');
++            unsigned long target;
++            if (!eq || s->nlinks >= MAX_LINKS) {
++                goto bad_links;
++            }
++            *eq = 0;
++            if (qemu_strtoul(parts[i], NULL, 0, &target) < 0 || target > 0xff ||
++                (target >> 4) == 0) {
++                goto bad_links;
++            }
++            s->link[s->nlinks].target = target;
++            s->link[s->nlinks].dev_id = g_strdup(eq + 1);
++            s->link[s->nlinks].level = -1;
++            s->nlinks++;
++        }
++    }
++    qdev_init_gpio_in_named(dev, strobe_in, "strobe", 1);
++    s->init_done.notify = chain_init_done;
++    qemu_add_machine_init_done_notifier(&s->init_done);
++    return;
++
++bad_nodes:
++    error_setg(errp, "i2spi-chain: nodes: id[:channels]/... with ids 1..15");
++    return;
++bad_links:
++    error_setg(errp, "i2spi-chain: links: target=device:... (target 0x10..0xff)");
++}
++
++static void get_u32(Object *obj, Visitor *v, const char *name, void *opaque,
++                    Error **errp)
++{
++    visit_type_uint32(v, name, (uint32_t *)opaque, errp);
++}
++
++static void chain_init(Object *obj)
++{
++    I2SPIChainState *s = I2SPI_CHAIN(obj);
++    object_property_add(obj, "frames", "uint32", get_u32, NULL, NULL, &s->frames);
++    object_property_add(obj, "arms", "uint32", get_u32, NULL, NULL, &s->arms);
++    object_property_add(obj, "fights", "uint32", get_u32, NULL, NULL, &s->fights);
++    object_property_add(obj, "armed", "uint32", get_u32, NULL, NULL, &s->armed_target);
++    object_property_add(obj, "powered", "uint32", get_u32, NULL, NULL,
++                        &s->powered_mask);
++}
++
++static Property chain_properties[] = {
++    DEFINE_PROP_STRING("nodes", I2SPIChainState, nodes_str),
++    DEFINE_PROP_STRING("links", I2SPIChainState, links_str),
++    DEFINE_PROP_STRING("misflash", I2SPIChainState, misflash_str),
++    DEFINE_PROP_UINT8("version", I2SPIChainState, version, 3),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void chain_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
++
++    dc->realize = chain_realize;
++    device_class_set_legacy_reset(dc, chain_reset);
++    device_class_set_props(dc, chain_properties);
++    k->event = chain_event;
++    k->send = chain_send;
++    k->recv = chain_recv;
++}
++
++static const TypeInfo chain_info = {
++    .name = TYPE_I2SPI_CHAIN,
++    .parent = TYPE_I2C_SLAVE,
++    .instance_size = sizeof(I2SPIChainState),
++    .instance_init = chain_init,
++    .class_init = chain_class_init,
++};
++
++static void chain_register_types(void)
++{
++    type_register_static(&chain_info);
++}
++
++type_init(chain_register_types)
+diff --git a/hw/misc/icm45686.c b/hw/misc/icm45686.c
+index 68fe9c5..2c00ba0 100644
+--- a/hw/misc/icm45686.c
++++ b/hw/misc/icm45686.c
+@@ -26,6 +26,15 @@
+  *   -device icm45686,bus=i2c0,address=0x68,id=imu
+  *   qom-set /machine/peripheral/imu gyro-z 90000          (90 degrees a second)
+  *
++ * icm45686-spi is the same chip on SPI (mode 0 or 3; the first byte is the register,
++ * bit 7 set to read; bursts walk the registers as on I2C), selected by its "ssi-gpio-cs"
++ * line (an esp32s3.pin-link, or an i2spi-chain's channel). On either bus, frames-read
++ * counts the FIFO frames a host has read. On SPI, fights counts the bytes it moved while
++ * another icm45686-spi was selected too: two chips driving MISO.
++ *
++ *   -device icm45686-spi,bus=spi2,cs=10,id=imu
++ *   -device esp32s3.pin-link,pin=10,dev=imu,line=ssi-gpio-cs,pull=up
++ *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License version 2 or
+  * (at your option) any later version.
+@@ -37,11 +46,14 @@
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+ #include "hw/i2c/i2c.h"
++#include "hw/ssi/ssi.h"
+ #include "hw/qdev-properties.h"
+ #include "qom/object.h"
+ 
+ #define TYPE_ICM45686 "icm45686"
+ OBJECT_DECLARE_SIMPLE_TYPE(ICM45686State, ICM45686)
++#define TYPE_ICM45686_SPI "icm45686-spi"
++OBJECT_DECLARE_SIMPLE_TYPE(ICM45686SPIState, ICM45686_SPI)
+ 
+ #define REG_PWR_MGMT0       0x10
+ #define REG_FIFO_COUNT      0x12
+@@ -68,14 +80,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(ICM45686State, ICM45686)
+ #define ACCEL_LSB_PER_G     16384.0                 /* At 20 bits: +-32 g */
+ #define GYRO_LSB_PER_DPS    131.072                 /* At 20 bits: +-4000 dps */
+ 
+-struct ICM45686State {
+-    I2CSlave parent_obj;
+-
++/* The chip, whichever bus it's on */
++typedef struct ICM45686Core {
+     uint8_t reg[128];
+     uint8_t ireg[0x10000];              /* Indirect: bank << 8 | register */
+     uint16_t ireg_addr;
+-    uint8_t ptr;
+-    bool addr_next;
+ 
+     uint8_t fifo[FIFO_FRAMES * FRAME_BYTES];
+     unsigned fifo_head, fifo_frames;    /* In frames */
+@@ -86,6 +95,24 @@ struct ICM45686State {
+     double q[4];                        /* Attitude, body to world: w, x, y, z */
+     int32_t gyro_mdps[3];
+     int32_t temperature_mc;
++    uint32_t frames_read;
++} ICM45686Core;
++
++struct ICM45686State {
++    I2CSlave parent_obj;
++    ICM45686Core c;
++    uint8_t ptr;
++    bool addr_next;
++};
++
++struct ICM45686SPIState {
++    SSIPeripheral parent_obj;
++    ICM45686Core c;
++    uint8_t ptr;
++    bool first;                         /* The next byte is the register */
++    bool reading;
++    bool selected;
++    uint32_t fights;
+ };
+ 
+ static void quat_mul(const double a[4], const double b[4], double out[4])
+@@ -111,7 +138,7 @@ static void world_to_body(const double q[4], const double v[3], double out[3])
+     out[2] = t[3];
+ }
+ 
+-static void integrate(ICM45686State *s, double dt)
++static void integrate(ICM45686Core *s, double dt)
+ {
+     double w[3], n = 0;
+     for (int i = 0; i < 3; i++) {
+@@ -141,7 +168,7 @@ static void put20(uint8_t *hi, uint8_t *nib, bool high_nibble, double v)
+     *nib = high_nibble ? (*nib & 0x0F) | (x & 0xF) << 4 : (*nib & 0xF0) | (x & 0xF);
+ }
+ 
+-static void push_frame(ICM45686State *s)
++static void push_frame(ICM45686Core *s)
+ {
+     if (s->fifo_frames == FIFO_FRAMES) {             /* Stream mode: drop the oldest */
+         s->fifo_head = (s->fifo_head + 1) % FIFO_FRAMES;
+@@ -173,7 +200,7 @@ static void push_frame(ICM45686State *s)
+     s->fifo_frames++;
+ }
+ 
+-static bool streaming(ICM45686State *s)
++static bool streaming(ICM45686Core *s)
+ {
+     return (s->reg[REG_FIFO_CONFIG3] & 0x07) == 0x07 &&      /* FIFO, accel, gyro in it */
+            (s->reg[REG_PWR_MGMT0] & 0x0F) != 0 &&
+@@ -181,7 +208,7 @@ static bool streaming(ICM45686State *s)
+ }
+ 
+ /* Frames up to now; the attitude moves on whether or not they're kept */
+-static void catch_up(ICM45686State *s)
++static void catch_up(ICM45686Core *s)
+ {
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+     if (!s->next_frame_ns) {
+@@ -203,7 +230,7 @@ static void catch_up(ICM45686State *s)
+     }
+ }
+ 
+-static uint8_t fifo_read_byte(ICM45686State *s)
++static uint8_t fifo_read_byte(ICM45686Core *s)
+ {
+     if (!s->fifo_frames) {
+         return 0xFF;
+@@ -213,11 +240,12 @@ static uint8_t fifo_read_byte(ICM45686State *s)
+         s->fifo_byte = 0;
+         s->fifo_head = (s->fifo_head + 1) % FIFO_FRAMES;
+         s->fifo_frames--;
++        s->frames_read++;
+     }
+     return b;
+ }
+ 
+-static void soft_reset(ICM45686State *s)
++static void soft_reset(ICM45686Core *s)
+ {
+     memset(s->reg, 0, sizeof(s->reg));
+     memset(s->ireg, 0, sizeof(s->ireg));
+@@ -226,7 +254,7 @@ static void soft_reset(ICM45686State *s)
+     s->reg[REG_WHO_AM_I] = WHO_AM_I_VALUE;
+ }
+ 
+-static uint8_t read_byte(ICM45686State *s, uint8_t a)
++static uint8_t read_byte(ICM45686Core *s, uint8_t a)
+ {
+     switch (a) {
+     case REG_FIFO_COUNT:
+@@ -248,7 +276,7 @@ static uint8_t read_byte(ICM45686State *s, uint8_t a)
+     return s->reg[a & 0x7F];
+ }
+ 
+-static void write_byte(ICM45686State *s, uint8_t a, uint8_t b)
++static void write_byte(ICM45686Core *s, uint8_t a, uint8_t b)
+ {
+     catch_up(s);                                     /* Frames so far, as configured so far */
+     switch (a) {
+@@ -294,7 +322,7 @@ static int icm_send(I2CSlave *i2c, uint8_t b)
+         s->addr_next = false;
+         return 0;
+     }
+-    write_byte(s, s->ptr, b);
++    write_byte(&s->c, s->ptr, b);
+     if (s->ptr != REG_IREG_DATA) {
+         s->ptr = (s->ptr + 1) & 0x7F;
+     }
+@@ -304,18 +332,16 @@ static int icm_send(I2CSlave *i2c, uint8_t b)
+ static uint8_t icm_recv(I2CSlave *i2c)
+ {
+     ICM45686State *s = ICM45686(i2c);
+-    uint8_t v = read_byte(s, s->ptr);
++    uint8_t v = read_byte(&s->c, s->ptr);
+     if (s->ptr != REG_FIFO_DATA && s->ptr != REG_IREG_DATA) {
+         s->ptr = (s->ptr + 1) & 0x7F;
+     }
+     return v;
+ }
+ 
+-static void icm_reset(DeviceState *dev)
++static void core_reset(ICM45686Core *s)
+ {
+-    ICM45686State *s = ICM45686(dev);
+     soft_reset(s);
+-    s->ptr = 0;
+     /* Its clock runs from power-up: a FIFO fills from when it's enabled, read or not */
+     s->next_frame_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + FRAME_NS;
+     s->frame_count = 0;
+@@ -323,6 +349,21 @@ static void icm_reset(DeviceState *dev)
+     s->q[1] = s->q[2] = s->q[3] = 0;
+ }
+ 
++static void icm_reset(DeviceState *dev)
++{
++    ICM45686State *s = ICM45686(dev);
++    core_reset(&s->c);
++    s->ptr = 0;
++}
++
++static ICM45686Core *core_of(Object *obj)
++{
++    if (object_dynamic_cast(obj, TYPE_ICM45686_SPI)) {
++        return &ICM45686_SPI(obj)->c;
++    }
++    return &ICM45686(obj)->c;
++}
++
+ static void get_i32(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
+ {
+     visit_type_int32(v, name, (int32_t *)opaque, errp);
+@@ -330,10 +371,9 @@ static void get_i32(Object *obj, Visitor *v, const char *name, void *opaque, Err
+ 
+ static void set_i32(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
+ {
+-    ICM45686State *s = ICM45686(obj);
+     int32_t value;
+     if (visit_type_int32(v, name, &value, errp)) {
+-        catch_up(s);                    /* The old rate up to now, the new one from now */
++        catch_up(core_of(obj));                    /* The old rate up to now, the new one from now */
+         *(int32_t *)opaque = value;
+     }
+ }
+@@ -341,7 +381,7 @@ static void set_i32(Object *obj, Visitor *v, const char *name, void *opaque, Err
+ /* The attitude, a quaternion's component (w, x, y, z), in millionths: read-only */
+ static void get_attitude(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
+ {
+-    ICM45686State *s = ICM45686(obj);
++    ICM45686Core *s = core_of(obj);
+     catch_up(s);
+     int32_t value = (int32_t)lround(s->q[(intptr_t)opaque] * 1e6);
+     visit_type_int32(v, name, &value, errp);
+@@ -350,15 +390,19 @@ static void get_attitude(Object *obj, Visitor *v, const char *name, void *opaque
+ /* Frames waiting in the FIFO: read-only */
+ static void get_fifo_frames(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
+ {
+-    ICM45686State *s = ICM45686(obj);
++    ICM45686Core *s = core_of(obj);
+     catch_up(s);
+     uint32_t value = s->fifo_frames;
+     visit_type_uint32(v, name, &value, errp);
+ }
+ 
+-static void icm_init(Object *obj)
++static void get_u32(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
++{
++    visit_type_uint32(v, name, (uint32_t *)opaque, errp);
++}
++
++static void core_init(Object *obj, ICM45686Core *s)
+ {
+-    ICM45686State *s = ICM45686(obj);
+     static const char *const axes[3] = { "gyro-x", "gyro-y", "gyro-z" };
+     for (int i = 0; i < 3; i++) {
+         object_property_add(obj, axes[i], "int32", get_i32, set_i32, NULL, &s->gyro_mdps[i]);
+@@ -370,8 +414,98 @@ static void icm_init(Object *obj)
+         object_property_add(obj, att[i], "int32", get_attitude, NULL, NULL, (void *)i);
+     }
+     object_property_add(obj, "fifo-frames", "uint32", get_fifo_frames, NULL, NULL, NULL);
++    object_property_add(obj, "frames-read", "uint32", get_u32, NULL, NULL, &s->frames_read);
++}
++
++static void icm_init(Object *obj)
++{
++    core_init(obj, &ICM45686(obj)->c);
++}
++
++/* SPI: how many icm45686-spi have their chip select asserted, machine-wide */
++static int spi_selected;
++
++static uint32_t icm_spi_transfer(SSIPeripheral *dev, uint32_t val)
++{
++    ICM45686SPIState *s = ICM45686_SPI(dev);
++    uint8_t out = 0;
++
++    if (spi_selected > 1) {
++        s->fights++;
++    }
++    if (s->first) {
++        s->first = false;
++        s->reading = val & 0x80;
++        s->ptr = val & 0x7F;
++        return 0;
++    }
++    if (s->reading) {
++        out = read_byte(&s->c, s->ptr);
++        if (s->ptr != REG_FIFO_DATA && s->ptr != REG_IREG_DATA) {
++            s->ptr = (s->ptr + 1) & 0x7F;
++        }
++    } else {
++        write_byte(&s->c, s->ptr, val);
++        if (s->ptr != REG_IREG_DATA) {
++            s->ptr = (s->ptr + 1) & 0x7F;
++        }
++    }
++    return out;
+ }
+ 
++static int icm_spi_set_cs(SSIPeripheral *dev, bool level)
++{
++    ICM45686SPIState *s = ICM45686_SPI(dev);
++    bool sel = !level;
++
++    if (sel != s->selected) {
++        spi_selected += sel ? 1 : -1;
++        s->selected = sel;
++    }
++    if (sel) {
++        s->first = true;
++    }
++    return 0;
++}
++
++static void icm_spi_realize(SSIPeripheral *dev, Error **errp)
++{
++}
++
++static void icm_spi_reset(DeviceState *dev)
++{
++    ICM45686SPIState *s = ICM45686_SPI(dev);
++    core_reset(&s->c);
++    s->first = true;
++}
++
++static void icm_spi_init(Object *obj)
++{
++    ICM45686SPIState *s = ICM45686_SPI(obj);
++    core_init(obj, &s->c);
++    object_property_add(obj, "fights", "uint32", get_u32, NULL, NULL, &s->fights);
++}
++
++static void icm_spi_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    SSIPeripheralClass *k = SSI_PERIPHERAL_CLASS(klass);
++
++    k->realize = icm_spi_realize;
++    k->transfer = icm_spi_transfer;
++    k->set_cs = icm_spi_set_cs;
++    k->cs_polarity = SSI_CS_LOW;
++    device_class_set_legacy_reset(dc, icm_spi_reset);
++}
++
++static const TypeInfo icm_spi_info = {
++    .name = TYPE_ICM45686_SPI,
++    .parent = TYPE_SSI_PERIPHERAL,
++    .instance_size = sizeof(ICM45686SPIState),
++    .instance_init = icm_spi_init,
++    .class_init = icm_spi_class_init,
++};
++
+ static void icm_class_init(ObjectClass *klass, void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -394,6 +528,7 @@ static const TypeInfo icm_info = {
+ static void icm_register_types(void)
+ {
+     type_register_static(&icm_info);
++    type_register_static(&icm_spi_info);
+ }
+ 
+ type_init(icm_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 0c56efe..929437b 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -355,4 +355,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
+ system_ss.add(when: 'CONFIG_SX126X', if_true: files('sx126x.c'))
+ system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('power_domain.c', 'bus_noise.c', 'pin_glitch.c'))
+-system_ss.add(when: 'CONFIG_ESP_BOARD_PERIPHERALS', if_true: files('icm45686.c'))
++system_ss.add(when: 'CONFIG_ESP_BOARD_PERIPHERALS', if_true: files('icm45686.c', 'i2spi_chain.c'))
+diff --git a/tests/qtest/esp32s3-i2spi-test.c b/tests/qtest/esp32s3-i2spi-test.c
+new file mode 100644
+index 0000000..390b46f
+--- /dev/null
++++ b/tests/qtest/esp32s3-i2spi-test.c
+@@ -0,0 +1,341 @@
++/*
++ * QTest: an I2SPI chain (i2spi-chain) selecting ICM-45686s (icm45686-spi) on GP-SPI2, as
++ * SlimeVR's docs/I2SPI.md describes it: frames, identity reads, sensor power, one-hot
++ * arming, the strobe and software chip selects; and icm45686-spi's registers and FIFO.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "libqtest.h"
++#include "qapi/qmp/qdict.h"
++#include "qemu/bitops.h"
++
++#define SPI2            0x60024000
++#define SPI_CMD         (SPI2 + 0x00)
++#define SPI_CLOCK       (SPI2 + 0x0C)
++#define SPI_USER        (SPI2 + 0x10)
++#define SPI_MS_DLEN     (SPI2 + 0x1C)
++#define SPI_MISC        (SPI2 + 0x20)
++#define SPI_INT_CLR     (SPI2 + 0x38)
++#define SPI_INT_RAW     (SPI2 + 0x3C)
++#define SPI_W0          (SPI2 + 0x98)
++#define SPI_CLK_GATE    (SPI2 + 0xE8)
++
++#define I2C0            0x60013000
++#define I2C_SCL_LOW     (I2C0 + 0x00)
++#define I2C_CTR         (I2C0 + 0x04)
++#define I2C_FIFO_CONF   (I2C0 + 0x18)
++#define I2C_DATA        (I2C0 + 0x1C)
++#define I2C_INT_RAW     (I2C0 + 0x20)
++#define I2C_INT_CLR     (I2C0 + 0x24)
++#define I2C_SCL_HIGH    (I2C0 + 0x38)
++#define I2C_CLK_CONF    (I2C0 + 0x54)
++#define I2C_COMD(n)     (I2C0 + 0x58 + 4 * (n))
++#define CMD(op, n, ack_check, ack_val) ((op) << 11 | (ack_val) << 10 | (ack_check) << 8 | (n))
++#define INT_TRANS_COMPLETE  BIT(7)
++#define INT_NACK            BIT(10)
++
++#define GPIO            0x60004000
++#define OUT_W1TS        (GPIO + 0x08)
++#define OUT_W1TC        (GPIO + 0x0C)
++#define ENABLE_W1TS     (GPIO + 0x24)
++
++#define PIN_STROBE      10
++#define PIN_DIRECT_CS   7
++#define CHAIN           0x13
++
++enum { ARM = 0x01, DISARM_ALL = 0x02, POWER_ALL = 0x03, SET_CS = 0x10, SET_MODE = 0x11,
++       SET_SENSOR_POWER = 0x12, SET_SENSOR_RESET = 0x13, IDENTIFY = 0x20, RESET_ALL = 0x7f };
++
++#define WHO_AM_I        0x72
++
++/* Node 1: two channels (imu1, imu2); node 2: one (imu3); imu4 on a host pin */
++#define DEVICES \
++    "-device icm45686-spi,bus=spi2,cs=10,id=imu1 " \
++    "-device icm45686-spi,bus=spi2,cs=11,id=imu2 " \
++    "-device icm45686-spi,bus=spi2,cs=12,id=imu3,gyro-z=90000 " \
++    "-device icm45686-spi,bus=spi2,cs=13,id=imu4 " \
++    "-device esp32s3.pin-link,pin=7,dev=imu4,line=ssi-gpio-cs,pull=up " \
++    "-device i2spi-chain,bus=i2c0,address=0x13,id=chain,%s" \
++    "links=0x10=imu1:0x11=imu2:0x20=imu3 " \
++    "-device esp32s3.pin-link,pin=10,dev=chain,line=strobe,pull=up "
++
++static QTestState *board(const char *chain_opts)
++{
++    g_autofree char *devices = g_strdup_printf(DEVICES, chain_opts);
++    g_autofree char *args = g_strdup_printf("-machine esp32s3 %s", devices);
++    QTestState *qts = qtest_init(args);
++
++    qtest_writel(qts, I2C_CLK_CONF, BIT(21));
++    qtest_writel(qts, I2C_SCL_LOW, 49);
++    qtest_writel(qts, I2C_SCL_HIGH, 49);
++    qtest_writel(qts, I2C_CTR, BIT(4) | BIT(11));
++
++    qtest_writel(qts, SPI_CLK_GATE, 0x7);
++    qtest_writel(qts, SPI_CLOCK, BIT(31));
++    qtest_writel(qts, SPI_MISC, 0x3F);              /* No hardware CS: GPIOs */
++    qtest_writel(qts, SPI_USER, BIT(0) | BIT(27) | BIT(28));
++    qtest_writel(qts, OUT_W1TS, BIT(PIN_STROBE) | BIT(PIN_DIRECT_CS));
++    qtest_writel(qts, ENABLE_W1TS, BIT(PIN_STROBE) | BIT(PIN_DIRECT_CS));
++    return qts;
++}
++
++static bool i2c_xfer(QTestState *qts, const uint8_t *w, int wn, uint8_t *r, int rn)
++{
++    int c = 0;
++    qtest_writel(qts, I2C_FIFO_CONF, BIT(12) | BIT(13));
++    qtest_writel(qts, I2C_FIFO_CONF, 0);
++    qtest_writel(qts, I2C_COMD(c++), CMD(6, 0, 0, 0));
++    if (wn) {
++        qtest_writel(qts, I2C_DATA, CHAIN << 1);
++        for (int i = 0; i < wn; i++) {
++            qtest_writel(qts, I2C_DATA, w[i]);
++        }
++        qtest_writel(qts, I2C_COMD(c++), CMD(1, 1 + wn, 1, 0));
++    } else {
++        qtest_writel(qts, I2C_DATA, CHAIN << 1 | 1);
++        qtest_writel(qts, I2C_COMD(c++), CMD(1, 1, 1, 0));
++        if (rn > 1) {
++            qtest_writel(qts, I2C_COMD(c++), CMD(3, rn - 1, 0, 0));
++        }
++        qtest_writel(qts, I2C_COMD(c++), CMD(3, 1, 0, 1));
++    }
++    qtest_writel(qts, I2C_COMD(c++), CMD(2, 0, 0, 0));
++    qtest_writel(qts, I2C_INT_CLR, 0x3FFFF);
++    qtest_writel(qts, I2C_CTR, BIT(4) | BIT(5));
++    qtest_clock_step(qts, 1000 * 1000);
++    uint32_t raw = qtest_readl(qts, I2C_INT_RAW);
++    for (int i = 0; i < rn; i++) {
++        r[i] = qtest_readl(qts, I2C_DATA);
++    }
++    return (raw & INT_TRANS_COMPLETE) && !(raw & INT_NACK);
++}
++
++static bool frame(QTestState *qts, uint8_t op, uint8_t target, uint8_t value)
++{
++    uint8_t f[3] = { op, target, value };
++    return i2c_xfer(qts, f, 3, NULL, 0);
++}
++
++static void identify(QTestState *qts, uint8_t node, uint8_t *id)
++{
++    g_assert_true(frame(qts, IDENTIFY, node << 4, 0));
++    g_assert_true(i2c_xfer(qts, NULL, 0, id, 4));
++}
++
++static void pin(QTestState *qts, int n, int level)
++{
++    qtest_writel(qts, level ? OUT_W1TS : OUT_W1TC, BIT(n));
++}
++
++static void spi(QTestState *qts, const uint8_t *tx, uint8_t *rx, size_t n)
++{
++    uint32_t w[16] = { 0 };
++    g_assert_cmpuint(n, <=, 64);
++    memcpy(w, tx, n);
++    for (int i = 0; i < 16; i++) {
++        qtest_writel(qts, SPI_W0 + 4 * i, w[i]);
++    }
++    qtest_writel(qts, SPI_MS_DLEN, n * 8 - 1);
++    qtest_writel(qts, SPI_INT_CLR, BIT(12));
++    qtest_writel(qts, SPI_CMD, BIT(24));
++    qtest_clock_step(qts, 100000);
++    for (int i = 0; i < 16; i++) {
++        w[i] = qtest_readl(qts, SPI_W0 + 4 * i);
++    }
++    memcpy(rx, w, n);
++}
++
++/* A register read framed by a chip-select pin (the strobe, or a host pin) */
++static uint8_t read_reg(QTestState *qts, int cs_pin, uint8_t reg)
++{
++    uint8_t tx[2] = { reg | 0x80, 0 }, rx[2];
++    if (cs_pin >= 0) {
++        pin(qts, cs_pin, 0);
++    }
++    spi(qts, tx, rx, 2);
++    if (cs_pin >= 0) {
++        pin(qts, cs_pin, 1);
++    }
++    return rx[1];
++}
++
++static void write_reg(QTestState *qts, int cs_pin, uint8_t reg, uint8_t v)
++{
++    uint8_t tx[2] = { reg, v }, rx[2];
++    pin(qts, cs_pin, 0);
++    spi(qts, tx, rx, 2);
++    pin(qts, cs_pin, 1);
++}
++
++static uint32_t qom_u32(QTestState *qts, const char *dev, const char *prop)
++{
++    g_autofree char *path = g_strdup_printf("/machine/peripheral/%s", dev);
++    QDict *r = qtest_qmp(qts, "{'execute': 'qom-get', 'arguments': {'path': %s, "
++                              "'property': %s}}", path, prop);
++    g_assert(qdict_haskey(r, "return"));
++    uint32_t v = qdict_get_int(r, "return");
++    qobject_unref(r);
++    return v;
++}
++
++static void test_identity(void)
++{
++    QTestState *qts = board("nodes=1:2/2,");
++    uint8_t id[4];
++
++    identify(qts, 1, id);
++    g_assert_cmphex(id[0], ==, 0x5c);
++    g_assert_cmphex(id[1], ==, 0x03);
++    g_assert_cmphex(id[2], ==, 1);
++    g_assert_cmphex(id[3], ==, 0x02);           /* Strobe mode; unarmed, unpowered */
++
++    identify(qts, 2, id);
++    g_assert_cmphex(id[2], ==, 2);
++
++    identify(qts, 5, id);                       /* Absent: nobody drives SDA */
++    g_assert_cmphex(id[0], ==, 0xff);
++
++    g_assert_true(frame(qts, SET_SENSOR_POWER, 0x10, 1));
++    g_assert_true(frame(qts, ARM, 0x11, 0));
++    identify(qts, 1, id);
++    g_assert_cmphex(id[3], ==, 0x02 | 0x01 | 0x04);
++    g_assert_cmpuint(qom_u32(qts, "chain", "armed"), ==, 0x11);
++    g_assert_cmpuint(qom_u32(qts, "chain", "powered"), ==, BIT(1));
++    qtest_quit(qts);
++}
++
++static void test_power_and_one_hot(void)
++{
++    QTestState *qts = board("nodes=1:2/2,");
++
++    /* Armed but unpowered: the IMU is not there */
++    g_assert_true(frame(qts, ARM, 0x10, 0));
++    g_assert_cmphex(read_reg(qts, PIN_STROBE, WHO_AM_I), ==, 0x00);
++
++    g_assert_true(frame(qts, POWER_ALL, 0, 1));
++    g_assert_cmphex(read_reg(qts, PIN_STROBE, WHO_AM_I), ==, 0xe9);
++
++    /* The strobe idles high: armed is not asserted */
++    g_assert_cmphex(read_reg(qts, -1, WHO_AM_I), ==, 0x00);
++
++    /* Arming another channel or node moves the one chip select; nothing doubles up */
++    for (int t = 0; t < 3; t++) {
++        uint8_t target = (uint8_t[]){ 0x11, 0x20, 0x10 }[t];
++        g_assert_true(frame(qts, ARM, target, 0));
++        g_assert_cmphex(read_reg(qts, PIN_STROBE, WHO_AM_I), ==, 0xe9);
++    }
++    /* With a host pin's IMU too: two chip selects at once is a fight, and is seen */
++    pin(qts, PIN_DIRECT_CS, 0);
++    read_reg(qts, PIN_STROBE, WHO_AM_I);
++    pin(qts, PIN_DIRECT_CS, 1);
++    g_assert_cmpuint(qom_u32(qts, "imu1", "fights"), >, 0);
++    g_assert_cmpuint(qom_u32(qts, "imu2", "fights"), ==, 0);
++    g_assert_cmpuint(qom_u32(qts, "chain", "fights"), ==, 0);
++
++    /* Arming a channel a node doesn't have, or node 0, disarms it */
++    g_assert_true(frame(qts, ARM, 0x25, 0));
++    g_assert_cmphex(read_reg(qts, PIN_STROBE, WHO_AM_I), ==, 0x00);
++    g_assert_true(frame(qts, ARM, 0x00, 0));
++    g_assert_cmpuint(qom_u32(qts, "chain", "armed"), ==, 0);
++
++    /* Power-off forgets: power back on and the IMU is at reset again */
++    g_assert_true(frame(qts, ARM, 0x10, 0));
++    write_reg(qts, PIN_STROBE, 0x21, 0x0f);
++    g_assert_cmphex(read_reg(qts, PIN_STROBE, 0x21), ==, 0x0f);
++    g_assert_true(frame(qts, SET_SENSOR_RESET, 0x10, 1));
++    g_assert_true(frame(qts, SET_SENSOR_RESET, 0x10, 0));
++    g_assert_cmphex(read_reg(qts, PIN_STROBE, 0x21), ==, 0x00);
++    qtest_quit(qts);
++}
++
++static void test_software_cs(void)
++{
++    QTestState *qts = board("nodes=1:2/2,");
++
++    g_assert_true(frame(qts, POWER_ALL, 0, 1));
++    g_assert_true(frame(qts, SET_MODE, 0x20, 0));
++    g_assert_true(frame(qts, ARM, 0x20, 0));
++    g_assert_cmphex(read_reg(qts, -1, WHO_AM_I), ==, 0x00);      /* Released */
++    g_assert_true(frame(qts, SET_CS, 0x20, 0));
++    g_assert_cmphex(read_reg(qts, -1, WHO_AM_I), ==, 0xe9);      /* No strobe needed */
++    g_assert_true(frame(qts, SET_CS, 0x20, 1));
++    g_assert_cmphex(read_reg(qts, -1, WHO_AM_I), ==, 0x00);
++
++    /* SET_CS for a channel that isn't armed does nothing */
++    g_assert_true(frame(qts, SET_CS, 0x10, 0));
++    g_assert_cmphex(read_reg(qts, -1, WHO_AM_I), ==, 0x00);
++    qtest_quit(qts);
++}
++
++static void test_bad_frames(void)
++{
++    QTestState *qts = board("nodes=1,");
++    uint8_t four[4] = { ARM, 0x10, 0, 0 }, two[2] = { ARM, 0x10 };
++
++    g_assert_true(frame(qts, POWER_ALL, 0, 1));
++    g_assert_true(i2c_xfer(qts, four, 4, NULL, 0));
++    g_assert_true(i2c_xfer(qts, two, 2, NULL, 0));
++    g_assert_true(frame(qts, 0x55, 0x10, 0));                   /* Unknown opcode */
++    g_assert_cmpuint(qom_u32(qts, "chain", "armed"), ==, 0);
++    g_assert_cmphex(read_reg(qts, PIN_STROBE, WHO_AM_I), ==, 0x00);
++    qtest_quit(qts);
++}
++
++static void test_no_nodes_and_misflash(void)
++{
++    QTestState *qts = board("");
++    g_assert_false(frame(qts, DISARM_ALL, 0, 0));               /* An empty cable NACKs */
++    qtest_quit(qts);
++
++    uint8_t id[4];
++    qts = board("nodes=1/2,misflash=2=5,version=2,");
++    identify(qts, 2, id);
++    g_assert_cmphex(id[1], ==, 2);
++    g_assert_cmphex(id[2], ==, 5);
++    qtest_quit(qts);
++}
++
++static void test_fifo(void)
++{
++    QTestState *qts = board("nodes=1:2/2,");
++    uint8_t tx[1 + 20 * 2] = { 0x14 | 0x80 }, rx[sizeof(tx)];
++
++    g_assert_true(frame(qts, POWER_ALL, 0, 1));
++    g_assert_true(frame(qts, ARM, 0x20, 0));                    /* imu3: gyro-z 90 dps */
++    write_reg(qts, PIN_STROBE, 0x10, 0x0f);                     /* PWR_MGMT0 */
++    write_reg(qts, PIN_STROBE, 0x1d, 0x5f);                     /* FIFO_CONFIG0: stream */
++    write_reg(qts, PIN_STROBE, 0x21, 0x0f);                     /* FIFO_CONFIG3 */
++    qtest_clock_step(qts, 100 * 1000 * 1000);                   /* 100 ms: ~20 packets */
++    uint16_t count = read_reg(qts, PIN_STROBE, 0x12);
++    count |= read_reg(qts, PIN_STROBE, 0x13) << 8;
++    g_assert_cmpuint(count, >=, 19);
++    g_assert_cmpuint(count, <=, 22);
++
++    pin(qts, PIN_STROBE, 0);
++    spi(qts, tx, rx, sizeof(tx));
++    pin(qts, PIN_STROBE, 1);
++    const uint8_t *p = rx + 1;
++    g_assert_cmphex(p[0] & 0x60, ==, 0x60);                     /* Accel and gyro */
++    g_assert_cmphex(p[20] & 0x60, ==, 0x20);                    /* Gyro only */
++    int16_t az = p[5] | p[6] << 8, gz = p[11] | p[12] << 8;
++    int32_t az20 = az * 16 | p[19] >> 4, gz20 = gz * 16 | (p[19] & 0xf);
++    g_assert_cmpint(az20, ==, 16384);                           /* 1 g */
++    g_assert_cmpint(gz20, >=, 11796 - 1);                       /* 90 dps at 131.072 */
++    g_assert_cmpint(gz20, <=, 11796 + 1);
++    g_assert_cmpuint(qom_u32(qts, "imu3", "frames-read"), ==, 2);
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/i2spi/identity", test_identity);
++    qtest_add_func("/esp32s3/i2spi/power-and-one-hot", test_power_and_one_hot);
++    qtest_add_func("/esp32s3/i2spi/software-cs", test_software_cs);
++    qtest_add_func("/esp32s3/i2spi/bad-frames", test_bad_frames);
++    qtest_add_func("/esp32s3/i2spi/no-nodes-and-misflash", test_no_nodes_and_misflash);
++    qtest_add_func("/esp32s3/i2spi/fifo", test_fifo);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 5e372c1..79c5938 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test', 'esp32s3-wifi-test', 'esp32s3-rmt-test', 'esp32s3-mmu-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test', 'esp32s3-wifi-test', 'esp32s3-rmt-test', 'esp32s3-mmu-test', 'esp32s3-i2spi-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+
