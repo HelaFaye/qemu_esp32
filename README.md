@@ -43,6 +43,7 @@ Or your own design: `boot("kicad:my-board.kicad_pcb", "flash.bin", "/tmp/run")`.
 | [Boards](docs/boards.md) | What's emulated; describing a board (in Python, on the command line, or from KiCad); the boards here |
 | [Testing](docs/testing.md) | Real firmware as test cases, the device tests, CI |
 | [Stress testing](docs/stress-testing.md) | Radio environments, bus noise, brown-outs, power domains, fault injection: what exists and what's planned |
+| [Plan](docs/plan.md) | What comes next: gbagate's boards, SlimeVR, ESP-SDR (the radio as a software-defined radio, for gbagate's GBA Wireless Adapter path), a shared 2.4 GHz air |
 | [Devices and patches](patches/espressif-qemu/README.md) | Each patch, each device, its properties and lines |
 
 Next to the code: [`firmware/`](firmware/README.md) (the test cases),
