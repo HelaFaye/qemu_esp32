@@ -506,12 +506,13 @@ def _wifi_args(wifi):
     return args
 
 
-def boot(board, flash, workdir, name="node", hci=None, uart1=None, uart2=None, wifi=None,
-         no_reboot=False, extra=(), **opts):
+def boot(board, flash, workdir, name="node", hci=None, uart1=None, uart2=None, usb=None,
+         wifi=None, no_reboot=False, extra=(), **opts):
     """Boot flash (a merged image) on a board. UART0 goes to <workdir>/<name>.log, the
     USB serial (plugged in) to <name>-usb.log. UART1 and UART2: uart1=/uart2= a TCP port
     QEMU listens on, for a test to connect to (Node.uart(n)); or hci: a TCP port UART1
-    connects to (a virtual Bluetooth controller); else nothing on them. TCP serial ports
+    connects to (a virtual Bluetooth controller); else nothing on them. usb=: the USB
+    serial on a TCP port instead of its log (Node.uart("usb")). TCP serial ports
     are nodelay: a protocol's few bytes each way would otherwise wait 25-50 ms each on
     Nagle and delayed ACKs. wifi: an access point for the S3's Wi-Fi (_wifi_args); its
     network is QEMU's user-mode one (DHCP; the host is 10.0.2.2). no_reboot: a reset
@@ -537,7 +538,7 @@ def boot(board, flash, workdir, name="node", hci=None, uart1=None, uart2=None, w
             "-serial", "file:" + log,
             "-serial", _uart_arg(uart1, hci),
             "-serial", _uart_arg(uart2),
-            "-serial", "file:" + log[:-4] + "-usb.log"]
+            "-serial", _uart_arg(usb) if usb else "file:" + log[:-4] + "-usb.log"]
     qmp = log[:-4] + "-qmp.sock"
     if len(qmp.encode()) >= 100:                   # Unix socket paths: under 108 bytes
         import tempfile
@@ -550,7 +551,7 @@ def boot(board, flash, workdir, name="node", hci=None, uart1=None, uart2=None, w
     args += devices + list(extra)                  # e.g. ["-gdb", "tcp::1234"]
     with open(os.path.join(workdir, name + "-qemu.txt"), "w") as f:
         f.write(" ".join(args) + "\n")
-    node_ports = {1: uart1, 2: uart2}
+    node_ports = {1: uart1, 2: uart2, "usb": usb}
     proc = subprocess.Popen(args, stdout=open(os.path.join(workdir, name + "-qemu.log"), "w"),
                             stderr=subprocess.STDOUT)
     node = Node(name, proc, log, qmp)
