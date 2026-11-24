@@ -1,4 +1,4 @@
-From d92db31fa94c7986d0a9c5a8bd793d776053a52d Mon Sep 17 00:00:00 2001
+From 8d5ec4c394cf10b9b692f71c4f00fbb02c83f140 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 23 Nov 2026 10:02:54 +0000
 Subject: [PATCH] icm45686-spi and i2spi-chain: SlimeVR's IMUs on I2SPI chains
@@ -868,10 +868,10 @@ index 68fe9c5..2c00ba0 100644
  
  type_init(icm_register_types)
 diff --git a/hw/misc/meson.build b/hw/misc/meson.build
-index 0c56efe..929437b 100644
+index 9214f88..e46019c 100644
 --- a/hw/misc/meson.build
 +++ b/hw/misc/meson.build
-@@ -355,4 +355,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+@@ -356,4 +356,4 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
  system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
  system_ss.add(when: 'CONFIG_SX126X', if_true: files('sx126x.c'))
  system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files('power_domain.c', 'bus_noise.c', 'pin_glitch.c'))
@@ -1225,15 +1225,15 @@ index 0000000..390b46f
 +    return g_test_run();
 +}
 diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
-index 5e372c1..79c5938 100644
+index 9125b8d..aef1659 100644
 --- a/tests/qtest/meson.build
 +++ b/tests/qtest/meson.build
 @@ -275,7 +275,7 @@ qtests_riscv32 = \
  qtests_xtensa = \
    (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
    (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
--  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test', 'esp32s3-wifi-test', 'esp32s3-rmt-test', 'esp32s3-mmu-test'] : []) + \
-+  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test', 'esp32s3-wifi-test', 'esp32s3-rmt-test', 'esp32s3-mmu-test', 'esp32s3-i2spi-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test', 'esp32s3-wifi-test', 'esp32s3-rmt-test', 'esp32s3-mmu-test', 'esp32s3-sdr-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test', 'esp32s3-wifi-test', 'esp32s3-rmt-test', 'esp32s3-mmu-test', 'esp32s3-sdr-test', 'esp32s3-i2spi-test'] : []) + \
    (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
  
  qtests_riscv64 = \

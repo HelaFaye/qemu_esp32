@@ -23,6 +23,7 @@ patched tree, `tests/qtest/`:
 | `esp32s3-wifi-test` | The Wi-Fi MAC and access point: a beacon received, the receive registers ESP-IDF follows, a reload, a probe answered, nothing off channel; malformed input: transmit lengths from 0 to 4095, an SSID element too long for its frame, a frame larger than the guest's buffer, short data frames |
 | `esp32s3-rmt-test` | The RMT's transmit side: an LED's three bytes sent and read back, the threshold and end interrupts on a wrapping transmission |
 | `esp32s3-mmu-test` | One flash page at two virtual pages: unmapping one leaves the other readable |
+| `esp32s3-sdr-test` | The dump engine: tuning by the analog I2C master and the hop register, a tone at each rate (its level, its offset, not its image), noise and the gain field, which bank and lanes a capture writes, an AM/Manchester burst read back bit by bit |
 | `esp32s3-i2spi-test` | An I2SPI chain and ICM-45686s: identity reads, sensor power, one-hot arming, the strobe and software chip selects, malformed frames, an empty cable, a mis-flashed node, a two-select fight seen; the FIFO's packets |
 | `esp32s3-lcd-cam-test` | LCD_CAM: an ST7789 on its parallel bus, commands and pixels by GDMA, byte order, the done interrupt; the glass read back exactly |
 
@@ -31,7 +32,7 @@ cd ~/esp-qemu/build
 for t in esp32s3-intmatrix-test esp32s3-gpio-test esp32s3-gpspi-test esp32s3-spi-devices-test \
          esp32s3-i2c-test esp32s3-i2c-devices-test esp32s3-sx1262-test \
          esp32s3-usb-serial-jtag-test esp32s3-brownout-test esp32s3-phy-test \
-         esp32s3-lcd-cam-test esp32s3-wifi-test esp32s3-rmt-test esp32s3-mmu-test \
+         esp32s3-lcd-cam-test esp32s3-wifi-test esp32s3-rmt-test esp32s3-mmu-test esp32s3-sdr-test \
          esp32s3-i2spi-test; do
   ninja tests/qtest/$t && QTEST_QEMU_BINARY=./qemu-system-xtensa ./tests/qtest/$t
 done
@@ -92,7 +93,7 @@ What the test cases have found, so far (each fixed, with a qtest that reproduces
   It also found three bugs in the tracker itself, fixed there: a boot loop from linking
   the legacy I2C driver beside Arduino 3.x's Wire, a background I2C scan that never
   worked, and built-in Wi-Fi credentials that were never tried.
-- With its IMUs on I2SPI chains (0028), the tracker found a bug of its own: a chain with
+- With its IMUs on I2SPI chains (0029), the tracker found a bug of its own: a chain with
   no strobe conductor (software chip selects) never told its nodes to leave strobe mode,
   so the nodes dropped every SET_CS and every sensor on the chain read as absent. Fixed
   in the tracker, with a scenario in its host simulation, which had never run a chain
@@ -109,6 +110,24 @@ What the test cases have found, so far (each fixed, with a qtest that reproduces
 And the stress demos, each against a small target firmware of its own
 ([`faults/`](../faults/README.md)): a glitch campaign on a PIN check, power cuts during
 NVS writes, ESP-IDF's I2C driver through bus noise.
+
+## Testing your own firmware
+
+A firmware repository that wants these tests keeps them itself, beside its code, and
+carries qemu_esp32 as a clone: a git submodule (`git submodule add
+https://github.com/HelaFaye/qemu_esp32 qemu_esp32`) or a pinned clone its CI checks out.
+Its checks import `qemu_esp32/firmware/boards.py` and use `patches/espressif-qemu/build.sh`
+for the patched QEMU. A contributor who has a qemu_esp32 checkout of their own (to try a
+QEMU change against the firmware) can replace the clone with a symlink to it, locally:
+
+```sh
+rm -rf qemu_esp32 && ln -s ~/src/qemu_esp32 qemu_esp32
+git update-index --skip-worktree qemu_esp32    # never stage or push the symlink
+```
+
+and undo it with `git update-index --no-skip-worktree qemu_esp32` and a fresh
+`git submodule update`. The test cases under `firmware/` here are for firmware this
+repository doesn't own, or its own minimal apps (`wifi-start`).
 
 ## CI
 

@@ -90,9 +90,9 @@ node.qmp("qom-set", path="/machine/peripheral/ball_click", property="pressed", v
 
 ## The Python API (`firmware/boards.py`)
 
-`boot(board, flash, workdir, name="node", hci=None, wifi=None, no_reboot=False, extra=(), **opts)` starts QEMU and
+`boot(board, flash, workdir, name="node", hci=None, usb=None, wifi=None, no_reboot=False, extra=(), **opts)` starts QEMU and
 returns a `Node`. `board` is a name from `BOARDS` or `"kicad:<design>"`; `opts` go to the
-board (`card=`, `sd=`, `air=`); `uart1=`/`uart2=` put those UARTs on TCP ports, `hci=`
+board (`card=`, `sd=`, `air=`); `uart1=`/`uart2=` put those UARTs on TCP ports, and `usb=` the USB serial (`node.uart("usb")`), `hci=`
 connects UART1 to a Bluetooth controller; `wifi=True` gives the S3 an access point (below);
 `no_reboot=True` makes a reset (a panic, the watchdog, `esp_restart()`) end QEMU, so a
 test sees it at once instead of a second boot; `extra` adds QEMU arguments

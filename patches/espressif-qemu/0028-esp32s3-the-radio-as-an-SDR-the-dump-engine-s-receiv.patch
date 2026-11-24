@@ -1,0 +1,1121 @@
+From c33303e91142aeb762ebacc3a4d01bd8176ec2c8 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Mon, 23 Nov 2026 20:03:21 +0000
+Subject: [PATCH 28/28] esp32s3: the radio as an SDR, the dump engine's receive
+ side
+
+The S3's Wi-Fi MAC has a debug dump engine. It copies the receiver's raw
+baseband samples into a 64 KiB SRAM bank, one word per sample: I, Q
+(negated) and the gain index, 10 bits each for I and Q. ESPARGOS esp-sdr
+and esp-sdr-zephyr use it as a software-defined radio. This model follows
+esp-sdr-zephyr's S3 register reference.
+- DUMP_CTRL, DUMP_WRITE_INDEX and DUMP_CONFIG: a capture of COUNT words at
+  80, 40 or 16 MS/s into the bank SRAM_USAGE_3 hands to the engine. DONE
+  comes once the capture's time on the chip has passed in virtual time.
+- The samples come from a scene: tones, noise, and AM bursts with
+  Manchester data, as gbagate's rfrf_modulate() makes them (the GBA
+  Wireless Adapter's radio). They are heard relative to the LO, within the
+  receiver's band, and clipped at the ADC's 10 bits.
+- Tuning. The analog I2C master's command words now address a register
+  file for the analog blocks: a write sets a register, and a read finds it
+  in bits 23:16. From it the model follows the RF PLL's fractional-N
+  divider (block 0x63) and the LO's 5/6 divider (block 0x65). It also
+  follows the PHY's channel hop (0x6000e150) on Wi-Fi channels.
+- The AGC block (0x6001c000) keeps what the PHY writes, so the largest
+  calibrated gain index reads back (82). A forced index goes into each word.
+
+Properties on /machine/soc/sdr: scene, seed, tuned-khz, pll-khz, captures.
+Not modelled yet: circular captures, transmit (the DAC), the CPU's loss of
+an owned bank, gain, and the front end's readback of a forced gain (so
+esp-sdr's manual gain fails its check; its AGC works).
+
+esp32s3-sdr-test covers tuning, a tone at each rate, noise and the gain
+field, bank and lane rules, and an AM burst read back bit by bit.
+phy-test's "kept" list drops the command word and checks its semantics.
+With ESPARGOS esp-sdr's S3 firmware at 3ab3b65, built with ESP-IDF 5.5:
+SYNC, INFO and LIMITS? answer. FREQ 2437, 2432 and 1900 tune exactly; the
+tones come back at their offsets and levels in CAP20 and CAP16 at all
+three rates.
+---
+ hw/misc/esp32s3_sdr.c          | 613 +++++++++++++++++++++++++++++++++
+ hw/misc/meson.build            |   1 +
+ hw/xtensa/esp32s3.c            |  22 ++
+ include/hw/misc/esp32s3_sdr.h  |  57 +++
+ tests/qtest/esp32s3-phy-test.c |  11 +-
+ tests/qtest/esp32s3-sdr-test.c | 253 ++++++++++++++
+ tests/qtest/meson.build        |   2 +-
+ 7 files changed, 956 insertions(+), 3 deletions(-)
+ create mode 100644 hw/misc/esp32s3_sdr.c
+ create mode 100644 include/hw/misc/esp32s3_sdr.h
+ create mode 100644 tests/qtest/esp32s3-sdr-test.c
+
+diff --git a/hw/misc/esp32s3_sdr.c b/hw/misc/esp32s3_sdr.c
+new file mode 100644
+index 0000000..47c7634
+--- /dev/null
++++ b/hw/misc/esp32s3_sdr.c
+@@ -0,0 +1,613 @@
++/*
++ * ESP32-S3 radio as a software-defined radio: the MAC's debug dump engine (receive)
++ *
++ * The S3's Wi-Fi MAC has a debug "dump engine" that copies the receiver's raw baseband
++ * samples into a 64 KiB SRAM bank, one 32-bit word per sample: I (10-bit signed, bits
++ * 9:0), Q (19:10, negated: RF above the LO shows at negative frequency), the gain
++ * index (27:20). Espressif's factory RF tests use it
++ * (librftest's adctrig()); ESPARGOS esp-sdr and esp-sdr-zephyr turn it into a
++ * software-defined radio. Registers (esp-sdr-zephyr, doc/dev/registers-esp32s3.md):
++ *
++ *   DUMP_CTRL_REG        0x60033d5c  RUN 31, TRIGGER 19 (1 then 0), DONE 18 (RO),
++ *                                    CIRCULAR 17, RATE_16M 16, RATE_40M 15, COUNT 14:0
++ *   DUMP_WRITE_INDEX_REG 0x60033d60  words written (RO)
++ *   DUMP_DAC_TRIG_REG    0x60033d64  transmit: kept, not modelled yet
++ *   DUMP_CONFIG_REG      0x60033d90  four 6-bit lane selectors: 0x000c2040 is receive I/Q
++ *   SRAM_USAGE_3_REG     0x600c101c  bits 3:0, one-hot: bank n (0x3fcb0000 + n * 64 KiB)
++ *                                    belongs to the engine
++ *
++ * A capture (RUN, the count, a rate, then TRIGGER pulsed) writes `count` words into the
++ * owned bank, 80 MS/s (40 with RATE_40M, 16 with RATE_16M), and reads DONE once the
++ * time they take on the chip has passed in virtual time. The samples come from a scene
++ * (the `scene` property, below) as the receiver would see it, tuned where the PHY last
++ * put its LO. The AGC's registers (0x6001c000) keep what the PHY writes, so
++ * AGC_FORCE_REG (0x6001c02c) carries the largest calibrated gain index (14:8) as on
++ * the chip, and a forced index (EN 23, index 31:24) goes into each word.
++ *
++ * Not modelled yet: circular captures (logged), transmit, the CPU's loss of an owned
++ * bank, the gain itself (samples come at the scene's level, whatever the index), and
++ * the front end's readback of a forced gain (0x60006118, 0x6000611c), so esp-sdr's
++ * manual gain fails its check ("ERR gain"); its hardware AGC works.
++ *
++ * Tuning: the PHY programs the RF PLL through the analog I2C master's command words
++ * (0x6000e000, 0x6000e004: block 7:0, register 15:8, data 23:16, write 24, busy 25).
++ * This model keeps every analog block's registers, so reads return what was written,
++ * and follows two ways the LO moves:
++ *   - the fractional-N divider, block 0x63 registers 3-5, loaded by register 0 with
++ *     bit 4: f = 0.75 * 40 MHz * (32 + r3 + r4 / 2^8 + r5 / 2^16), times 5/6 when the
++ *     LO divider is on (block 0x65 register 0 bit 4);
++ *   - the PHY's channel hop (0x6000e150 bits 27:20: MHz - 2400), on Wi-Fi channels.
++ * The later of the two is the PLL (`pll-khz`); the LO (`tuned-khz`) is the PLL, times
++ * 5/6 while the LO divider is on.
++ *
++ * The scene: sources separated by ';', each a kind and its parameters, key=value,
++ * separated by ',':
++ *   tone,f=MHz,a=LSB[,phase=deg]         a carrier, peak amplitude in ADC LSBs (10 bits)
++ *   noise,a=LSB                          complex Gaussian noise, rms per component
++ *   am,f=MHz,a=LSB,bits=HEX[,depth=0.6,rate=5e6,lead=8,tail=8,period=200e-6,
++ *      start=0,polarity=ieee|thomas,rise=0]
++ *                                        AM bursts with Manchester data, as gbagate's
++ *                                        rfrf_modulate() makes them: lead bits of carrier,
++ *                                        the bits (MSB first), tail bits of carrier, the
++ *                                        low level at 1 - depth; one every period
++ *                                        seconds from start (virtual time)
++ * A source more than half the sample rate (or 22 MHz, the receiver's filter) from the
++ * LO is not heard. Sums past the ADC's range clip. Noise is deterministic, from `seed`
++ * and the number of captures before.
++ *
++ *   -global driver=esp32s3.sdr,property=scene,value="tone,,f=2437.25,,a=200;noise,,a=3"
++ *   (the long form: the type name has a dot; commas doubled), or qom-set /machine/soc/sdr
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include <math.h>
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "qapi/visitor.h"
++#include "hw/qdev-properties.h"
++#include "exec/address-spaces.h"
++#include "hw/misc/esp32s3_sdr.h"
++
++#define CTRL_RUN        BIT(31)
++#define CTRL_TRIGGER    BIT(19)
++#define CTRL_DONE       BIT(18)
++#define CTRL_CIRCULAR   BIT(17)
++#define CTRL_RATE_16M   BIT(16)
++#define CTRL_RATE_40M   BIT(15)
++#define CTRL_COUNT      0x7fffu
++
++#define R_CTRL          0x00            /* Offsets from 0x60033d5c */
++#define R_WRITE_INDEX   0x04
++#define R_DAC_TRIG      0x08
++#define R_CONFIG        0x34
++
++#define LANES_RX_IQ     0x000c2040u     /* Sources 0, 1, 2, 3 */
++#define BANK0           0x3fcb0000u
++#define BANK_SIZE       0x10000u
++#define RX_FILTER_HZ    22e6
++
++#define AGC_FORCE       0x2c            /* AGC_FORCE_REG, from 0x6001c000 */
++
++#define ANA_WRITE       BIT(24)
++#define ANA_BUSY        BIT(25)
++
++ESP32S3SdrState *esp32s3_sdr;
++
++typedef enum { SRC_TONE, SRC_NOISE, SRC_AM } SrcKind;
++
++struct ESP32S3SdrSource {
++    SrcKind kind;
++    double f_hz, a, phase;
++    /* am */
++    double depth, rate, period, start, rise;
++    unsigned lead, tail;
++    bool thomas;
++    uint8_t *bits;
++    unsigned nbits;
++};
++
++static void free_sources(ESP32S3SdrSource *src, unsigned n)
++{
++    for (unsigned i = 0; i < n; i++) {
++        g_free(src[i].bits);
++    }
++    g_free(src);
++}
++
++static bool parse_hex(const char *v, uint8_t **bits, unsigned *nbits)
++{
++    size_t len = strlen(v);
++    if (len == 0 || len % 2) {
++        return false;
++    }
++    *bits = g_malloc(len / 2);
++    for (size_t i = 0; i < len / 2; i++) {
++        unsigned b;
++        if (sscanf(v + 2 * i, "%2x", &b) != 1 || !isxdigit(v[2 * i]) || !isxdigit(v[2 * i + 1])) {
++            g_free(*bits);
++            *bits = NULL;
++            return false;
++        }
++        (*bits)[i] = b;
++    }
++    *nbits = len / 2 * 8;
++    return true;
++}
++
++static bool parse_scene(const char *scene, ESP32S3SdrSource **out, unsigned *nout, Error **errp)
++{
++    g_auto(GStrv) items = g_strsplit(scene ? scene : "", ";", -1);
++    ESP32S3SdrSource *src = g_new0(ESP32S3SdrSource, g_strv_length(items) + 1);
++    unsigned n = 0;
++    for (char **it = items; *it; it++) {
++        g_autofree char *item = g_strstrip(g_strdup(*it));
++        if (!*item) {
++            continue;
++        }
++        g_auto(GStrv) kv = g_strsplit(item, ",", -1);
++        ESP32S3SdrSource *s = &src[n];
++        *s = (ESP32S3SdrSource) { .depth = 0.6, .rate = 5e6, .lead = 8, .tail = 8,
++                                  .period = 200e-6 };
++        const char *kind = g_strstrip(kv[0]);
++        if (!strcmp(kind, "tone")) {
++            s->kind = SRC_TONE;
++        } else if (!strcmp(kind, "noise")) {
++            s->kind = SRC_NOISE;
++        } else if (!strcmp(kind, "am")) {
++            s->kind = SRC_AM;
++        } else {
++            error_setg(errp, "esp32s3.sdr: unknown source '%s'", kind);
++            goto fail;
++        }
++        bool have_f = false, have_a = false;
++        for (char **p = kv + 1; *p; p++) {
++            char *eq = strchr(*p, '=');
++            if (!eq) {
++                error_setg(errp, "esp32s3.sdr: '%s' is not key=value", *p);
++                goto fail;
++            }
++            *eq = 0;
++            const char *k = g_strstrip(*p), *v = g_strstrip(eq + 1);
++            char *end;
++            double d = g_ascii_strtod(v, &end);
++            bool num = end != v && *end == 0;
++            if (!strcmp(k, "bits") && s->kind == SRC_AM) {
++                if (!parse_hex(v, &s->bits, &s->nbits)) {
++                    error_setg(errp, "esp32s3.sdr: bits must be whole bytes of hex");
++                    goto fail;
++                }
++                continue;
++            }
++            if (!strcmp(k, "polarity") && s->kind == SRC_AM) {
++                if (strcmp(v, "ieee") && strcmp(v, "thomas")) {
++                    error_setg(errp, "esp32s3.sdr: polarity is ieee or thomas");
++                    goto fail;
++                }
++                s->thomas = !strcmp(v, "thomas");
++                continue;
++            }
++            if (!num) {
++                error_setg(errp, "esp32s3.sdr: %s=%s is not a number", k, v);
++                goto fail;
++            }
++            if (!strcmp(k, "f")) {
++                s->f_hz = d * 1e6;
++                have_f = true;
++            } else if (!strcmp(k, "a")) {
++                s->a = d;
++                have_a = true;
++            } else if (!strcmp(k, "phase")) {
++                s->phase = d * M_PI / 180;
++            } else if (s->kind == SRC_AM && !strcmp(k, "depth")) {
++                s->depth = d;
++            } else if (s->kind == SRC_AM && !strcmp(k, "rate")) {
++                s->rate = d;
++            } else if (s->kind == SRC_AM && !strcmp(k, "lead")) {
++                s->lead = d;
++            } else if (s->kind == SRC_AM && !strcmp(k, "tail")) {
++                s->tail = d;
++            } else if (s->kind == SRC_AM && !strcmp(k, "period")) {
++                s->period = d;
++            } else if (s->kind == SRC_AM && !strcmp(k, "start")) {
++                s->start = d;
++            } else if (s->kind == SRC_AM && !strcmp(k, "rise")) {
++                s->rise = d;
++            } else {
++                error_setg(errp, "esp32s3.sdr: %s has no '%s'", kind, k);
++                goto fail;
++            }
++        }
++        if (!have_a || (s->kind != SRC_NOISE && !have_f) || (s->kind == SRC_AM && !s->bits) ||
++            (s->kind == SRC_AM && (s->rate <= 0 || s->period <= 0))) {
++            error_setg(errp, "esp32s3.sdr: '%s' needs %s", kind,
++                       s->kind == SRC_NOISE ? "a" : s->kind == SRC_TONE ? "f and a"
++                                                                      : "f, a, bits, rate > 0, period > 0");
++            goto fail;
++        }
++        n++;
++    }
++    *out = src;
++    *nout = n;
++    return true;
++fail:
++    free_sources(src, n + 1);
++    return false;
++}
++
++/* The envelope of an AM burst source at time t (seconds of virtual time), 0..1 */
++static double am_envelope(const ESP32S3SdrSource *s, double t)
++{
++    double rel = t - s->start;
++    if (rel < 0) {
++        return 0;
++    }
++    rel = fmod(rel, s->period);
++    const double half = 0.5 / s->rate;
++    const unsigned cells = 2 * (s->lead + s->nbits + s->tail);
++    double pos = rel / half;                     /* In half-bits */
++    if (pos >= cells) {
++        return 0;
++    }
++    /* The level of half-bit h: lead and tail are carrier (high) */
++    #define LEVEL(h) ({                                                              \
++        unsigned _h = (h), _lv = 1;                                                  \
++        if (_h >= 2 * s->lead && _h < 2 * (s->lead + s->nbits)) {                    \
++            unsigned _b = (_h - 2 * s->lead) / 2, _second = (_h - 2 * s->lead) % 2;  \
++            unsigned _bit = s->bits[_b / 8] >> (7 - _b % 8) & 1;                     \
++            unsigned _hi_first = s->thomas ? _bit : !_bit; /* IEEE: 0 high-low */    \
++            _lv = _second ? !_hi_first : _hi_first;                                  \
++        }                                                                            \
++        _lv ? 1.0 : 1.0 - s->depth; })
++    unsigned h = (unsigned)pos;
++    double level = LEVEL(h);
++    if (s->rise > 0) {
++        /* A linear edge 1.25 * rise long (10-90% in rise), centred on the boundary */
++        double edge = 1.25 * s->rise / half, frac = pos - h;
++        if (frac < edge / 2 && h > 0) {
++            double prev = LEVEL(h - 1);
++            level = prev + (level - prev) * (0.5 + frac / edge);
++        } else if (frac > 1 - edge / 2 && h + 1 < cells) {
++            double next = LEVEL(h + 1);
++            level = level + (next - level) * (frac - (1 - edge / 2)) / edge;
++        }
++    }
++    #undef LEVEL
++    return level;
++}
++
++static uint64_t splitmix(uint64_t *x)
++{
++    uint64_t z = (*x += 0x9e3779b97f4a7c15ull);
++    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
++    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
++    return z ^ (z >> 31);
++}
++
++static double gauss(uint64_t *x)
++{
++    double u1 = ((splitmix(x) >> 11) + 1) * 0x1.0p-53, u2 = (splitmix(x) >> 11) * 0x1.0p-53;
++    return sqrt(-2 * log(u1)) * cos(2 * M_PI * u2);
++}
++
++static int clip10(double v)
++{
++    long r = lround(v);
++    return r > 511 ? 511 : r < -512 ? -512 : (int)r;
++}
++
++static void capture(ESP32S3SdrState *s, uint32_t count, double fs, int64_t t0_ns)
++{
++    uint32_t bank = s->owner & 0xf;
++    s->count = count;
++    s->written = 0;
++    s->captures++;
++    if (bank & 8) {
++        qemu_log_mask(LOG_GUEST_ERROR, "esp32s3.sdr: bank 3 (0x3fce0000) holds ROM data; "
++                      "the capture is dropped\n");
++        return;
++    }
++    if (!bank || (bank & (bank - 1))) {
++        qemu_log_mask(LOG_GUEST_ERROR, "esp32s3.sdr: a capture with SRAM_USAGE_3 = 0x%x "
++                      "(one bank must be the engine's)\n", s->owner);
++        return;
++    }
++    count = MIN(count, BANK_SIZE / 4);
++    const bool iq = (s->config & 0xffffff) == LANES_RX_IQ;
++    if (!iq) {
++        qemu_log_mask(LOG_UNIMP, "esp32s3.sdr: lanes 0x%06x: only receive I/Q (0x%06x) is "
++                      "modelled; zeros\n", s->config & 0xffffff, LANES_RX_IQ);
++    }
++    const double lo = s->tuned_khz * 1e3, t0 = t0_ns * 1e-9;
++    const double band = MIN(fs / 2, RX_FILTER_HZ);
++    uint64_t rng = ((uint64_t)s->seed << 32) ^ s->captures;
++    /* The gain index in each word: the forced one (AGC_FORCE_REG: EN 23, index 31:24) */
++    const uint32_t force = s->agc[AGC_FORCE / 4];
++    const uint32_t gain = force & BIT(23) ? (force >> 24) << 20 : 0;
++    uint32_t *buf = g_new(uint32_t, count);
++    for (uint32_t k = 0; k < count; k++) {
++        double t = t0 + k / fs, re = 0, im = 0;
++        for (unsigned j = 0; iq && j < s->nsources; j++) {
++            const ESP32S3SdrSource *src = &s->sources[j];
++            if (src->kind == SRC_NOISE) {
++                re += src->a * gauss(&rng);
++                im += src->a * gauss(&rng);
++                continue;
++            }
++            double df = src->f_hz - lo;
++            if (fabs(df) > band) {
++                continue;
++            }
++            double amp = src->a * (src->kind == SRC_AM ? am_envelope(src, t) : 1.0);
++            if (amp == 0) {
++                continue;
++            }
++            /* The phase, from the time since the epoch, reduced first: t * df alone
++             * loses precision over seconds of virtual time */
++            double cycles = fmod(t * fmod(df, 1e9), 1.0);
++            double ph = 2 * M_PI * cycles + src->phase;
++            re += amp * cos(ph);
++            im += amp * sin(ph);
++        }
++        /* The word holds the conjugate: RF above the LO at negative frequency, as on
++         * the chip (esp-sdr's hosts conjugate; its protocol calls the pair (I, -Q)) */
++        int i = clip10(re), q = clip10(-im);
++        buf[k] = (i & 0x3ff) | (q & 0x3ff) << 10 | gain;
++    }
++    unsigned b = ctz32(bank);
++    address_space_write(&address_space_memory, BANK0 + b * BANK_SIZE, MEMTXATTRS_UNSPECIFIED,
++                        buf, count * 4);
++    g_free(buf);
++    s->written = count;
++}
++
++static double ctrl_rate(uint32_t ctrl)
++{
++    return ctrl & CTRL_RATE_16M ? 16e6 : ctrl & CTRL_RATE_40M ? 40e6 : 80e6;
++}
++
++static uint64_t dump_read(void *opaque, hwaddr addr, unsigned size)
++{
++    ESP32S3SdrState *s = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    switch (addr) {
++    case R_CTRL:
++        return s->ctrl | (s->done_ns && now >= s->done_ns ? CTRL_DONE : 0);
++    case R_WRITE_INDEX:
++        if (s->done_ns && now < s->done_ns) {
++            double left = (s->done_ns - now) * 1e-9 * ctrl_rate(s->ctrl);
++            return s->written > left ? (uint32_t)(s->written - left) : 0;
++        }
++        return s->written & CTRL_COUNT;
++    case R_DAC_TRIG:
++        return s->dac_trig;
++    case R_CONFIG:
++        return s->config;
++    }
++    return 0;
++}
++
++static void dump_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++    ESP32S3SdrState *s = opaque;
++    switch (addr) {
++    case R_CTRL: {
++        uint32_t old = s->ctrl;
++        s->ctrl = value & ~CTRL_DONE;
++        if (!(value & CTRL_RUN)) {
++            s->done_ns = 0;                         /* Stopped */
++            break;
++        }
++        if ((value & CTRL_TRIGGER) && !(old & CTRL_TRIGGER)) {
++            if (value & CTRL_CIRCULAR) {
++                qemu_log_mask(LOG_UNIMP, "esp32s3.sdr: circular captures are not modelled\n");
++                break;
++            }
++            uint32_t count = value & CTRL_COUNT;
++            double fs = ctrl_rate(value);
++            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++            capture(s, count, fs, now);
++            s->done_ns = now + MAX((int64_t)(count / fs * 1e9), 1);
++        }
++        break;
++    }
++    case R_DAC_TRIG:
++        if (value & BIT(31)) {
++            qemu_log_mask(LOG_UNIMP, "esp32s3.sdr: transmit (DUMP_DAC_TRIG) is not modelled\n");
++        }
++        s->dac_trig = value;
++        break;
++    case R_CONFIG:
++        s->config = value;
++        break;
++    }
++}
++
++static const MemoryRegionOps dump_ops = {
++    .read = dump_read,
++    .write = dump_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static uint64_t owner_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return ((ESP32S3SdrState *)opaque)->owner;
++}
++
++static void owner_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++    ((ESP32S3SdrState *)opaque)->owner = value;
++}
++
++static const MemoryRegionOps owner_ops = {
++    .read = owner_read,
++    .write = owner_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static uint64_t agc_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return ((ESP32S3SdrState *)opaque)->agc[addr / 4];
++}
++
++static void agc_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++    ESP32S3SdrState *s = opaque;
++    s->agc[addr / 4] = value;
++}
++
++static const MemoryRegionOps agc_ops = {
++    .read = agc_read,
++    .write = agc_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++/* The analog I2C master and the hop register, passed on by the SoC's I/O block */
++
++/* The LO: the PLL, divided by 6/5 while the LO divider (block 0x65 register 0 bit 4)
++ * is on. Either may change first: the PHY tunes, then esp-sdr picks the divider */
++static void retune(ESP32S3SdrState *s)
++{
++    s->tuned_khz = s->ana[0x65][0] & 0x10 ? (uint32_t)lround(s->pll_khz * 5.0 / 6) : s->pll_khz;
++}
++
++static void retune_sdm(ESP32S3SdrState *s)
++{
++    const uint8_t *r = s->ana[0x63];
++    double mhz = 0.75 * 40 * (32 + r[3] + r[4] / 256.0 + r[5] / 65536.0);
++    s->pll_khz = lround(mhz * 1000);
++    retune(s);
++}
++
++bool esp32s3_sdr_io_read(ESP32S3SdrState *s, hwaddr addr, uint64_t *value)
++{
++    if (addr == ESP32S3_SDR_ANA_BASE || addr == ESP32S3_SDR_ANA_BASE + 4) {
++        *value = s->ana_cmd[(addr - ESP32S3_SDR_ANA_BASE) / 4];
++        return true;
++    }
++    return false;
++}
++
++void esp32s3_sdr_io_write(ESP32S3SdrState *s, hwaddr addr, uint64_t value)
++{
++    if (addr == ESP32S3_SDR_ANA_BASE || addr == ESP32S3_SDR_ANA_BASE + 4) {
++        unsigned m = (addr - ESP32S3_SDR_ANA_BASE) / 4;
++        uint8_t block = value & 0xff, reg = (value >> 8) & 0xf, data = (value >> 16) & 0xff;
++        if (value & ANA_WRITE) {
++            s->ana[block][reg] = data;
++            if (block == 0x63 && reg == 0 && (data & 0x10)) {
++                retune_sdm(s);                      /* The divider word loaded */
++            } else if (block == 0x65 && reg == 0) {
++                retune(s);                          /* The LO divider */
++            }
++        }
++        /* Done at once (BUSY clear); a read finds the register's value in 23:16 */
++        s->ana_cmd[m] = (value & ~(0xffu << 16) & ~ANA_BUSY) | (uint32_t)s->ana[block][reg] << 16;
++    } else if (addr == ESP32S3_SDR_HOP_REG) {
++        unsigned field = (value >> 20) & 0xff;
++        if (field) {
++            s->pll_khz = (2400 + field) * 1000;
++            retune(s);
++        }
++    }
++}
++
++/* Properties */
++
++static char *get_scene(Object *obj, Error **errp)
++{
++    return g_strdup(ESP32S3_SDR(obj)->scene ? ESP32S3_SDR(obj)->scene : "");
++}
++
++static void set_scene(Object *obj, const char *value, Error **errp)
++{
++    ESP32S3SdrState *s = ESP32S3_SDR(obj);
++    ESP32S3SdrSource *src;
++    unsigned n;
++    if (!parse_scene(value, &src, &n, errp)) {
++        return;
++    }
++    free_sources(s->sources, s->nsources);
++    s->sources = src;
++    s->nsources = n;
++    g_free(s->scene);
++    s->scene = g_strdup(value);
++}
++
++static void get_u32(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
++{
++    visit_type_uint32(v, name, (uint32_t *)opaque, errp);
++}
++
++static void set_u32(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
++{
++    visit_type_uint32(v, name, (uint32_t *)opaque, errp);
++}
++
++static void esp32s3_sdr_init(Object *obj)
++{
++    ESP32S3SdrState *s = ESP32S3_SDR(obj);
++    memory_region_init_io(&s->dump_mem, obj, &dump_ops, s, "esp32s3.sdr.dump", ESP32S3_SDR_DUMP_SIZE);
++    memory_region_init_io(&s->owner_mem, obj, &owner_ops, s, "esp32s3.sdr.owner", 4);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->dump_mem);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->owner_mem);
++    memory_region_init_io(&s->agc_mem, obj, &agc_ops, s, "esp32s3.sdr.agc", ESP32S3_SDR_AGC_SIZE);
++    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->agc_mem);
++    s->pll_khz = s->tuned_khz = 2412000;
++    object_property_add_str(obj, "scene", get_scene, set_scene);
++    object_property_add(obj, "seed", "uint32", get_u32, set_u32, NULL, &s->seed);
++    object_property_add(obj, "tuned-khz", "uint32", get_u32, NULL, NULL, &s->tuned_khz);
++    object_property_add(obj, "pll-khz", "uint32", get_u32, NULL, NULL, &s->pll_khz);
++    object_property_add(obj, "captures", "uint32", get_u32, NULL, NULL, &s->captures);
++}
++
++static void esp32s3_sdr_realize(DeviceState *dev, Error **errp)
++{
++    esp32s3_sdr = ESP32S3_SDR(dev);
++}
++
++static void esp32s3_sdr_reset(DeviceState *dev)
++{
++    ESP32S3SdrState *s = ESP32S3_SDR(dev);
++    s->ctrl = s->dac_trig = s->config = s->owner = 0;
++    s->written = s->count = 0;
++    s->done_ns = 0;
++}
++
++static void esp32s3_sdr_finalize(Object *obj)
++{
++    ESP32S3SdrState *s = ESP32S3_SDR(obj);
++    free_sources(s->sources, s->nsources);
++    g_free(s->scene);
++}
++
++static void esp32s3_sdr_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    dc->realize = esp32s3_sdr_realize;
++    device_class_set_legacy_reset(dc, esp32s3_sdr_reset);
++}
++
++static const TypeInfo esp32s3_sdr_info = {
++    .name = TYPE_ESP32S3_SDR,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(ESP32S3SdrState),
++    .instance_init = esp32s3_sdr_init,
++    .instance_finalize = esp32s3_sdr_finalize,
++    .class_init = esp32s3_sdr_class_init,
++};
++
++static void esp32s3_sdr_register_types(void)
++{
++    type_register_static(&esp32s3_sdr_info);
++}
++
++type_init(esp32s3_sdr_register_types)
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index 0c56efe..9214f88 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -268,6 +268,7 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files(
+   'esp32s3_rtc_cntl.c',
+   'esp32s3_rng.c',
+   'esp32s3_rmt.c',
++  'esp32s3_sdr.c',
+   'esp32s3_pms.c',
+   'esp_hmac.c',
+   'esp32s3_hmac.c'
+diff --git a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+index 6c68232..7b96e2f 100644
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -50,6 +50,7 @@
+ #include "hw/char/esp32s3_uart.h"
+ #include "hw/misc/esp32s3_rng.h"
+ #include "hw/misc/esp32s3_rmt.h"
++#include "hw/misc/esp32s3_sdr.h"
+ 
+ #include "hw/nvram/esp32s3_efuse.h"
+ #include "hw/xtensa/esp32s3_clk.h"
+@@ -133,6 +134,7 @@ typedef struct Esp32s3SocState {
+     ESP32S3I2CState i2c[2];
+     Esp32s3RngState rng;
+     ESP32S3RmtState rmt;                /* RMT: the transmit side */
++    ESP32S3SdrState sdr;                /* The radio's dump engine: raw I/Q */
+     Esp32S3TWAIState twai;
+ 
+     Esp32s3RtcCntlState rtc_cntl;
+@@ -700,6 +702,10 @@ static uint64_t esp32s3_io_read(void *opaque, hwaddr addr, unsigned int size)
+         return ESP32S3_I2C_MST_PKDET_DONE;
+     }
+     unsigned i;
++    uint64_t sdr_value;
++    if (esp32s3_sdr && esp32s3_sdr_io_read(esp32s3_sdr, ESP32S3_IO_START_ADDR + addr, &sdr_value)) {
++        return sdr_value;
++    }
+     if (esp32s3_ana_word(ESP32S3_IO_START_ADDR + addr, &i)) {
+         uint32_t v = esp32s3_ana_block[i];
+         if (ESP32S3_IO_START_ADDR + addr == ESP32S3_ANA_TXDC_MEAS_REG) {
+@@ -729,6 +735,9 @@ static uint64_t esp32s3_io_read(void *opaque, hwaddr addr, unsigned int size)
+ static void esp32s3_io_write(void *opaque, hwaddr addr, uint64_t value, unsigned int size)
+ {
+     unsigned i;
++    if (esp32s3_sdr) {
++        esp32s3_sdr_io_write(esp32s3_sdr, ESP32S3_IO_START_ADDR + addr, value);
++    }
+     if (esp32s3_ana_word(ESP32S3_IO_START_ADDR + addr, &i)) {
+         esp32s3_ana_block[i] = value;
+         if (ESP32S3_IO_START_ADDR + addr == ESP32S3_ANA_RF_FREQ_REG) {
+@@ -906,6 +915,7 @@ static void esp32s3_machine_init(MachineState *machine)
+     object_initialize_child(OBJECT(ss), "i2c1", &ss->i2c[1], TYPE_ESP32S3_I2C);
+     object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
+     object_initialize_child(OBJECT(ss), "rmt", &ss->rmt, TYPE_ESP32S3_RMT);
++    object_initialize_child(OBJECT(ss), "sdr", &ss->sdr, TYPE_ESP32S3_SDR);
+ 
+     object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
+ 
+@@ -1220,6 +1230,18 @@ static void esp32s3_machine_init(MachineState *machine)
+                            qdev_get_gpio_in(DEVICE(&ss->intmatrix), ETS_RMT_INTR_SOURCE));
+     }
+ 
++    /* The radio as an SDR: the MAC's dump engine and the SRAM bank it writes, above the
++     * general I/O block and the PMS (esp32s3_sdr.c) */
++    {
++        sysbus_realize(SYS_BUS_DEVICE(&ss->sdr), &error_fatal);
++        memory_region_add_subregion_overlap(sys_mem, ESP32S3_SDR_DUMP_BASE,
++                                            sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->sdr), 0), 1);
++        memory_region_add_subregion_overlap(sys_mem, ESP32S3_SDR_OWNER_REG,
++                                            sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->sdr), 1), 1);
++        memory_region_add_subregion_overlap(sys_mem, ESP32S3_SDR_AGC_BASE,
++                                            sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->sdr), 2), 1);
++    }
++
+     
+     esp32s3_machine_init_sd(ss);
+ 
+diff --git a/include/hw/misc/esp32s3_sdr.h b/include/hw/misc/esp32s3_sdr.h
+new file mode 100644
+index 0000000..09e7bab
+--- /dev/null
++++ b/include/hw/misc/esp32s3_sdr.h
+@@ -0,0 +1,57 @@
++/*
++ * ESP32-S3 radio as a software-defined radio: the MAC's debug dump engine (receive)
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#pragma once
++
++#include "hw/sysbus.h"
++
++#define TYPE_ESP32S3_SDR "esp32s3.sdr"
++#define ESP32S3_SDR(obj) OBJECT_CHECK(ESP32S3SdrState, (obj), TYPE_ESP32S3_SDR)
++
++#define ESP32S3_SDR_DUMP_BASE   0x60033d5c      /* DUMP_CTRL_REG .. DUMP_CONFIG_REG */
++#define ESP32S3_SDR_DUMP_SIZE   0x38
++#define ESP32S3_SDR_OWNER_REG   0x600c101c      /* SENSITIVE_INTERNAL_SRAM_USAGE_3_REG */
++#define ESP32S3_SDR_AGC_BASE    0x6001c000      /* The AGC: kept (the PHY's gain set-up) */
++#define ESP32S3_SDR_AGC_SIZE    0x1000
++#define ESP32S3_SDR_ANA_BASE    0x6000e000      /* The analog I2C master's two command words */
++#define ESP32S3_SDR_HOP_REG     0x6000e150      /* The PHY's channel hop: MHz - 2400 in 27:20 */
++
++typedef struct ESP32S3SdrSource ESP32S3SdrSource;
++
++typedef struct ESP32S3SdrState {
++    SysBusDevice parent_obj;
++    MemoryRegion dump_mem;
++    MemoryRegion owner_mem;
++    MemoryRegion agc_mem;
++    uint32_t agc[ESP32S3_SDR_AGC_SIZE / 4];
++
++    uint32_t ctrl;              /* DUMP_CTRL_REG, without DONE */
++    uint32_t dac_trig;          /* DUMP_DAC_TRIG_REG: kept (transmit is not modelled yet) */
++    uint32_t config;            /* DUMP_CONFIG_REG: the lane selectors */
++    uint32_t owner;             /* SRAM_USAGE_3: banks handed to the engine */
++    uint32_t written;           /* Words the last capture wrote */
++    uint32_t count;             /* Words it was asked for */
++    int64_t done_ns;            /* When it finishes, in virtual time (0: none running) */
++
++    uint8_t ana[256][16];       /* The analog blocks' registers, by block and register */
++    uint32_t ana_cmd[2];        /* Each master's last command word, for its readback */
++    uint32_t pll_khz;           /* The RF PLL, from the last tuning the PHY made */
++    uint32_t tuned_khz;         /* The LO: the PLL, times 5/6 with the LO divider on */
++
++    char *scene;                /* What's on the air (see esp32s3_sdr.c) */
++    ESP32S3SdrSource *sources;
++    unsigned nsources;
++    uint32_t seed;
++    uint32_t captures;          /* For tests: captures made */
++} ESP32S3SdrState;
++
++/* The analog I2C master and the hop register are in the SoC's general I/O block: it
++ * passes their accesses here. NULL until the device is realized. */
++extern ESP32S3SdrState *esp32s3_sdr;
++bool esp32s3_sdr_io_read(ESP32S3SdrState *s, hwaddr addr, uint64_t *value);
++void esp32s3_sdr_io_write(ESP32S3SdrState *s, hwaddr addr, uint64_t value);
+diff --git a/tests/qtest/esp32s3-phy-test.c b/tests/qtest/esp32s3-phy-test.c
+index 652cb89..720636e 100644
+--- a/tests/qtest/esp32s3-phy-test.c
++++ b/tests/qtest/esp32s3-phy-test.c
+@@ -1,6 +1,7 @@
+ /*
+  * QTest for what Wi-Fi and Bluetooth start-up polls on the ESP32-S3 with no radio behind
+- * it: the analog, SENS, baseband and MAC blocks keep what's written; the PHY's
++ * it: the analog, SENS, baseband and MAC blocks keep what's written (the analog I2C
++ * master's command words address the analog registers, which keep it); the PHY's
+  * calibrations (peak detector, TX DC offset, IQ estimation), the temperature sensor, the
+  * MAC's reset and SAR ADC conversions read as done. LEDC keeps what's written too.
+  *
+@@ -16,12 +17,18 @@
+ static void test_kept(void)
+ {
+     QTestState *qts = qtest_init("-machine esp32s3");
+-    const uint32_t regs[] = { 0x6000E000, 0x60008800 + 0x40, 0x60006144, 0x60033c34,
++    const uint32_t regs[] = { 0x6000E044, 0x60008800 + 0x40, 0x60006144, 0x60033c34,
+                               0x600190A0 /* LEDC timer 0's divider */ };
+     for (unsigned i = 0; i < ARRAY_SIZE(regs); i++) {
+         qtest_writel(qts, regs[i], 0x12345678);
+         g_assert_cmphex(qtest_readl(qts, regs[i]), ==, 0x12345678);
+     }
++    /* The analog I2C master's command word (0x6000E000) isn't a plain register: a write
++     * (bit 24) sets the analog register it addresses, a read command finds that
++     * register's value in bits 23:16, and it's never busy (bit 25) */
++    qtest_writel(qts, 0x6000E000, 0x05000000 | 0x5a << 16 | 3 << 8 | 0x67);
++    qtest_writel(qts, 0x6000E000, 0x04000000 | 3 << 8 | 0x67);
++    g_assert_cmphex(qtest_readl(qts, 0x6000E000), ==, 0x04000000 | 0x5a << 16 | 3 << 8 | 0x67);
+     qtest_quit(qts);
+ }
+ 
+diff --git a/tests/qtest/esp32s3-sdr-test.c b/tests/qtest/esp32s3-sdr-test.c
+new file mode 100644
+index 0000000..053e51a
+--- /dev/null
++++ b/tests/qtest/esp32s3-sdr-test.c
+@@ -0,0 +1,253 @@
++/*
++ * QTest for the ESP32-S3 radio as an SDR (esp32s3_sdr.c): the MAC's dump engine, the
++ * SRAM bank it writes, and the LO as the PHY tunes it through the analog I2C master.
++ * The register sequences are ESPARGOS esp-sdr's (main/targets/esp32s3/receiver.c) and
++ * esp-sdr-zephyr's (doc/dev/registers-esp32s3.md).
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include <math.h>
++#include "qemu/bitops.h"
++#include "libqtest.h"
++#include "qapi/qmp/qdict.h"
++
++#define DUMP_CTRL       0x60033d5c
++#define DUMP_INDEX      0x60033d60
++#define DUMP_CONFIG     0x60033d90
++#define SRAM_OWNER      0x600c101c
++#define ANA_CMD         0x6000e000
++#define HOP_REG         0x6000e150
++#define AGC_FORCE       0x6001c02c
++#define BANK2           0x3fcd0000
++
++#define CTRL_RUN        BIT(31)
++#define CTRL_TRIGGER    BIT(19)
++#define CTRL_DONE       BIT(18)
++#define CTRL_RATE_40M   BIT(15)
++#define CTRL_RATE_16M   BIT(16)
++#define LANES_IQ        0x000c2040
++#define MARKER          0xa5a0055a
++
++static void ana_write(QTestState *qts, unsigned block, unsigned reg, unsigned data)
++{
++    qtest_writel(qts, ANA_CMD + 4, 0x05000000 | data << 16 | reg << 8 | block);
++}
++
++static unsigned ana_read(QTestState *qts, unsigned block, unsigned reg)
++{
++    qtest_writel(qts, ANA_CMD + 4, 0x04000000 | reg << 8 | block);
++    uint32_t v = qtest_readl(qts, ANA_CMD + 4);
++    g_assert_cmphex(v & BIT(25), ==, 0);                     /* Not busy */
++    return v >> 16 & 0xff;
++}
++
++static uint32_t qom_u32(QTestState *qts, const char *prop)
++{
++    QDict *r = qtest_qmp(qts, "{'execute': 'qom-get', 'arguments': "
++                         "{'path': '/machine/soc/sdr', 'property': %s}}", prop);
++    g_assert(qdict_haskey(r, "return"));
++    uint32_t v = qdict_get_int(r, "return");
++    qobject_unref(r);
++    return v;
++}
++
++static void set_scene(QTestState *qts, const char *scene)
++{
++    QDict *r = qtest_qmp(qts, "{'execute': 'qom-set', 'arguments': "
++                         "{'path': '/machine/soc/sdr', 'property': 'scene', 'value': %s}}", scene);
++    g_assert(qdict_haskey(r, "return"));
++    qobject_unref(r);
++}
++
++/* esp-sdr's capture: the marker, the lanes, bank 2 to the engine, RUN, TRIGGER pulsed */
++static void capture(QTestState *qts, uint32_t n, uint32_t rate_bits, uint32_t owner)
++{
++    for (uint32_t k = 0; k < n; k++) {
++        qtest_writel(qts, BANK2 + 4 * k, MARKER);
++    }
++    qtest_writel(qts, DUMP_CTRL, 0);
++    qtest_writel(qts, DUMP_CONFIG, LANES_IQ);
++    qtest_writel(qts, SRAM_OWNER, owner);
++    uint32_t ctrl = CTRL_RUN | rate_bits | n;
++    qtest_writel(qts, DUMP_CTRL, ctrl);
++    qtest_writel(qts, DUMP_CTRL, ctrl | CTRL_TRIGGER);
++    qtest_writel(qts, DUMP_CTRL, ctrl);
++}
++
++static void finish(QTestState *qts)
++{
++    qtest_writel(qts, DUMP_CTRL, 0);
++    qtest_writel(qts, SRAM_OWNER, 0);
++}
++
++/* A word as the host sees it: (I, Q), the word's Q negated (esp-sdr: "(I, -Q)") */
++static void word_iq(uint32_t w, double *i, double *q)
++{
++    int iv = w & 0x3ff, qv = w >> 10 & 0x3ff;
++    *i = iv - (iv & 0x200 ? 1024 : 0);
++    *q = -(qv - (qv & 0x200 ? 1024 : 0));
++}
++
++static double tone_at(QTestState *qts, uint32_t n, double fs, double f)
++{
++    double re = 0, im = 0;
++    for (uint32_t k = 0; k < n; k++) {
++        double i, q;
++        word_iq(qtest_readl(qts, BANK2 + 4 * k), &i, &q);
++        double ph = -2 * M_PI * f * k / fs;
++        re += i * cos(ph) - q * sin(ph);
++        im += i * sin(ph) + q * cos(ph);
++    }
++    return hypot(re, im) / n;
++}
++
++/* The PHY's tunings: the fractional-N divider, the hop register, the LO divider */
++static void test_tuning(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++    /* 2432 MHz = 30 MHz x (32 + 49 + 0x11/2^8 + 0x11/2^16) */
++    ana_write(qts, 0x63, 0, 0x07);
++    ana_write(qts, 0x63, 3, 49);
++    ana_write(qts, 0x63, 4, 0x11);
++    ana_write(qts, 0x63, 5, 0x11);
++    g_assert_cmpuint(qom_u32(qts, "tuned-khz"), ==, 2412000);   /* Not loaded yet */
++    ana_write(qts, 0x63, 0, 0x17);
++    g_assert_cmpuint(qom_u32(qts, "tuned-khz"), ==, 2432000);
++    g_assert_cmpuint(ana_read(qts, 0x63, 3), ==, 49);           /* Registers read back */
++    g_assert_cmpuint(ana_read(qts, 0x63, 0), ==, 0x17);
++
++    /* The LO divider (block 0x65 register 0 bit 4): the LO is 5/6 of the PLL */
++    ana_write(qts, 0x65, 0, 0x10);
++    g_assert_cmpuint(qom_u32(qts, "pll-khz"), ==, 2432000);
++    g_assert_cmpuint(qom_u32(qts, "tuned-khz"), ==, 2026667);
++    ana_write(qts, 0x65, 0, 0);
++
++    /* A Wi-Fi channel by the hop register: MHz - 2400 in bits 27:20 */
++    qtest_writel(qts, HOP_REG, 37u << 20);
++    g_assert_cmpuint(qom_u32(qts, "tuned-khz"), ==, 2437000);
++    qtest_quit(qts);
++}
++
++/* A tone 250 kHz above the LO, at each rate: DONE after the capture's time on the chip,
++ * the words in bank 2, the tone at +250 kHz (not -250: the word's Q is negated) */
++static void test_tone(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++    qtest_writel(qts, HOP_REG, 37u << 20);                       /* 2437 MHz */
++    set_scene(qts, "tone,f=2437.25,a=200;tone,f=2460,a=300");   /* The second: out of band */
++    static const struct { uint32_t bits; double fs; } rates[] = {
++        { 0, 80e6 }, { CTRL_RATE_40M, 40e6 }, { CTRL_RATE_16M, 16e6 },
++    };
++    for (unsigned r = 0; r < ARRAY_SIZE(rates); r++) {
++        const uint32_t n = 1600;
++        capture(qts, n, rates[r].bits, 4);
++        g_assert_cmphex(qtest_readl(qts, DUMP_CTRL) & CTRL_DONE, ==, 0);
++        qtest_clock_step(qts, (int64_t)(n / rates[r].fs * 1e9) + 1);
++        g_assert_cmphex(qtest_readl(qts, DUMP_CTRL) & CTRL_DONE, ==, CTRL_DONE);
++        g_assert_cmpuint(qtest_readl(qts, DUMP_INDEX), ==, n);
++        finish(qts);
++        g_assert_cmpfloat(fabs(tone_at(qts, n, rates[r].fs, 250e3) - 200), <, 2);
++        g_assert_cmpfloat(tone_at(qts, n, rates[r].fs, -250e3), <, 2);
++    }
++    qtest_quit(qts);
++}
++
++/* Noise: about its rms, the same capture for the same seed; and a forced gain index in
++ * every word's bits 27:20 */
++static void test_noise_and_gain(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++    set_scene(qts, "noise,a=20");
++    qtest_writel(qts, AGC_FORCE, 0x2a805200);                    /* Forced, index 42 */
++    capture(qts, 4000, 0, 4);
++    qtest_clock_step(qts, 100000);
++    finish(qts);
++    double sum = 0;
++    for (int k = 0; k < 4000; k++) {
++        uint32_t w = qtest_readl(qts, BANK2 + 4 * k);
++        double i, q;
++        word_iq(w, &i, &q);
++        sum += i * i + q * q;
++        g_assert_cmpuint(w >> 20 & 0xff, ==, 42);
++    }
++    g_assert_cmpfloat(fabs(sqrt(sum / 8000) - 20), <, 1.5);
++    qtest_quit(qts);
++}
++
++/* Captures go only into a bank handed to the engine, and only receive I/Q is modelled */
++static void test_bank_and_lanes(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++    set_scene(qts, "noise,a=50");
++    capture(qts, 64, 0, 0);                                      /* No bank: nothing */
++    qtest_clock_step(qts, 10000);
++    finish(qts);
++    for (int k = 0; k < 64; k++) {
++        g_assert_cmphex(qtest_readl(qts, BANK2 + 4 * k), ==, MARKER);
++    }
++    capture(qts, 64, 0, 4);
++    qtest_writel(qts, DUMP_CONFIG, 0x00145105);                  /* Other sources */
++    qtest_writel(qts, DUMP_CTRL, 0);                             /* Again, with them */
++    qtest_writel(qts, DUMP_CTRL, CTRL_RUN | 64);
++    qtest_writel(qts, DUMP_CTRL, CTRL_RUN | CTRL_TRIGGER | 64);
++    qtest_clock_step(qts, 10000);
++    finish(qts);
++    for (int k = 0; k < 64; k++) {
++        g_assert_cmphex(qtest_readl(qts, BANK2 + 4 * k), ==, 0);
++    }
++    qtest_quit(qts);
++}
++
++/* An AM burst with Manchester data, as an AGB-015's: at 80 MS/s a half-bit at 5 Mbit/s
++ * is 8 samples. The envelope gives back the bits, IEEE polarity: a 0 is high then low */
++static void test_am_burst(void)
++{
++    QTestState *qts = qtest_init("-machine esp32s3");
++    ana_write(qts, 0x63, 3, 49);                                 /* 2432 MHz */
++    ana_write(qts, 0x63, 4, 0x11);
++    ana_write(qts, 0x63, 5, 0x11);
++    ana_write(qts, 0x63, 0, 0x17);
++    int64_t now = qtest_clock_step(qts, 1000);
++    /* The burst starts 1 us after the capture does: 80 samples in */
++    g_autofree char *scene = g_strdup_printf(
++        "am,f=2432.1,a=300,depth=0.6,rate=5e6,bits=a5c3,lead=4,tail=4,period=1,start=%.9f",
++        now * 1e-9 + 1e-6);
++    set_scene(qts, scene);
++    capture(qts, 1000, 0, 4);
++    qtest_clock_step(qts, 20000);
++    finish(qts);
++    double env[1000];
++    for (int k = 0; k < 1000; k++) {
++        double i, q;
++        word_iq(qtest_readl(qts, BANK2 + 4 * k), &i, &q);
++        env[k] = hypot(i, q);
++    }
++    g_assert_cmpfloat(env[40], <, 2);                            /* Before: silence */
++    g_assert_cmpfloat(fabs(env[80 + 32] - 300), <, 2);           /* Lead: the carrier */
++    const unsigned bits = 0xa5c3;
++    for (int b = 0; b < 16; b++) {
++        int first = 80 + 64 + 16 * b + 4, second = first + 8;   /* Mid half-bit */
++        unsigned bit = bits >> (15 - b) & 1;
++        double hi = 300, lo = 300 * 0.4;
++        g_assert_cmpfloat(fabs(env[first] - (bit ? lo : hi)), <, 2);
++        g_assert_cmpfloat(fabs(env[second] - (bit ? hi : lo)), <, 2);
++    }
++    g_assert_cmpfloat(fabs(env[80 + 64 + 256 + 32] - 300), <, 2);   /* Tail */
++    g_assert_cmpfloat(env[80 + 64 + 256 + 64 + 8], <, 2);            /* After */
++    qtest_quit(qts);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    qtest_add_func("/esp32s3/sdr/tuning", test_tuning);
++    qtest_add_func("/esp32s3/sdr/tone", test_tone);
++    qtest_add_func("/esp32s3/sdr/noise-and-gain", test_noise_and_gain);
++    qtest_add_func("/esp32s3/sdr/bank-and-lanes", test_bank_and_lanes);
++    qtest_add_func("/esp32s3/sdr/am-burst", test_am_burst);
++    return g_test_run();
++}
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index 5e372c1..9125b8d 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -275,7 +275,7 @@ qtests_riscv32 = \
+ qtests_xtensa = \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-periph-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ? ['esp32-intmatrix-test'] : []) + \
+-  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test', 'esp32s3-wifi-test', 'esp32s3-rmt-test', 'esp32s3-mmu-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp32s3-intmatrix-test', 'esp32s3-gpio-test', 'esp32s3-gpspi-test', 'esp32s3-spi-devices-test', 'esp32s3-i2c-test', 'esp32s3-i2c-devices-test', 'esp32s3-sx1262-test', 'esp32s3-usb-serial-jtag-test', 'esp32s3-brownout-test', 'esp32s3-phy-test', 'esp32s3-lcd-cam-test', 'esp32s3-wifi-test', 'esp32s3-rmt-test', 'esp32s3-mmu-test', 'esp32s3-sdr-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_XTENSA_ESP32S3') ? ['esp-spi-test'] : [])
+ 
+ qtests_riscv64 = \
+-- 
+2.43.0
+
