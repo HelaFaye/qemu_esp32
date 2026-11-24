@@ -93,7 +93,7 @@ What the test cases have found, so far (each fixed, with a qtest that reproduces
   It also found three bugs in the tracker itself, fixed there: a boot loop from linking
   the legacy I2C driver beside Arduino 3.x's Wire, a background I2C scan that never
   worked, and built-in Wi-Fi credentials that were never tried.
-- With its IMUs on I2SPI chains (0029), the tracker found a bug of its own: a chain with
+- With its IMUs on I2SPI chains (0030), the tracker found a bug of its own: a chain with
   no strobe conductor (software chip selects) never told its nodes to leave strobe mode,
   so the nodes dropped every SET_CS and every sensor on the chain read as absent. Fixed
   in the tracker, with a scenario in its host simulation, which had never run a chain

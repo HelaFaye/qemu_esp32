@@ -1,0 +1,269 @@
+From 6d2c2f32a04505320c6b3df7fb029da781b7b1b9 Mon Sep 17 00:00:00 2001
+From: HelaFaye <dilsha21@gmail.com>
+Date: Tue, 24 Nov 2026 01:16:50 +0000
+Subject: [PATCH 29/29] esp32s3.gpio: a logic analyzer, as a VCD PulseView can
+ open
+
+la-file (a path) and la-pins (a mask, all pins by default) record every
+change of the chosen pads to a Value Change Dump. Each change is stamped
+with its virtual time in nanoseconds; a wire per pin is named GPIOn, with
+the levels at the start. The levels are the pads' as update_pins()
+resolves them: output, outside drive, pulls. Set over QMP, la-file starts
+a capture and "" stops it; the file is flushed at exit.
+
+The times are as exact as the emulation: peripherals that time their own
+edges place them where the chip would. Edges made by the CPU follow
+QEMU's clock: instruction-accurate with -icount.
+
+PulseView imports the VCD (File > Import > Value Change Dump).
+qemu_esp32's la/ tools convert it to a sigrok session at a sample rate,
+and compare it with a real analyzer's capture.
+---
+ hw/gpio/esp32s3_gpio.c          | 119 ++++++++++++++++++++++++++++++++
+ include/hw/gpio/esp32s3_gpio.h  |   9 +++
+ tests/qtest/esp32s3-gpio-test.c |  38 ++++++++++
+ 3 files changed, 166 insertions(+)
+
+diff --git a/hw/gpio/esp32s3_gpio.c b/hw/gpio/esp32s3_gpio.c
+index b97039f..4525fa4 100644
+--- a/hw/gpio/esp32s3_gpio.c
++++ b/hw/gpio/esp32s3_gpio.c
+@@ -23,6 +23,9 @@
+ #include "hw/irq.h"
+ #include "hw/qdev-properties.h"
+ #include "migration/vmstate.h"
++#include "qapi/visitor.h"
++#include "qemu/timer.h"
++#include "sysemu/sysemu.h"
+ #include "hw/gpio/esp32s3_gpio.h"
+ 
+ #define PINS            ESP32S3_GPIO_PINS
+@@ -221,6 +224,108 @@ static void latch_levels(ESP32S3GPIOState *s)
+     }
+ }
+ 
++/*
++ * The logic analyzer. A Value Change Dump: a wire per recorded pin (GPIOn), its level at
++ * the start, then each change at its virtual time in nanoseconds. Levels are the pad's
++ * as update_pins() resolves them (output, outside drive, pulls; a floating pin is 0).
++ * How exact the times are is the emulation's: peripherals that time their own edges
++ * place them where the chip would; edges the CPU makes depend on QEMU's clock (-icount
++ * for instruction-accurate time).
++ */
++static char la_id(int n)
++{
++    return '!' + n;                                 /* Printable, one character */
++}
++
++static void la_close(ESP32S3GPIOState *s)
++{
++    if (s->la) {
++        fclose(s->la);
++        s->la = NULL;
++    }
++}
++
++static void la_open(ESP32S3GPIOState *s, Error **errp)
++{
++    la_close(s);
++    if (!s->la_file || !*s->la_file) {
++        return;
++    }
++    s->la = fopen(s->la_file, "w");
++    if (!s->la) {
++        error_setg_errno(errp, errno, "esp32s3.gpio: can't write %s", s->la_file);
++        return;
++    }
++    setvbuf(s->la, NULL, _IOFBF, 1 << 16);
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    fprintf(s->la, "$version qemu esp32s3.gpio logic analyzer $end\n"
++                   "$timescale 1 ns $end\n$scope module esp32s3 $end\n");
++    for (int n = 0; n < PINS; n++) {
++        if ((s->la_pins >> n) & 1) {
++            fprintf(s->la, "$var wire 1 %c GPIO%d $end\n", la_id(n), n);
++        }
++    }
++    fprintf(s->la, "$upscope $end\n$enddefinitions $end\n#%" PRId64 "\n$dumpvars\n", now);
++    for (int n = 0; n < PINS; n++) {
++        if ((s->la_pins >> n) & 1) {
++            fprintf(s->la, "%d%c\n", (int)((s->level >> n) & 1), la_id(n));
++        }
++    }
++    fprintf(s->la, "$end\n");
++    s->la_last_ns = now;
++}
++
++static void la_edge(ESP32S3GPIOState *s, int n, int level)
++{
++    if (!s->la || !((s->la_pins >> n) & 1)) {
++        return;
++    }
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    if (now != s->la_last_ns) {
++        fprintf(s->la, "#%" PRId64 "\n", now);
++        s->la_last_ns = now;
++    }
++    fprintf(s->la, "%d%c\n", level, la_id(n));
++}
++
++static void la_at_exit(Notifier *n, void *data)
++{
++    ESP32S3GPIOState *s = container_of(n, ESP32S3GPIOState, la_exit);
++    if (s->la) {
++        fprintf(s->la, "#%" PRId64 "\n", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++        la_close(s);
++    }
++}
++
++static char *la_get_file(Object *obj, Error **errp)
++{
++    return g_strdup(ESP32S3_GPIO(obj)->la_file ? ESP32S3_GPIO(obj)->la_file : "");
++}
++
++/* Set at run time (qom-set), it starts a capture; "" stops it */
++static void la_set_file(Object *obj, const char *value, Error **errp)
++{
++    ESP32S3GPIOState *s = ESP32S3_GPIO(obj);
++    if (s->la) {
++        fprintf(s->la, "#%" PRId64 "\n", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
++    }
++    g_free(s->la_file);
++    s->la_file = g_strdup(value);
++    if (DEVICE(obj)->realized) {
++        la_open(s, errp);
++    }
++}
++
++static void la_get_pins(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
++{
++    visit_type_uint64(v, name, &ESP32S3_GPIO(obj)->la_pins, errp);
++}
++
++static void la_set_pins(Object *obj, Visitor *v, const char *name, void *opaque, Error **errp)
++{
++    visit_type_uint64(v, name, &ESP32S3_GPIO(obj)->la_pins, errp);
++}
++
+ /* Recompute every pin's level: wires out, edge interrupts, then the interrupt line */
+ static void update_pins(ESP32S3GPIOState *s)
+ {
+@@ -231,6 +336,7 @@ static void update_pins(ESP32S3GPIOState *s)
+             continue;
+         }
+         s->level = (s->level & ~(1ULL << n)) | ((uint64_t)l << n);
++        la_edge(s, n, l);
+         int type = PIN_INT_TYPE(s->pin[n]);
+         if ((type == INT_POSEDGE && l) || (type == INT_NEGEDGE && !l) || type == INT_ANYEDGE) {
+             s->status |= 1ULL << n;
+@@ -454,6 +560,18 @@ static void esp32s3_gpio_init(Object *obj)
+     qdev_init_gpio_out_named(DEVICE(s), s->pin_out, ESP32S3_GPIO_PIN_OUT, PINS);
+     qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpio_sig_out, ESP32S3_GPIO_SIG_OUT, ESP32S3_GPIO_SIGNALS);
+     qdev_init_gpio_in_named(DEVICE(s), esp32s3_gpio_pin_pull, ESP32S3_GPIO_PIN_PULL, PINS);
++
++    s->la_pins = PIN_MASK;
++    object_property_add_str(obj, "la-file", la_get_file, la_set_file);
++    object_property_add(obj, "la-pins", "uint64", la_get_pins, la_set_pins, NULL, NULL);
++}
++
++static void esp32s3_gpio_realize(DeviceState *dev, Error **errp)
++{
++    ESP32S3GPIOState *s = ESP32S3_GPIO(dev);
++    s->la_exit.notify = la_at_exit;
++    qemu_add_exit_notifier(&s->la_exit);
++    la_open(s, errp);
+ }
+ 
+ static Property esp32s3_gpio_properties[] = {
+@@ -467,6 +585,7 @@ static void esp32s3_gpio_class_init(ObjectClass *klass, void *data)
+     ResettableClass *rc = RESETTABLE_CLASS(klass);
+ 
+     rc->phases.hold = esp32s3_gpio_reset_hold;
++    dc->realize = esp32s3_gpio_realize;
+     device_class_set_props(dc, esp32s3_gpio_properties);
+ }
+ 
+diff --git a/include/hw/gpio/esp32s3_gpio.h b/include/hw/gpio/esp32s3_gpio.h
+index a17973b..711b0fd 100644
+--- a/include/hw/gpio/esp32s3_gpio.h
++++ b/include/hw/gpio/esp32s3_gpio.h
+@@ -20,6 +20,7 @@
+ #pragma once
+ 
+ #include "hw/sysbus.h"
++#include "qemu/notify.h"
+ #include "hw/hw.h"
+ #include "hw/registerfields.h"
+ 
+@@ -64,6 +65,14 @@ typedef struct ESP32S3GPIOState {
+     uint32_t iomux_regs[ESP32S3_GPIO_PINS];
+     uint32_t iomux_pin_ctrl;
+     uint32_t bt_select, sdio_select, clock_gate;
++
++    /* The logic analyzer: every change of the pins in la_pins, at its virtual time, to
++     * la_file as a VCD (PulseView imports it; qemu_esp32's tools/la make sigrok files) */
++    char *la_file;
++    uint64_t la_pins;
++    FILE *la;
++    int64_t la_last_ns;
++    Notifier la_exit;
+ } ESP32S3GPIOState;
+ 
+ /* Have `irq` follow the level of `pin` from now on (and set it to the current level) */
+diff --git a/tests/qtest/esp32s3-gpio-test.c b/tests/qtest/esp32s3-gpio-test.c
+index c1152ae..fb8afe9 100644
+--- a/tests/qtest/esp32s3-gpio-test.c
++++ b/tests/qtest/esp32s3-gpio-test.c
+@@ -184,6 +184,43 @@ static void test_interrupts(void)
+     qtest_quit(qts);
+ }
+ 
++/*
++ * The logic analyzer (la-file, la-pins): a VCD with a wire per recorded pin, the levels
++ * at the start, and each change at its virtual time in nanoseconds
++ */
++static void test_logic_analyzer(void)
++{
++    g_autofree char *path = NULL;
++    int fd = g_file_open_tmp("esp32s3-la-XXXXXX.vcd", &path, NULL);
++    g_assert(fd >= 0);
++    close(fd);
++    QTestState *qts = qtest_initf("-machine esp32s3 "
++                                  "-global driver=esp32s3.gpio,property=la-file,value=%s "
++                                  "-global driver=esp32s3.gpio,property=la-pins,value=96",
++                                  path);                     /* Pins 5 and 6 */
++    int64_t t0 = qtest_clock_step(qts, 1000);
++    qtest_writel(qts, ENABLE_W1TS, BIT(5) | BIT(6) | BIT(7));
++    qtest_writel(qts, OUT_W1TS, BIT(5) | BIT(7));            /* 7 isn't recorded */
++    int64_t t1 = qtest_clock_step(qts, 2500);
++    qtest_writel(qts, OUT_W1TC, BIT(5));
++    qtest_writel(qts, OUT_W1TS, BIT(6));
++    int64_t t2 = qtest_clock_step(qts, 500);
++    qtest_writel(qts, OUT_W1TC, BIT(6));
++    qtest_quit(qts);                                         /* Flushes the file */
++
++    g_autofree char *vcd = NULL;
++    g_assert(g_file_get_contents(path, &vcd, NULL, NULL));
++    unlink(path);
++    g_assert(strstr(vcd, "$timescale 1 ns $end"));
++    g_assert(strstr(vcd, "$var wire 1 & GPIO5 $end"));
++    g_assert(strstr(vcd, "$var wire 1 ' GPIO6 $end"));
++    g_assert(!strstr(vcd, "GPIO7"));
++    g_autofree char *start = g_strdup_printf("$dumpvars\n0&\n0'\n$end\n#%" PRId64 "\n1&\n", t0);
++    g_assert(strstr(vcd, start));
++    g_autofree char *mid = g_strdup_printf("#%" PRId64 "\n0&\n1'\n#%" PRId64 "\n0'\n", t1, t2);
++    g_assert(strstr(vcd, mid));
++}
++
+ int main(int argc, char **argv)
+ {
+     g_test_init(&argc, &argv, NULL);
+@@ -192,5 +229,6 @@ int main(int argc, char **argv)
+     qtest_add_func("/esp32s3/gpio/external_and_pulls", test_external_and_pulls);
+     qtest_add_func("/esp32s3/gpio/matrix", test_matrix);
+     qtest_add_func("/esp32s3/gpio/interrupts", test_interrupts);
++    qtest_add_func("/esp32s3/gpio/logic_analyzer", test_logic_analyzer);
+     return g_test_run();
+ }
+-- 
+2.43.0
+

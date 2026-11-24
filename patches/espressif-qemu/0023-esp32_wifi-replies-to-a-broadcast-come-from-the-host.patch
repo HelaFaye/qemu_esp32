@@ -1,7 +1,7 @@
 From fb833a4592c3657013e51c9dad167e18bb6343dd Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 16 Nov 2026 20:13:54 +0000
-Subject: [PATCH 23/28] esp32_wifi: replies to a broadcast come from the host's
+Subject: [PATCH 23/29] esp32_wifi: replies to a broadcast come from the host's
  alias, not loopback
 
 libslirp delivers a reply to a broadcast with the host's loopback

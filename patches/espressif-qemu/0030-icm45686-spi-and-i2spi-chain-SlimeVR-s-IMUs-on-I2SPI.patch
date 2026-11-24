@@ -1,4 +1,4 @@
-From 8d5ec4c394cf10b9b692f71c4f00fbb02c83f140 Mon Sep 17 00:00:00 2001
+From 3407af72d887e315f883c7b2abc877895036071f Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 23 Nov 2026 10:02:54 +0000
 Subject: [PATCH] icm45686-spi and i2spi-chain: SlimeVR's IMUs on I2SPI chains

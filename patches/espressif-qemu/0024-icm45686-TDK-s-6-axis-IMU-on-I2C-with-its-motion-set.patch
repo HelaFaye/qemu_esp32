@@ -1,7 +1,7 @@
 From ba09c599bfd31e344f9e3f57401617a56cf21bd4 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Mon, 16 Nov 2026 15:33:26 +0000
-Subject: [PATCH 24/28] icm45686: TDK's 6-axis IMU on I2C, with its motion set
+Subject: [PATCH 24/29] icm45686: TDK's 6-axis IMU on I2C, with its motion set
  at run time
 
 The ICM-45686 as SlimeVR's softfusion driver (and TDK's) uses it: WHO_AM_I

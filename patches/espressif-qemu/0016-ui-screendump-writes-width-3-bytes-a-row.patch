@@ -1,7 +1,7 @@
 From 6534af83ef3f6d5a2b6d21e18147a9a2d39e31ec Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Sun, 15 Nov 2026 09:35:23 +0000
-Subject: [PATCH 16/28] ui: screendump writes width * 3 bytes a row
+Subject: [PATCH 16/29] ui: screendump writes width * 3 bytes a row
 
 ppm_save() wrote each row at its line buffer's stride, which pixman rounds up
 to a multiple of 4 bytes. A screen whose width * 3 isn't one (170 pixels: the

@@ -113,3 +113,58 @@ QEMUs: per channel, with the links' loss (a frame below sensitivity is lost), an
 broadcast and action frames as ESP-NOW sends them. Then two gbagate nodes run their RFU
 peer path over emulated ESP-NOW, and the SDR medium can show Wi-Fi traffic as a
 receiver sees it.
+
+## 4. GPIO waveforms and the logic analyzer
+
+Every feature that drives a pin should put the chip's waveform on it, edge for edge, and
+a real logic analyzer is the reference. The built-in analyzer (patch 0029, [`la/`](../la/README.md))
+records pads in virtual time; PulseView opens its captures.
+
+### What reaches the pins today
+
+| Feature | On the pins | Next |
+|---|---|---|
+| GPIO out (OUT, W1TS/W1TC), open drain, pulls, external drives | Yes, at the write's virtual time | CPU timing: `-icount`, fitted (below) |
+| GP-SPI chip selects, LCD_CAM CS and D/C | Yes | |
+| GP-SPI SCLK, MOSI (MISO in) | No: bytes move at bus level | Edges from the clock divider and mode, per bit |
+| I2C SCL/SDA | No | Start, bits, ACK, stop at the configured SCL timing |
+| UART TX (RX in) | No | Bits at the baud divider |
+| LEDC | No | PWM from timer, divider, duty, fades |
+| RMT | No (decoded only) | Symbols' levels and durations on the channel's pin |
+| Button and encoder inputs | Yes (edges 2 ms apart, settable) | |
+
+Each becomes waveform-accurate with a qtest that checks its edges in a VCD.
+
+### Validating against the real SuperMini (PulseView, 10 channels, 24 MHz)
+
+At 24 MHz a sample is 41.7 ns: signals up to about 4 MHz are measurable; edge times are
+known to one sample.
+
+1. **A test firmware** (`firmware/gpio-validate`, a minimal ESP-IDF app of this repo's,
+   like `wifi-start`): segments, each started by a sync pulse on D0 (GPIO1):
+   GPIO pulses timed by `esp_rom_delay_us` (1, 10, 100, 1000 us); a CPU-speed toggle
+   burst; GPIO interrupt latency (a jumper from an output to an input, the ISR toggling a
+   third pin); LEDC at 1 kHz/50 %, 10 kHz/25 %, 100 kHz; RMT WS2812 frames; UART1 TX at
+   115200 and 1 Mbaud; SPI mode 0 at 1 and 4 MHz (SCLK, MOSI, CS); I2C at 100 and 400 kHz
+   with board pull-ups; a pin's pulls and open drain.
+2. **Channels**: D0 sync on GPIO1, D1-D9 on GPIO2-10 (the SuperMini's header pins; check
+   your board's silkscreen). The same map in the emulator: `la-pins` 0x7fe.
+3. **Real capture**: flash the board, PulseView at 24 MHz, trigger on D0 rising, capture
+   the run, File > Save as `real.sr`.
+4. **Emulated capture**: the same image in QEMU with the analyzer (and `-icount`), then
+   `la.py sr ... --map GPIO1=D0,...`.
+5. **Compare**: `la.py compare real.sr emu.vcd --map D0=GPIO1,... --sync D0`; and sigrok's
+   decoders on both (`sigrok-cli -P uart`, `spi`, `i2c`) for the content.
+6. **Correct**: `la.py fit` per segment gives emulated = slope x real + offset:
+   - peripheral-timed edges (LEDC, RMT, UART, SPI, I2C): slope 1 within the crystal's
+     tolerance and offset under a sample; anything else is a model bug, fixed and
+     pinned with a qtest built from the real capture's numbers;
+   - delays (`esp_rom_delay_us`): slope 1 against the emulated CCOUNT;
+   - CPU-timed edges: the slope gives the ns per instruction to run with (`--icount`
+     prints the `-icount shift`); fixed offsets (interrupt latency, cache misses)
+     become modelled latencies.
+   The real captures are kept as reference data, and CI runs compare against them, so
+   a correction stays corrected.
+
+Acceptance: peripheral-timed edges within one 24 MHz sample plus 50 ppm; delays within
+1 %; decoded content identical.
