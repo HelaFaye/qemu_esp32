@@ -1,7 +1,7 @@
 From 128c8f7c54b20a0b71bf487cd76a1124097749e8 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Tue, 17 Nov 2026 22:17:44 +0000
-Subject: [PATCH 27/28] icm45686: 20-bit scale, a FIFO that fills from
+Subject: [PATCH 27/29] icm45686: 20-bit scale, a FIFO that fills from
  power-up, attitude to check against
 
 SlimeVR's tracker, with two of these on its SuperMini, showed two bugs:

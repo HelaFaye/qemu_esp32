@@ -1,7 +1,7 @@
 From 70fefc652c68daf92285fe3df6415a5a34db6529 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Sun, 15 Nov 2026 09:35:39 +0000
-Subject: [PATCH 18/28] esp32s3: LEDC keeps what's written
+Subject: [PATCH 18/29] esp32s3: LEDC keeps what's written
 
 LEDC (0x60019000) read as 0, so ESP-IDF's ledc_get_freq() divided by a timer's
 clock divider of 0: the T-Display-S3's factory firmware (its backlight on LEDC)

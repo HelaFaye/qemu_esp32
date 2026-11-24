@@ -1,7 +1,7 @@
 From c33303e91142aeb762ebacc3a4d01bd8176ec2c8 Mon Sep 17 00:00:00 2001
 From: HelaFaye <dilsha21@gmail.com>
 Date: Mon, 23 Nov 2026 20:03:21 +0000
-Subject: [PATCH 28/28] esp32s3: the radio as an SDR, the dump engine's receive
+Subject: [PATCH 28/29] esp32s3: the radio as an SDR, the dump engine's receive
  side
 
 The S3's Wi-Fi MAC has a debug dump engine. It copies the receiver's raw
